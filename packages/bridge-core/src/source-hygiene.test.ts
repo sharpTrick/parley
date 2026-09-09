@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { extname, join } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   backendPackages,
@@ -503,6 +503,119 @@ describe('no file in this repo names the machine it was written on', () => {
 });
 
 /**
+ * One hop of the value path, shared by the two rules below: a rule that matches a TOKEN inside an
+ * assertion grades the spelling rather than the value, and the defect that motivated the first of
+ * them was one call deep. `bindingsIn` is deliberately scope-blind — a rule that over-reaches
+ * reports a site to look at, while one that under-reaches reports nothing at all, which is the
+ * failure being fixed.
+ */
+const extentFrom = (
+  code: string,
+  at: number,
+  open: string,
+  close: string,
+  stopAtSemicolon: boolean,
+): string => {
+  let depth = 0;
+  for (let i = at; i < code.length; i++) {
+    const ch = code[i]!;
+    if (open.includes(ch)) depth++;
+    else if (close.includes(ch)) {
+      if (depth === 0) return code.slice(at, i);
+      if (--depth === 0 && !stopAtSemicolon) return code.slice(at, i + 1);
+    } else if (stopAtSemicolon && ch === ';' && depth === 0) return code.slice(at, i);
+  }
+  return code.slice(at);
+};
+
+/**
+ * Names a callback or function takes as an argument. A scope-blind reader cannot tell which
+ * binding an assertion sees when a module-level `const shards` and an `it.each` callback's
+ * `shards` share a file, so a shadowed name is left alone rather than guessed at.
+ */
+const parameterNames = (code: string): Set<string> => {
+  const out = new Set<string>();
+  const collect = (group: string): void => {
+    for (const ident of group.matchAll(/\b([A-Za-z_$][\w$]*)\b/g)) out.add(ident[1]!);
+  };
+  for (const m of code.matchAll(/\(([^()]*)\)\s*(?::[^=\n]*)?=>/g)) collect(m[1]!);
+  for (const m of code.matchAll(/\bfunction\s*[A-Za-z_$][\w$]*\s*\(([^()]*)\)/g)) collect(m[1]!);
+  return out;
+};
+
+/** Every module-scope name in a file, to the text that defines it. */
+const bindingsIn = (code: string): Map<string, string> => {
+  const out = new Map<string, string>();
+  for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;\n]+)?=\s*/g))
+    if (!out.has(m[1]!)) out.set(m[1]!, extentFrom(code, m.index + m[0].length, '([{', ')]}', true));
+  for (const m of code.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)\s*/g)) {
+    const brace = code.indexOf('{', m.index);
+    if (brace > 0) out.set(m[1]!, code.slice(m.index, brace) + extentFrom(code, brace, '{', '}', false));
+  }
+  return out;
+};
+
+/** Imported name to the specifier it came from, read before the literals are blanked. */
+const importSpecifiers = (source: string): Map<string, string> => {
+  const out = new Map<string, string>();
+  for (const m of withoutComments(source).matchAll(
+    /\bimport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*'([^'\n]+)'/g,
+  ))
+    for (const raw of m[1]!.split(',')) {
+      const name = raw.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()?.trim();
+      if (name !== undefined && /^[A-Za-z_$][\w$]*$/.test(name)) out.set(name, m[2]!);
+    }
+  return out;
+};
+
+interface ValuePath {
+  /** What defines `name` here, or in the sibling module it was imported from. */
+  valueOf: (name: string) => string | undefined;
+  /** Whether `text`, or the definition of anything it CALLS, matches `pattern`. */
+  reaches: (text: string, pattern: RegExp) => boolean;
+}
+
+const valuePath = (
+  source: string,
+  moduleSource: (specifier: string) => string | undefined,
+): ValuePath => {
+  const local = bindingsIn(codeOf(source));
+  const shadowed = parameterNames(codeOf(source));
+  const imported = importSpecifiers(source);
+  const resolved = new Map<string, string | undefined>();
+  const valueOf = (name: string): string | undefined => {
+    if (resolved.has(name)) return resolved.get(name);
+    resolved.set(name, undefined);
+    if (shadowed.has(name)) return undefined;
+    let value = local.get(name);
+    if (value === undefined) {
+      const specifier = imported.get(name);
+      const other = specifier === undefined ? undefined : moduleSource(specifier);
+      if (other !== undefined) value = bindingsIn(codeOf(other)).get(name);
+    }
+    resolved.set(name, value);
+    return value;
+  };
+  const reaches = (text: string, pattern: RegExp, depth = 0): boolean => {
+    if (new RegExp(pattern.source).test(text)) return true;
+    if (depth >= 1) return false;
+    for (const call of text.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const value = valueOf(call[1]!);
+      if (value !== undefined && reaches(value, pattern, depth + 1)) return true;
+    }
+    return false;
+  };
+  return { valueOf, reaches };
+};
+
+/** Sibling sources as a rule scanning the real tree sees them: relative specifiers, `.js` to `.ts`. */
+const siblingsOf = (file: string) => (specifier: string) => {
+  if (!specifier.startsWith('.')) return undefined;
+  const path = resolve(dirname(file), specifier.replace(/\.js$/, '.ts'));
+  return existsSync(path) ? readFileSync(path, 'utf8') : undefined;
+};
+
+/**
  * CLASS: an assertion whose expected value is read off the grading machine. The negative control
  * divided its budget by `availableParallelism()`, so the same commit was RED on one vCPU and GREEN
  * on eight and a developer could add work until CI reddened for a reason their box could not
@@ -510,7 +623,8 @@ describe('no file in this repo names the machine it was written on', () => {
  * graded as a class rather than at the one site that had it.
  */
 describe('no assertion reads the machine it is being graded on', () => {
-  const HOST_READS = /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\.CI\b/g;
+  const HOST_READS =
+    /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\s*(?:\.(?:CI|GITHUB_ACTIONS|RUNNER_[A-Z_]+)\b|\[)/g;
 
   /**
    * From `expect(` to the end of its statement, so the matcher's argument is scanned too: a bound
@@ -532,22 +646,115 @@ describe('no assertion reads the machine it is being graded on', () => {
     return out;
   };
 
-  const hostReadsInAssertions = (source: string): string[] =>
-    assertionRegions(codeOf(source))
-      .flatMap((region) => [...region.matchAll(HOST_READS)])
-      .map((m) => m[0]);
+  /**
+   * Where a name's host read lives: in the BODY, so every mention of it is one, or only in a
+   * PARAMETER DEFAULT, so only a call that supplies nothing is. `brokenShards(cores)` passing a
+   * declared constant is the fix that closed this defect; `brokenShards()` is the defect.
+   */
+  const hostReadKind = (path: ValuePath, name: string): 'body' | 'default' | 'none' => {
+    const value = path.valueOf(name);
+    if (value === undefined) return 'none';
+    const at = value.indexOf('(');
+    const callable = at >= 0 && /^[\s\w<>,:]*$/.test(value.slice(0, at));
+    const params = callable ? extentFrom(value, at, '(', ')', false) : '';
+    const body = callable ? value.slice(at + params.length) : value;
+    if ([...body.matchAll(HOST_READS)].length > 0) return 'body';
+    if ([...params.matchAll(HOST_READS)].length > 0) return 'default';
+    return path.reaches(value, HOST_READS) ? 'body' : 'none';
+  };
+
+  const hostReadsInAssertions = (
+    source: string,
+    moduleSource: (specifier: string) => string | undefined = () => undefined,
+  ): string[] => {
+    const code = codeOf(source);
+    const path = valuePath(source, moduleSource);
+    const found: string[] = [];
+    for (const region of assertionRegions(code)) {
+      found.push(...[...region.matchAll(HOST_READS)].map((m) => m[0]));
+      for (const use of region.matchAll(/\b([A-Za-z_$][\w$]*)\b/g)) {
+        const kind = hostReadKind(path, use[1]!);
+        const noArgument = /^\s*\(\s*\)/.test(region.slice(use.index + use[1]!.length));
+        if (kind === 'body' || (kind === 'default' && noArgument)) found.push(use[1]!);
+      }
+    }
+    return found;
+  };
+
+  /**
+   * The sibling module of the row below that reads the host, in the shape the real one has: the
+   * read is a parameter default, so the same name is a host read at one call site and not at
+   * another.
+   */
+  const FIXTURE_MODULES: Record<string, string> = {
+    './reference-plugin.js':
+      'export const brokenShards = (cores: number = availableParallelism()): number =>\n' +
+      '  Math.min(MAX_BROKEN_SHARDS, BROKEN_VARIANTS.length, cores);\n',
+  };
+  const fixtureModule = (specifier: string): string | undefined => FIXTURE_MODULES[specifier];
+
+  /**
+   * negative-control.test.ts as it stood in the commit that motivated this rule (2f36e7a^), which
+   * the token-matching version of the rule reported clean: the host read is one call hop away,
+   * through a sibling module, in a matcher's argument.
+   */
+  const PRE_FIX_NEGATIVE_CONTROL = [
+    "import { BROKEN_VARIANTS, brokenShards } from './reference-plugin.js';",
+    '',
+    'it(\'the budget covers the whole table\', () => {',
+    '  expect(',
+    '    NESTED_RUN_BUDGET_MS,',
+    '    `${BROKEN_VARIANTS.length} variants x ${CLAUSES.length} clauses over ${brokenShards()} ` +',
+    "      'shards no longer fit the budget'",
+    '  ).toBeGreaterThanOrEqual(',
+    '    requiredBudgetMs(BROKEN_VARIANTS.length, CLAUSES.length, brokenShards()),',
+    '  );',
+    '});',
+  ].join('\n');
 
   it.each([
     ['a core count as the expected value', 'expect(shards).toBe(availableParallelism());', ['availableParallelism(']],
     ['a core count as the subject', 'expect(cpus().length).toBeGreaterThan(0);', ['cpus(']],
     ['a memory read inside the data', 'expect([totalmem()]).toEqual(x);', ['totalmem(']],
     ['a CI flag branching the expectation', 'expect(n).toBe(process.env.CI ? 1 : 2);', ['process.env.CI']],
+    ['the same flag reached by index', "expect(n).toBe(process.env['CI'] ? 1 : 2);", ['process.env[']],
+    ['the runner flag', 'expect(n).toBe(process.env.GITHUB_ACTIONS ? 1 : 2);', ['process.env.GITHUB_ACTIONS']],
     ['a platform read in a plain argument', 'expect(a).toBe(process.platform);', ['process.platform']],
     ['a platform read inside a template placeholder', 'expect(a, `on ${process.platform}`).toBe(b);', ['process.platform']],
+    ['a read one const away', 'const n = cpus().length;\nexpect(x).toBe(n);', ['n']],
+    ['a read one local helper away', 'const shardsFor = () => cpus().length;\nexpect(x).toBe(shardsFor());', ['shardsFor']],
+    [
+      "a read two helpers away",
+      'const cores = () => cpus().length;\nconst shardsFor = () => Math.min(4, cores());\nexpect(x).toBe(shardsFor());',
+      ['shardsFor'],
+    ],
+    ['a read one helper away, in a matcher argument', 'const shardsFor = () => cpus().length;\nexpect(x).toBeLessThan(shardsFor());', ['shardsFor']],
+    [
+      'a read one helper away, in the diagnostic template',
+      'const shardsFor = () => cpus().length;\nexpect(x, `over ${shardsFor()} shards`).toBe(y);',
+      ['shardsFor'],
+    ],
     ['the same read outside any assertion', 'const shards = availableParallelism();\nexpect(1).toBe(1);', []],
     ['a narrated one', '// expect(n).toBe(cpus().length)\nexpect(1).toBe(1);', []],
+    [
+      'a default-parameter read, called with nothing',
+      "import { brokenShards } from './reference-plugin.js';\nexpect(B).toBeGreaterThanOrEqual(need(40, 57, brokenShards()));",
+      ['brokenShards'],
+    ],
+    [
+      'the same name called with a declared constant, which is the fix',
+      "import { brokenShards } from './reference-plugin.js';\nexpect(brokenShards(GRADED_HOST_CORES)).toBe(2);",
+      [],
+    ],
   ])('reads %s', (_label, source, found) => {
-    expect(hostReadsInAssertions(source)).toEqual(found);
+    expect(hostReadsInAssertions(source, fixtureModule)).toEqual(found);
+  });
+
+  it('flags the source that motivated it', () => {
+    expect(
+      hostReadsInAssertions(PRE_FIX_NEGATIVE_CONTROL, fixtureModule),
+      'a rule that cannot flag the commit it was written for is not a ratchet',
+    ).not.toEqual([]);
   });
 
   /**
@@ -575,7 +782,7 @@ describe('no assertion reads the machine it is being graded on', () => {
 
   it.each(scanned)('%s', (name, file) => {
     const kept = KEEPS.find(([f]) => f === name);
-    const found = hostReadsInAssertions(readFileSync(file, 'utf8'));
+    const found = hostReadsInAssertions(readFileSync(file, 'utf8'), siblingsOf(file));
     expect(
       kept ? [] : found,
       'this assertion is graded against the machine running it, so the same commit passes on one ' +
@@ -623,43 +830,159 @@ describe('the suite runs against a sandboxed state directory, not the developer�
  */
 describe('no it.each table can register nothing', () => {
   /**
-   * The second rule is narrowed to tables ROOTED IN A FILESYSTEM READ. "Any `.each(identifier)` not
-   * produced by derivedRows" was the wider instruction, and it names 193 sites — almost all of them
-   * a `flatMap` over a literal declared beside it, which cannot narrow past what is written there. A
-   * register of 193 would be a rubber stamp; a walk that comes back short is the real exposure.
+   * The rule is narrowed to tables ROOTED IN AN EXTERNAL ENUMERATION — a tree walk, or a child
+   * process asked for one. "Any `.each(identifier)` not produced by derivedRows" was the wider
+   * instruction, and it names 193 sites, almost all a `flatMap` over a literal declared beside it,
+   * which cannot narrow past what is written there. A register of 193 would be a rubber stamp; a
+   * walk that comes back short is the real exposure.
+   *
+   * It is the ARGUMENT EXPRESSION that is read, and one hop through what the names in it are bound
+   * to — including into a sibling module. The version that matched `.each(BAREIDENT)` against a
+   * regex-extracted right-hand side saw none of the spellings this repo actually uses: not
+   * `.each(readdirSync(D))`, not `.each(WORKSPACES.map(…))`, and not a walk imported from next
+   * door.
    */
-  const FILESYSTEM_READ = /\b(?:readdirSync|filesUnder|workspacePackages|backendPackages|globSync)\s*\(/;
+  const EXTERNAL_ENUMERATION =
+    /\b(?:readdirSync|filesUnder|workspacePackages|backendPackages|globSync|execFileSync|execSync|spawnSync)\s*\(/;
 
-  const bindingOf = (code: string, name: string): string | undefined =>
-    new RegExp(`(?:const|let|var)\\s+${name}\\b[^=\\n]*=\\s*([\\s\\S]*?);\\n`).exec(code)?.[1];
+  const EMPTY_LITERAL = /^\s*\[\s*\](?:\s+as\b|\s*$)/;
 
-  const ungradedTables = (source: string): string[] => {
+  const ungradedTables = (
+    source: string,
+    moduleSource: (specifier: string) => string | undefined = () => undefined,
+  ): string[] => {
     const code = codeOf(source);
+    const path = valuePath(source, moduleSource);
     const out: string[] = [];
-    if (/\.each\(\s*(?:\[\s*\]|\[\s*\]\s+as\b)/.test(code)) out.push('.each([])');
-    for (const use of code.matchAll(/\.each\(\s*([A-Za-z_$][\w$]*)\s*\)/g)) {
-      const name = use[1]!;
-      const rhs = bindingOf(code, name);
-      if (rhs !== undefined && FILESYSTEM_READ.test(rhs) && !/\bderivedRows\s*\(/.test(rhs))
-        out.push(`.each(${name})`);
+    for (const each of code.matchAll(/\.each\s*\(/g)) {
+      const argument = extentFrom(code, each.index + each[0].length - 1, '(', ')', false).slice(1, -1);
+      if (EMPTY_LITERAL.test(argument)) {
+        out.push('.each([])');
+        continue;
+      }
+      if (/\bderivedRows\s*\(/.test(argument)) continue;
+      if (EXTERNAL_ENUMERATION.test(argument)) {
+        out.push(`.each(${EXTERNAL_ENUMERATION.exec(argument)![0]}…)`);
+        continue;
+      }
+      for (const name of new Set(
+        [...argument.matchAll(/\b([A-Za-z_$][\w$]*)\b/g)].map((m) => m[1]!),
+      )) {
+        const bound = path.valueOf(name);
+        if (bound === undefined || /\bderivedRows\s*\(/.test(bound)) continue;
+        if (EMPTY_LITERAL.test(bound)) {
+          out.push('.each([])');
+          break;
+        }
+        if (path.reaches(bound, EXTERNAL_ENUMERATION)) {
+          out.push(`.each(${name})`);
+          break;
+        }
+      }
     }
     return out;
   };
+
+  /** The sibling module of the pinned rows below, in the shape the real one has: it walks. */
+  const WALKING_MODULE: Record<string, string> = {
+    './declared-config-keys.js':
+      "import { readdirSync } from 'node:fs';\n" +
+      'export function backendConfigDeclarations() {\n' +
+      '  return filesUnder(PACKAGES).map((file) => declarationIn(file));\n' +
+      '}\n',
+  };
+  const walkingModule = (specifier: string): string | undefined => WALKING_MODULE[specifier];
+
+  /**
+   * Two live tables this rule exists for, verbatim as they stand: packaging.test.ts, whose seven
+   * `.each(WORKSPACES.map(…))` rows carry the whole publish gate off a set enumerated by a child
+   * process, and refusal-coverage.test.ts, whose rows come from a walk one import hop away. Both
+   * read as clean to the version of this rule that matched `.each(BAREIDENT)`.
+   */
+  const LIVE_SHAPES: ReadonlyArray<readonly [label: string, source: string]> = [
+    [
+      'packaging.test.ts: a set enumerated by a child process',
+      'const WORKSPACES = publicWorkspaces();\n' +
+        "it.each(WORKSPACES.map((w) => [w.name, w] as const))(\n" +
+        "  '%s compiles no test source into its published output',\n" +
+        '  (_name, w) => {},\n' +
+        ');\n' +
+        'function publicWorkspaces() {\n' +
+        '  return JSON.parse(execFileSync(process.execPath, [], { encoding: \'utf8\' }));\n' +
+        '}\n',
+    ],
+    [
+      'refusal-coverage.test.ts: a walk one import hop away',
+      "import { backendConfigDeclarations } from './declared-config-keys.js';\n" +
+        'const declared = backendConfigDeclarations();\n' +
+        "it.each(declared.map((d) => [d.pkg] as const))('%s crosses it', (pkg) => {});\n",
+    ],
+  ];
 
   it.each([
     ['an empty table', 'it.each([])(\'%s\', () => {});', ['.each([])']],
     ['an empty table with a type assertion', "it.each([] as string[])('%s', () => {});", ['.each([])']],
     ['a spaced empty table', 'it.each([ ])(\'%s\', () => {});', ['.each([])']],
-    ['a tree walk that is not graded', "const f = readdirSync(D).sort();\nit.each(f)('%s', () => {});", ['.each(f)']],
+    ['a table declared empty and filled later', "const f: string[] = [];\nit.each(f)('%s', () => {});", ['.each([])']],
+    ['a bare identifier bound to a walk', "const f = readdirSync(D).sort();\nit.each(f)('%s', () => {});", ['.each(f)']],
+    ['the walk spelled directly in the argument', "it.each(readdirSync(D))('%s', () => {});", ['.each(readdirSync(…)']],
+    ['a walk mapped into rows', "const f = readdirSync(D);\nit.each(f.map((x) => [x]))('%s', () => {});", ['.each(f)']],
+    [
+      'a walk chained through two array methods',
+      "const f = filesUnder(D, ['.ts']);\nit.each(f.flatMap((x) => [x]).filter(Boolean))('%s', () => {});",
+      ['.each(f)'],
+    ],
+    [
+      'a walk behind a local function',
+      "function every() { return readdirSync(D); }\nconst f = every();\nit.each(f)('%s', () => {});",
+      ['.each(f)'],
+    ],
+    [
+      'a walk with no semicolon to end its binding',
+      "const f = readdirSync(D)\nit.each(f)('%s', () => {})",
+      ['.each(f)'],
+    ],
     ['the same walk through derivedRows', "const f = derivedRows('f', () => readdirSync(D), { floor: 1, witness: ['x'] });\nit.each(f)('%s', () => {});", []],
+    [
+      'a derived table mapped into rows',
+      "const f = derivedRows('f', () => readdirSync(D), { floor: 1, witness: ['x'] });\nit.each(f.map((x) => [x]))('%s', () => {});",
+      [],
+    ],
     ['a literal table', "const f = [['a'], ['b']];\nit.each(f)('%s', () => {});", []],
+    ['a literal table mapped into rows', "const f = ['a', 'b'];\nit.each(f.map((x) => [x]))('%s', () => {});", []],
     ['a walk narrated in a comment', '// it.each([]) would be a hole\nit.each([1])(\'%s\', () => {});', []],
   ])('reads %s', (_label, source, found) => {
-    expect(ungradedTables(source)).toEqual(found);
+    expect(ungradedTables(source, walkingModule)).toEqual(found);
   });
 
-  /** Sites allowed to register a filesystem-rooted table by hand. Empty is the intended state. */
-  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [];
+  it.each(LIVE_SHAPES)('flags %s', (_label, source) => {
+    expect(
+      ungradedTables(source, walkingModule),
+      'this shape is live in the tree and is what the rule was rewritten to see',
+    ).not.toEqual([]);
+  });
+
+  /**
+   * DEBT, not permission: the tables that were already building rows out of a walk when this rule
+   * learned to see through a binding. The shipped rule matched `.each(BAREIDENT)` against a
+   * regex-extracted right-hand side and so reported every one of them clean. Each owes a
+   * `derivedRows` floor and witnesses; the entry is what makes the size of that owing visible, and
+   * the case below fails a keep that no longer offends, so an entry cannot outlive its fix.
+   */
+  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [
+    ['packages/bridge-core/src/packaging.test.ts', 'seven publish-gate rows off WORKSPACES, a set a child process enumerates'],
+    ['packages/bridge-core/src/transport/absent-topic-sites.test.ts', 'SENTINELS, from a walk of the transport sources'],
+    ['packages/bridge-core/src/transport/skill-safety.test.ts', 'pinned(), from a walk of the shipped skill files'],
+    ['packages/bridge-matrix/test/shipped-artifacts.test.ts', 'configs, from a walk of the shipped example configs'],
+    ['packages/bridge-net-util/test/refusal-coverage.test.ts', 'declared, from a walk one import hop away'],
+    ['packages/bridge-net-util/test/retry-after-header.test.ts', 'clockShapedLiterals, from a walk of the package sources'],
+    ['packages/bridge-postgres/test/suite-hygiene.test.ts', 'testFiles, pgMockingFiles and publishedDocs, each from a walk'],
+    ['packages/bridge-redis/test/readme.test.ts', 'linked, from a walk of the shipped documents'],
+    ['packages/bridge-xmpp/test/backend-config.test.ts', 'exampleConfigs, from a walk with no floor at all'],
+    ['packages/bridge-xmpp/test/creds-warning.test.ts', 'cells, declared empty and filled by nested loops'],
+    ['packages/conformance/test/published-bins.test.ts', 'BINS, from a walk of every published manifest'],
+    ['packages/conformance/test/repo-contract.test.ts', 'tested, SCRIPTS and file, each from a walk of the tree'],
+  ];
 
   const tabled = derivedRows(
     'every source and test file in the repo',
@@ -679,11 +1002,17 @@ describe('no it.each table can register nothing', () => {
   );
 
   it.each(tabled)('%s', (name, file) => {
-    const found = KEEPS.some(([f]) => f === name) ? [] : ungradedTables(readFileSync(file, 'utf8'));
+    const kept = KEEPS.find(([f]) => f === name);
+    const found = kept ? [] : ungradedTables(readFileSync(file, 'utf8'), siblingsOf(file));
     expect(
       found,
       'this table can come back empty or short with the file reporting success — build it with ' +
         '`derivedRows`, which registers a case of its own for the floor and the witnesses',
     ).toEqual([]);
+    if (kept)
+      expect(
+        ungradedTables(readFileSync(file, 'utf8'), siblingsOf(file)),
+        `${name} is registered as debt but no longer builds a table this way — delete the entry`,
+      ).not.toEqual([]);
   });
 });
