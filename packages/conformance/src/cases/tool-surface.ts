@@ -96,7 +96,7 @@ const catchUpAsAnAgentWould = async (
     const args: Record<string, unknown> = { topic: String(topic), limit: TOOL_PAGE };
     if (since !== undefined) args.since = since;
     const answer = answerOf(await fetchRecent(args));
-    got.push(...answer.messages.map((m) => m.content));
+    for (const m of answer.messages) got.push(m.content);
     if (answer.nextCursor === undefined || answer.nextCursor === since) return got;
     since = answer.nextCursor;
   }

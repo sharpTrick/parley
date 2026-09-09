@@ -32,7 +32,7 @@ export async function readWindow(
   ]);
   const backwards = since === undefined;
   const want = Math.max(0, limit);
-  const out: Message[] = [];
+  let out: Message[] = [];
   let widen = 0;
   let anchor = backwards ? 'newest' : String(since);
   let includeAnchor = backwards;
@@ -73,10 +73,9 @@ export async function readWindow(
           'the cursor can be derived',
       );
     }
-    // Keep the unshift: pages from the newest anchor walk BACKWARDS, so appending would
-    // return the window in descending page order.
-    if (backwards) out.unshift(...got);
-    else out.push(...got);
+    // Pages from the newest anchor walk BACKWARDS, so appending would return the window in
+    // descending page order.
+    out = backwards ? got.concat(out) : out.concat(got);
     // Keep the window at the caller's limit: a widened page can serve more usable records than the
     // window still had room for, and the surplus is its FAR side, not its edge.
     if (out.length > want) {

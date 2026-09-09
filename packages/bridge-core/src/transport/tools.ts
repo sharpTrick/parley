@@ -27,17 +27,31 @@ export const MAX_FETCH_LIMIT = 1_000;
  * `bridge-core/src/transport/tools.ts` read by relative path, which reddens that plugin when this
  * file moves and reports the failure against the wrong package.
  */
+/**
+ * The terminal condition of the catch-up loop, in the words every artifact that teaches the loop
+ * ships. `TOOL_TEXT.fetch_recent` interpolates it; `skills/chat-handoff/SKILL.md` and
+ * `docs/CONVENTIONS.md` are graded against it by `skill-safety.test.ts`, so a correction here
+ * cannot be applied to the tool and left behind in the two documents an agent actually executes.
+ *
+ * Measured on live Synapse: an agent that stopped on the first EMPTY page reached 0 of the 3
+ * messages it had missed, and the same run reached all 3 once only cursor progress ended the loop.
+ */
+export const CATCH_UP_TERMINAL_CONDITION =
+  'keep calling with the `nextCursor` you are handed until it STOPS ADVANCING — the same cursor ' +
+  'twice, or none handed back at all. An EMPTY page does not mean you are done: a backend whose ' +
+  "history read is coarser than one topic hands back a page of other topics' messages, which " +
+  'reaches you as an empty page whose cursor moved on, and stopping there leaves everything ' +
+  'behind it unread.';
+
 export const TOOL_TEXT = {
   fetch_recent:
     'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
     'cursor from a previous call) to get only newer messages. Omit `since` and a bridge that keeps ' +
     'a read position for you resumes from it, so a session that was down comes back to the OLDEST ' +
     'message it has not seen; a bridge that keeps none — and a first-ever read of a topic — ' +
-    'answers with the most recent page instead. Either way, keep calling with the `nextCursor` you ' +
-    'are handed until it STOPS ADVANCING — the same cursor twice, or none handed back at all. An ' +
-    'EMPTY page does not mean you are done: a backend whose history read is coarser than one topic ' +
-    "hands back a page of other topics' messages, which reaches you as an empty page whose cursor " +
-    'moved on, and stopping there leaves everything behind it unread. Pass back only a ' +
+    'answers with the most recent page instead. Either way, ' +
+    CATCH_UP_TERMINAL_CONDITION +
+    ' Pass back only a ' +
     '`nextCursor` a previous page gave you: another cursor is read from, but does not move where ' +
     'this session resumes. Returns { messages, nextCursor } — ' +
     'nextCursor is omitted only when the read had no position to hand back at all: a since-less ' +
@@ -49,7 +63,16 @@ export const TOOL_TEXT = {
     'server-side), so a polling agent burns tokens per message, not per tick. A cancelled ' +
     'long-poll answers like any other empty window, echoing back the position it read from. ' +
     'Not every backend can park on a wait: one that cannot REFUSES `block_ms` with an ' +
-    'error naming itself, so retry without it and poll on your own cadence.',
+    'error naming itself, so retry without it and poll on your own cadence. ' +
+    'Pass `from: "recent"` when you want what is happening NOW rather than everything you ' +
+    'missed — a session away for a month reads the newest page instead of paging a month forward ' +
+    'to reach it. It leaves where this session resumes from untouched, so the backlog is still ' +
+    'there when you come back for it.',
+  fetch_recent_from:
+    'Where a read with no `since` STARTS. "position" (the default) resumes from where this ' +
+    'instance last read, so nothing you missed is skipped. "recent" asks for the backend\'s newest ' +
+    'page instead, and does NOT move where this session resumes from — the backlog stays reachable ' +
+    'by a later "position" read. Ignored when you pass `since`, which names its own start.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit to resume from where this ' +
     'instance last read, or — if it keeps no read position, or has never read this topic — from ' +
@@ -115,6 +138,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       .nonnegative()
       .optional()
       .describe(TOOL_TEXT.fetch_recent_block_ms),
+    from: z.enum(['position', 'recent']).optional().describe(TOOL_TEXT.fetch_recent_from),
   };
 
   server.registerTool(
@@ -123,7 +147,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       description: TOOL_TEXT.fetch_recent + describeAllowed(allow),
       inputSchema: z.object(fetchRecentInput).strict(),
     },
-    async ({ topic, since, limit, block_ms }, extra) => {
+    async ({ topic, since, limit, block_ms, from }, extra) => {
       const t = deps.allow.assert(topic);
       const args: FetchRecentArgs = { topic: t };
       // A caller with no cursor of its own resumes from the position THIS instance last read to.
@@ -131,7 +155,15 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // while the session was away, so everything older than that window — however much of it the
       // session had never been handed — is unreachable: the agent's next call asks for the recent
       // window again, and the window has only moved forward.
-      const resumeFrom = since === undefined ? deps.readState?.get(t) : asCursor(since);
+      //
+      // `from: 'recent'` asks for that window ON PURPOSE. It does not advance the stored position
+      // (the compare-and-set below refuses it), so the backlog it skipped stays reachable.
+      const resumeFrom =
+        since !== undefined
+          ? asCursor(since)
+          : from === 'recent'
+            ? undefined
+            : deps.readState?.get(t);
       if (resumeFrom !== undefined) args.since = resumeFrom;
       if (limit !== undefined) args.limit = Math.min(limit, MAX_FETCH_LIMIT);
       const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;

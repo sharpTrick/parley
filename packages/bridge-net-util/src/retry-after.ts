@@ -99,10 +99,12 @@ export function retryAfterFromHeader(res: Response): number | undefined {
   const raw = res.headers.get('retry-after');
   if (raw === null) return undefined;
   const from = serverNow(res);
-  const candidates = fieldValues(raw)
-    .map((part) => oneRetryAfterValue(part, from))
-    .filter((ms): ms is number => ms !== undefined && ms > 0);
-  return candidates.length === 0 ? undefined : Math.max(...candidates);
+  let longest: number | undefined;
+  for (const part of fieldValues(raw)) {
+    const ms = oneRetryAfterValue(part, from);
+    if (ms !== undefined && ms > 0 && (longest === undefined || ms > longest)) longest = ms;
+  }
+  return longest;
 }
 
 /** A hint only counts as server-stated when it is a real, positive duration. */

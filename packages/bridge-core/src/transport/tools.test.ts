@@ -380,6 +380,77 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
     return got;
   };
 
+  /**
+   * One row per CALLER INTENT the tool description names, with the argument spelling that expresses
+   * it. A capability whose intent has no spelling fails its row rather than disappearing quietly:
+   * "the newest page" was reachable by omitting `since` until a since-less read was redefined to
+   * resume from the stored position, and nothing anywhere asked whether the intent still had one.
+   *
+   * Judged on WHICH END of the backlog comes back, so an intent answered by the wrong one — the
+   * commonest way one of these silently becomes an alias of another — fails. Driven through the
+   * real client, so a spelling the `.strict()` schema does not accept fails here too.
+   */
+  const INTENTS: ReadonlyArray<
+    readonly [
+      intent: string,
+      spell: (cursorFromAPreviousPage: string) => Record<string, unknown>,
+      holds: (got: string[], missed: string[]) => void,
+    ]
+  > = [
+    ['resume where I left off', () => ({}), (got, missed) => expect(got[0]).toBe(missed[0])],
+    [
+      'everything since cursor C',
+      (cursor) => ({ since: cursor }),
+      (got, missed) => expect(got[0]).toBe(missed[0]),
+    ],
+    ['the newest page', () => ({ from: 'recent' }), (got, missed) => expect(got.at(-1)).toBe(missed.at(-1))],
+  ];
+
+  const read = async (client: Client, args: Record<string, unknown>): Promise<string[]> =>
+    (
+      parse(await client.callTool({ name: 'parley_fetch_recent', arguments: args })) as {
+        messages: Array<{ content: string }>;
+      }
+    ).messages.map((m) => m.content);
+
+  /** A session that read this topic once, and was then away while more than one page arrived. */
+  const awayAfterReading = async (): Promise<{
+    client: Client;
+    cursor: string;
+    missed: string[];
+  }> => {
+    const { client, plugin } = await harness({ readState: memoryReadState() });
+    await plugin.post(T, bob, 'read-in-session-one');
+    const opening = parse(
+      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
+    ) as { nextCursor?: string };
+    for (let i = 0; i < MISSED; i++) await plugin.post(T, bob, `missed-${i}`);
+    return {
+      client,
+      cursor: opening.nextCursor!,
+      missed: Array.from({ length: MISSED }, (_unused, i) => `missed-${i}`),
+    };
+  };
+
+  it.each(INTENTS)('an agent can spell the intent: %s', async (_intent, spell, holds) => {
+    const { client, cursor, missed } = await awayAfterReading();
+    holds(await read(client, { topic: 'ctx', limit: PAGE, ...spell(cursor) }), missed);
+  });
+
+  /**
+   * The newest page is a READ, not a seek: an agent that asks what is happening now must not lose
+   * the backlog by asking, since the stored position is the only thing that keeps it reachable.
+   */
+  it('asking for the newest page does not consume the backlog', async () => {
+    const { client, missed } = await awayAfterReading();
+    await read(client, { topic: 'ctx', limit: PAGE, from: 'recent' });
+    expect(
+      await drainAsAnAgentWould(client),
+      'a read of the newest page dragged the stored position past the backlog, so everything ' +
+        'between the two is now unreachable by resuming',
+    ).toEqual(missed);
+  });
+
   it('a session that was down reaches every message it missed, oldest first', async () => {
     const readState = memoryReadState();
     const { client, plugin } = await harness({ readState });

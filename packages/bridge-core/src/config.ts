@@ -109,7 +109,8 @@ const ConfigObject = z.object({
         .int()
         .positive({
           message:
-            'catchup.block_max_ms must be > 0 (ms): every caller\'s block_ms is clamped to this ' +
+            'catchup.block_max_ms must be > 0 (ms). An earlier release accepted 0 here and this ' +
+            'one refuses it: every caller\'s block_ms is clamped to this ' +
             'before it reaches a plugin, so a ceiling of 0 means no backend is ever handed a ' +
             'budget, none can refuse one, and parley_fetch_recent answers a long poll at once ' +
             'with an empty page the caller cannot tell from one that timed out. To turn the long ' +
@@ -125,11 +126,15 @@ const ConfigObject = z.object({
        * on a backend whose delivery is coarser than a topic, or a native blocker cut short. Nothing
        * re-drives a plugin that is still parked; the wrapper is waiting on that call.
        *
-       * So this is not the delivery latency of a blocking fetch. Both backends that park natively
-       * spend the budget inside ONE `fetchRecent` and never reach the nap (measured against a live
-       * Redis and a live NATS: a message posted 400 ms into an 8 s budget arrives at 402 ms, an idle
-       * 1200 ms budget returns at ~1205 ms — the same at a cadence of 250 ms and of 5000 ms), and
-       * the eight backends that refuse `block_ms` never start the loop at all.
+       * So this is not the delivery latency while a plugin is parked: the two backends that park
+       * natively spend the budget inside ONE `fetchRecent` (measured against a live Redis and a live
+       * NATS: a message posted 400 ms into an 8 s budget arrives at 402 ms, an idle 1200 ms budget
+       * returns at ~1205 ms — the same at a cadence of 250 ms and of 5000 ms), and the eight
+       * backends that refuse `block_ms` never start the loop at all.
+       *
+       * They do not always stay parked. Redis returns early on a disconnect landing inside the
+       * budget, on a caught reader failure, and for a caller past its concurrent-reader cap — and
+       * this cadence is what honours the rest of that caller's budget.
        */
       block_poll_interval_ms: z
         .number()

@@ -821,6 +821,64 @@ describe('a retired config key is refused by name, not as a suspected typo', () 
   });
 });
 
+/**
+ * A key that KEPT its name and lost part of its RANGE is the migration a retired-key table cannot
+ * see: `catchup.block_max_ms: 0` loaded at the previous release and is a load error now, and the
+ * refusal arrived as a bare range message while `presence` — removed in the same period — got a
+ * named one. An operator who reads "must be > 0" learns that their file is wrong, not that it used
+ * to be right, and not what to write instead.
+ *
+ * One row per value that was legal at the previous release, asserting the diagnostic names THE OLD
+ * VALUE and says what to do instead. The positive control is what keeps the rows honest.
+ */
+describe('a value legal at the previous release is refused with a migration note', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parley-narrowed-'));
+  const BASE = 'identity:\n  handle: ctx\ntopics:\n  - ctx\n';
+
+  const NARROWED = [
+    [
+      'catchup.block_max_ms',
+      '0',
+      'catchup:\n  block_max_ms: 0\n',
+      /accepted 0 here/,
+      /stop sending block_ms/,
+    ],
+  ] as const;
+
+  const write = (name: string, text: string): string => {
+    const path = join(dir, `${name}.yaml`);
+    writeFileSync(path, text);
+    return path;
+  };
+
+  it('a value still legal loads (positive control: the rows cannot pass by throwing always)', () => {
+    expect(loadConfig(write('legal', `${BASE}catchup:\n  block_max_ms: 1000\n`)).catchup.block_max_ms).toBe(
+      1000,
+    );
+  });
+
+  it.each(NARROWED)('%s no longer accepts %s', (key, old, yaml, namesOld, saysWhatInstead) => {
+    let thrown: unknown;
+    try {
+      loadConfig(write(key.replace(/\./g, '-'), BASE + yaml));
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown, `${key}: ${old} was accepted`).toBeInstanceOf(Error);
+    const rendered = (thrown as Error).message;
+    expect(rendered, 'the diagnostic must name the key by its own path').toContain(key);
+    expect(
+      rendered,
+      `${key} used to accept ${old}; the diagnostic does not say so, so an operator upgrading ` +
+        'reads a typo where a migration happened',
+    ).toMatch(namesOld);
+    expect(
+      rendered,
+      `${key} tells the operator their value is refused but not what to write instead`,
+    ).toMatch(saysWhatInstead);
+  });
+});
+
 // `loadConfig` is what every shipped backend CLI calls, so its failure message is the first thing a
 // stuck operator reads. Grade the CLASS "every way a config FILE can fail names the file and the
 // kind of failure" rather than the empty-document instance: one row per way a whole file goes wrong,

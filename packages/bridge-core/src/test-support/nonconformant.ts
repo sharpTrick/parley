@@ -183,15 +183,24 @@ export function pagingProbe(serve: ServePage): { plugin: BackendPlugin; calls: F
  */
 export function memoryReadState(): {
   path: string;
+  warmPath: string;
   get(topic: Topic): Cursor | undefined;
   set(topic: Topic, cursor: Cursor): void;
+  warmedThrough(topic: Topic): Cursor | undefined;
+  markWarmed(topic: Topic, cursor: Cursor): void;
 } {
   const state = new Map<Topic, Cursor>();
+  const warmed = new Map<Topic, Cursor>();
   return {
     path: '<memory>',
+    warmPath: '<memory:warmed>',
     get: (topic) => state.get(topic),
     set: (topic, cursor) => {
       state.set(topic, cursor);
+    },
+    warmedThrough: (topic) => warmed.get(topic),
+    markWarmed: (topic, cursor) => {
+      warmed.set(topic, cursor);
     },
   };
 }

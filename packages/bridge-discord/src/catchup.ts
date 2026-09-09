@@ -70,7 +70,8 @@ async function walk(
     const size = Math.min(limit - walked.length, PAGE_LIMIT);
     const chunk = await pageWithin(page, query(size, walked.at(-1)?.id), deadline, n);
     if (chunk === undefined || chunk.length === 0) break;
-    walked.push(...(forward ? chunk.reverse() : chunk));
+    if (forward) chunk.reverse();
+    for (const m of chunk) walked.push(m);
     if (chunk.length < size) break;
   }
   return forward ? walked : walked.reverse();

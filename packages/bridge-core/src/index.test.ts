@@ -245,7 +245,7 @@ describe('public barrel surface', () => {
     ParleyOAuthProviderOptions: ['consentPath', 'now', 'resource', 'scopesSupported', 'verifyOwner'],
     ParseArgsOptions: ['bin', 'env', 'version'],
     PushLoopOptions: ['identity', 'mentionFilter'],
-    ReadStateStore: ['constructor', 'get', 'path', 'set'],
+    ReadStateStore: ['constructor', 'get', 'markWarmed', 'path', 'set', 'warmPath', 'warmedThrough'],
     RemoteAuthOptions: [
       'fetchFn', 'mcpPath', 'now', 'publicUrl', 'scopesSupported', 'trustProxy', 'verifyOwner',
     ],

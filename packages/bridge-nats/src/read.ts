@@ -148,12 +148,12 @@ export abstract class NatsReads extends NatsPulls {
     // walk BACKWARDS in growing windows, so that a deep hole costs work proportional to the hole
     // rather than to the retained history: reading the whole range in one pull instead makes core's
     // cold start stream — and materialize — every message the topic ever had to return `limit`.
-    const newest: Message[] = [];
+    let newest: Message[] = [];
     let startSeq = tailSeq + 1;
     for (let span = limit, top = tailSeq; newest.length < limit && top >= firstSeq; span *= WIDEN_FACTOR) {
       startSeq = Math.max(firstSeq, top - span + 1, 1);
       const read = await this.pull(stream, args.topic, startSeq, top - startSeq + 1, top, limit - newest.length);
-      newest.unshift(...read);
+      newest = read.concat(newest);
       if (startSeq <= firstSeq) break;
       top = startSeq - 1;
     }

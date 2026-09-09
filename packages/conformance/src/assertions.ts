@@ -47,7 +47,7 @@ export async function drainAll(plugin: BackendPlugin, topic: Topic): Promise<Mes
           `DRAIN_PAGE or lower the volume; do not grade a partial view.`,
       );
     }
-    out.push(...res.messages);
+    for (const m of res.messages) out.push(m);
     if (res.messages.length === 0 || res.nextCursor === since) return out;
     since = res.nextCursor;
   }
