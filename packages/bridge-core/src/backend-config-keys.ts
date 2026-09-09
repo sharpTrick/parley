@@ -7,18 +7,34 @@
  * Record<keyof Required<XBackendConfig>, 0>` form every backend uses — so that a key added to the
  * interface and not to the list is a compile error rather than a key `connect()` rejects.
  */
-/** True for an object literal — the only shape `backend_config` and its nested groups may take. */
-export const isPlainObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
 export interface BackendConfigKeys {
   readonly keys: readonly string[];
   readonly nested?: Readonly<Record<string, readonly string[]>>;
 }
 
+/**
+ * True for an object literal — the only shape `backend_config` and its nested groups may take, and
+ * the two prototypes a YAML/JSON parse produces. Every consumer uses this as the
+ * enumerate-this-container gate, so anything it admits that `Object.entries` reads as EMPTY is a
+ * config accepted with zero mappings by a loader whose whole job is to refuse one: a `Date`, a
+ * `Buffer`, a boxed primitive and a class instance all enumerate to nothing while passing a bare
+ * `typeof value === 'object'`.
+ */
+export const isPlainObject = (value: unknown): value is Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+};
+
 /** What a value IS, for a diagnostic that must never carry what a value HOLDS. */
 const typeName = (value: unknown): string =>
-  Array.isArray(value) ? 'an array' : value === null ? 'null' : `a ${typeof value}`;
+  Array.isArray(value)
+    ? 'an array'
+    : value === null
+      ? 'null'
+      : typeof value === 'object'
+        ? 'an object'
+        : `a ${typeof value}`;
 
 function refuse(plugin: string, path: string, allowed: readonly string[], prefix: string): never {
   throw new Error(
