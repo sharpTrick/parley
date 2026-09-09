@@ -8,12 +8,7 @@ import { isIPv4, isIPv6 } from 'node:net';
  */
 const SECURE_SCHEMES = new Set(['https:', 'wss:']);
 
-/**
- * The origin to name when the URL would put a credential on the wire in the clear, else undefined.
- * Keep the warning on the ORIGIN rather than the whole configured URL, so that a secret smuggled
- * into a path of a key secret-hygiene classifies by NAME as harmless is not the thing stderr — and
- * the tool result core hands the model — prints.
- */
+/** The origin to name when the URL would put a credential on the wire in the clear, else undefined. */
 export function plaintextRemoteOrigin(baseUrl: string): string | undefined {
   try {
     const { protocol, hostname, host } = new URL(baseUrl);
