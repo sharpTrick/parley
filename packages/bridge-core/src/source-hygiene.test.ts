@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   backendPackages,
   codeOf,
+  commentaryLines,
   derivedRows,
   filesUnder,
   withoutComments,
@@ -105,109 +106,6 @@ describe('source hygiene', () => {
       'pkg/src/a/b/deep.ts',
       'pkg/src/shallow.ts',
     ]);
-  });
-
-  /**
-   * These rules are about COMMENTS and test NAMES, so scan only those. A sibling comment lint has to
-   * quote the shapes it bans — `example: '// as discussed with the reviewer, this stays.'` is a
-   * negative control proving its matcher fires — and a line-wide grep reads that fixture as an
-   * offence. Exempting the FILE would have excused `connection-hygiene`, `publish-hygiene` and
-   * `secret-hygiene` too, which are not comment lints at all; matching the stated scope is narrower
-   * and needs no allowlist.
-   */
-  const STRINGS = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
-  const TITLE = /^\s*(?:it|test|describe)(?:\.\w+)*(?:\.each\([^)]*\))?\s*\(\s*(['"`])((?:[^\\]|\\.)*?)\1/;
-
-  /**
-   * The text these rules govern, and nothing else. Blanking string literals BEFORE looking for `//`
-   * is what separates a comment from a fixture that quotes one, and it keeps a TRAILING comment in
-   * scope — matching on line shape instead would let `const x = 1; // as of now` through, trading a
-   * false positive for a false negative.
-   *
-   * Block state carries ACROSS lines, so that a `/* … *\/` whose continuations do not start with
-   * `*` is still commentary — the prime-directive rule below is the one form of backend dependency
-   * the import graph can never catch, and half the comment grammar was invisible to it. Clearing
-   * the state on `*\/` is as load-bearing as setting it: a flag never cleared reports the whole
-   * rest of a file as commentary, which is worse than the hole.
-   */
-  const commentaryOf = (line: string, inBlock = false): { text: string; inBlock: boolean } => {
-    const title = TITLE.exec(line)?.[2] ?? '';
-    const code = line.replace(STRINGS, (m) => m[0]!.repeat(m.length));
-    const said = (text: string, open: boolean): { text: string; inBlock: boolean } => ({
-      text: `${title} ${text}`,
-      inBlock: open,
-    });
-    if (inBlock) {
-      const end = code.indexOf('*/');
-      if (end < 0) return said(line, true);
-      const after = code.slice(end + 2).indexOf('//');
-      return said(line.slice(0, end + 2) + (after >= 0 ? line.slice(end + 2 + after) : ''), false);
-    }
-    const at = Math.min(
-      ...[code.indexOf('//'), code.indexOf('/*')].filter((i) => i >= 0).concat(Number.MAX_SAFE_INTEGER),
-    );
-    const trimmed = line.trim();
-    if (at === Number.MAX_SAFE_INTEGER) return said(trimmed.startsWith('*') ? trimmed : '', false);
-    return said(line.slice(at), code.indexOf('/*') === at && code.indexOf('*/', at + 2) < 0);
-  };
-
-  /** Every line's commentary, with the block state threaded through the file as the lints see it. */
-  const commentaryLines = (source: string): string[] => {
-    let inBlock = false;
-    return source.split('\n').map((line) => {
-      const seen = commentaryOf(line, inBlock);
-      inBlock = seen.inBlock;
-      return seen.text;
-    });
-  };
-
-  const PROBE = /the reviewer|as of (?:today|now)|for the time being/i;
-
-  /**
-   * Parameterised by the SHAPE a comment is written in rather than by the words in it. Every row
-   * appears twice — once carrying the banned phrase, once with the same shape carrying it inside a
-   * string literal, which is code and must stay out of scope. Rows that are all shapes the scanner
-   * already sees cannot tell a working scanner from one blind to half the grammar.
-   */
-  const SHAPES: readonly (readonly [label: string, flagged: string, ignored: string])[] = [
-    [
-      'a whole-line comment',
-      '// as discussed with the reviewer, this stays.',
-      "  example: '// as discussed with the reviewer, x.',",
-    ],
-    ['a trailing comment', 'const x = 1; // as of now this is fine', "const u = 'https://x/as-of-today';"],
-    ['a JSDoc continuation', '/**\n * kept as of today\n */', 'const TEMPORAL = /the reviewer/i;'],
-    ['a one-line block comment', '/* kept as of today */', "const s = '/* kept as of today */';"],
-    [
-      'a block comment continued without a leading star',
-      '/*\n   kept as of today,\n   and tomorrow\n*/',
-      "const s = ['/*', 'kept as of today', '*/'].join('');",
-    ],
-    [
-      'a block continuation carrying a quote character',
-      "/*\n   the reviewer's note\n*/",
-      'const s = "/* the reviewer\'s note */";',
-    ],
-    [
-      'a test name',
-      "  it('as of today it holds', () => {})",
-      "  it('holds', () => { const s = 'as of today'; })",
-    ],
-  ];
-
-  it.each(SHAPES)('scans %s', (_label, flagged, ignored) => {
-    expect(commentaryLines(flagged).some((text) => PROBE.test(text))).toBe(true);
-    expect(commentaryLines(ignored).some((text) => PROBE.test(text))).toBe(false);
-  });
-
-  /**
-   * The clear half graded on its own: everything after a closed block is code again. A scanner that
-   * sets the flag and never clears it satisfies every row above and then flags the whole repository.
-   */
-  it('stops treating a file as commentary once the block closes', () => {
-    const lines = commentaryLines('/*\n   a note\n*/\nconst asOfToday = 1;\nconst reviewer = 2;\n');
-    expect(lines[1]).toContain('a note');
-    expect(lines.slice(3).join('\n')).not.toMatch(/asOfToday|reviewer/);
   });
 
   /**
