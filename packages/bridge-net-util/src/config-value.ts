@@ -58,6 +58,7 @@ export const RENDERED_BY_VALUE: Readonly<Record<string, string>> = {
  */
 function render(value: unknown): string {
   if (typeof value === 'number') return String(value);
+  if (typeof value === 'symbol') return describeConfigShape(value);
   if (value !== null && (typeof value === 'object' || typeof value === 'function')) {
     return describeConfigShape(value);
   }

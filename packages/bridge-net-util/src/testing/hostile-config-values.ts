@@ -86,6 +86,8 @@ export const WRAPPING_A_SECRET: readonly (readonly [string, unknown])[] = [
   ['a value whose toString yields it', { toString: () => PLANTED_SECRET }],
   ['a boxed String', new String(PLANTED_SECRET)],
   ['a value with a Symbol.toPrimitive', { [Symbol.toPrimitive]: () => PLANTED_SECRET }],
+  ['a symbol whose description is it', Symbol(PLANTED_SECRET)],
+  ['a function whose source names it', (): string => PLANTED_SECRET],
 ];
 
 /**
