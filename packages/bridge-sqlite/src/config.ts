@@ -184,7 +184,7 @@ export function describe(v: unknown): string {
   if (v === undefined) return 'undefined';
   if (Array.isArray(v)) return 'an array';
   if (typeof v === 'number') return String(v);
-  return typeof v === 'object' || typeof v === 'function' ? `an ${typeof v}` : `a ${typeof v}`;
+  return typeof v === 'object' ? 'an object' : `a ${typeof v}`;
 }
 
 export function normalizeLimit(limit: number | undefined, topic: Topic): number {
