@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { derivedRows, withoutComments } from '@sharptrick/parley-net-util/testing';
+import { derivedRows, withoutComments, workspacePackages } from '@sharptrick/parley-net-util/testing';
 
 /**
  * CLASS: a file in one package reaching INTO another one by path.
@@ -25,23 +25,8 @@ import { derivedRows, withoutComments } from '@sharptrick/parley-net-util/testin
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 
-const workspaceAreas = (root: string): string[] => [
-  ...new Set(
-    (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { workspaces?: string[] })
-      .workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [],
-  ),
-];
-
 /** Every directory holding a manifest under a declared workspace area — the set, never a member. */
-function packageDirs(root: string): string[] {
-  return workspaceAreas(root).flatMap((area) => {
-    const at = join(root, area);
-    if (!existsSync(at)) return [];
-    return readdirSync(at)
-      .map((d) => join(at, d))
-      .filter((d) => statSync(d).isDirectory() && existsSync(join(d, 'package.json')));
-  });
-}
+const packageDirs = (root: string): string[] => workspacePackages(root).map((p) => p.dir);
 
 function tsFilesUnder(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

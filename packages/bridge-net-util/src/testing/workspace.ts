@@ -83,12 +83,6 @@ export const backendPackages = (root?: string): WorkspacePackage[] =>
     (p) => SUITE in { ...p.manifest.dependencies, ...p.manifest.devDependencies },
   );
 
-/** The workspaces that publish to npm. */
-export const publicWorkspaces = (root?: string): WorkspacePackage[] =>
-  workspacePackages(root).filter(
-    (p) => p.manifest.private !== true && p.manifest.publishConfig?.access === 'public',
-  );
-
 const NEVER_WALKED = new Set(['node_modules', 'dist', '.git', 'coverage']);
 
 /** Every file under `dir`, recursively, filtered by extension. Never a flat listing. */

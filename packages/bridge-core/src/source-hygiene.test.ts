@@ -1,8 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { derivedRows, filesUnder, withoutComments } from '@sharptrick/parley-net-util/testing';
+import {
+  backendPackages,
+  derivedRows,
+  filesUnder,
+  withoutComments,
+  workspacePackages,
+} from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
@@ -87,19 +93,7 @@ describe('source hygiene', () => {
    * depth from the tree — so neither can be satisfied by the layout happening to be flat today.
    */
   it('reaches every workspace package, at every depth', () => {
-    const areas = [
-      ...new Set(
-        (
-          JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { workspaces?: string[] }
-        ).workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [],
-      ),
-    ];
-    expect(areas.length).toBeGreaterThan(1);
-    const packages = areas.flatMap((area) =>
-      readdirSync(join(REPO, area))
-        .map((d) => join(REPO, area, d))
-        .filter((d) => existsSync(join(d, 'package.json'))),
-    );
+    const packages = workspacePackages(REPO).map((p) => p.dir);
     expect(packages.length).toBeGreaterThan(10);
     const unlinted = packages.filter((dir) => !codeFiles.some((f) => f.startsWith(`${dir}/`)));
     expect(unlinted.map((d) => d.slice(REPO.length)), 'this package is graded by no rule here').toEqual([]);
@@ -271,36 +265,10 @@ describe('source hygiene', () => {
    */
   const SUITE = '@sharptrick/parley-conformance';
 
-  interface Manifest {
-    name?: string;
-    workspaces?: string[];
-    dependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-  }
+  const backends = (repo: string = REPO): { dir: string; name: string }[] =>
+    backendPackages(repo).map((p) => ({ dir: p.folder, name: p.name }));
 
-  const manifestAt = (dir: string): Manifest =>
-    JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as Manifest;
-
-  function backendPackages(repo: string = REPO): { dir: string; name: string }[] {
-    const root = manifestAt(repo);
-    const areas = [...new Set(root.workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [])];
-    return areas
-      .flatMap((area) => {
-        const at = join(repo, area);
-        if (!existsSync(at)) return [];
-        return readdirSync(at)
-          .map((entry) => ({ dir: join(at, entry), entry }))
-          .filter(({ dir }) => statSync(dir).isDirectory() && existsSync(join(dir, 'package.json')));
-      })
-      .flatMap(({ dir, entry }) => {
-        const pkg = manifestAt(dir);
-        if (!(SUITE in { ...pkg.dependencies, ...pkg.devDependencies })) return [];
-        return [{ dir: entry, name: pkg.name ?? entry }];
-      })
-      .sort((a, b) => a.dir.localeCompare(b.dir));
-  }
-
-  const BACKEND_PACKAGES = backendPackages();
+  const BACKEND_PACKAGES = backends();
   const escaped = (text: string): string => text.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
   /**
    * Both spellings core could name a backend by: the package directory and the published name.
@@ -539,8 +507,8 @@ describe('source hygiene', () => {
     plant('packages/bridge-core/package.json', JSON.stringify({ name: '@x/bridge-core' }));
     plant('packages/bridge-net-util/package.json', JSON.stringify({ name: '@x/bridge-net-util' }));
 
-    expect(backendPackages(root)).toEqual([{ dir: 'bridge-signal', name: '@x/bridge-signal' }]);
-    const rule = ruleFor(backendPackages(root));
+    expect(backends(root)).toEqual([{ dir: 'bridge-signal', name: '@x/bridge-signal' }]);
+    const rule = ruleFor(backends(root));
     expect(rule.test('hashed exactly like bridge-signal does')).toBe(true);
     expect(rule.test('re-exported from @x/bridge-signal')).toBe(true);
     expect(rule.test('see packages/bridge-signal/src/schema.ts for the same shape')).toBe(true);

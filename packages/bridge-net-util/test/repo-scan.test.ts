@@ -11,7 +11,6 @@ import {
   filesUnder,
   importedNames,
   importsIn,
-  publicWorkspaces,
   withoutComments,
   workspacePackages,
   workspaceRoot,
@@ -62,10 +61,9 @@ describe('the workspace derivation', () => {
     ]);
   });
 
-  it('separates the backends and the published set structurally', () => {
+  it('separates the backends structurally, by what they declare', () => {
     const root = plant(TREE);
     expect(backendPackages(root).map((p) => p.name)).toEqual(['@x/alpha']);
-    expect(publicWorkspaces(root).map((p) => p.name)).toEqual(['@x/alpha']);
   });
 
   it('walks to every depth and never into node_modules', () => {

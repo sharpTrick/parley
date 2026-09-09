@@ -21,12 +21,6 @@ export {
   consumersOf,
 } from './imports.js';
 export {
-  type LintTarget,
-  lintEveryPackage,
-  lintTargets,
-  type SourceRule,
-} from './lint.js';
-export {
   codeOf,
   commentaryLines,
   withoutComments,
@@ -35,7 +29,6 @@ export {
   backendPackages,
   filesUnder,
   type Manifest,
-  publicWorkspaces,
   SUITE,
   type WorkspacePackage,
   workspaceAreas,
