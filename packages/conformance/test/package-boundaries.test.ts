@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { derivedRows, withoutComments } from '@sharptrick/parley-net-util/testing';
 
 /**
  * CLASS: a file in one package reaching INTO another one by path.
@@ -51,10 +52,6 @@ function tsFilesUnder(dir: string, out: string[] = []): string[] {
   }
   return out;
 }
-
-/** A path named in prose is not a read, and this file has to be able to describe what it bans. */
-const withoutComments = (source: string): string =>
-  source.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
 
 /** What a path segment this scan cannot read stands for: anything, of any depth. */
 const UNKNOWN_SEGMENT = '*';
@@ -128,6 +125,91 @@ export function reachesIntoAnotherPackage(
   });
 }
 
+/**
+ * `const NAME = …` bindings this scan can resolve to a directory.
+ *
+ * Judging only paths that BEGIN with `..` left the repo-root spelling walking straight through —
+ * `const REPO = fileURLToPath(new URL('../../../', import.meta.url))` and then
+ * `readFileSync(join(REPO, 'packages', 'bridge-core', 'src', 'seam.ts'))`. That is the spelling the
+ * repo's own meta-guards use, so it is the one the next author copies. A head this scan cannot
+ * resolve — a `mkdtempSync` root, a caller's argument — stays unjudged, because a planted tree is
+ * where the rules below are graded and flagging one would make the rule unusable.
+ */
+export function rootBindings(file: string, source: string): Map<string, string> {
+  const code = withoutComments(source);
+  const known = new Map<string, string>();
+  const segments = (args: string): string[] =>
+    [...args.matchAll(/'([^'\n]*)'|"([^"\n]*)"/g)].map((m) => m[1] ?? m[2] ?? '');
+  for (const m of code.matchAll(/\b(?:const|let|var)\s+(\w+)\s*=\s*([^;]+);/g)) {
+    const name = m[1] as string;
+    const expression = m[2] as string;
+    const literals = segments(expression);
+    if (/import\.meta\.url/.test(expression) && literals.length > 0) {
+      known.set(name, resolve(dirname(file), literals[0] as string));
+      continue;
+    }
+    const url = /new URL\(\s*(?:'([^'\n]*)'|"([^"\n]*)")\s*,\s*(\w+)\s*\)/.exec(expression);
+    const from = url === null ? undefined : known.get(url[3] as string);
+    if (url !== null && from !== undefined) {
+      known.set(name, resolve(from, (url[1] ?? url[2]) as string));
+      continue;
+    }
+    const rooted = /\b(?:join|resolve)\(\s*(\w+)\s*,([^)]*)\)/.exec(expression);
+    const head = rooted === null ? undefined : known.get(rooted[1] as string);
+    if (rooted !== null && head !== undefined) {
+      const rest = segments(rooted[2] as string);
+      if (rest.length > 0) known.set(name, resolve(head, rest.join('/')));
+    }
+  }
+  return known;
+}
+
+/** Every absolute path a source builds from a head this scan resolved, whatever that head is called. */
+export function rootedPathsNamed(file: string, source: string): string[] {
+  const known = rootBindings(file, source);
+  const code = withoutComments(source);
+  const out: string[] = [];
+  for (const m of code.matchAll(/\b(?:join|resolve)\(([^)]*)\)/g)) {
+    const args = argumentsOf(m[1] as string);
+    const head = known.get(args[0] ?? '');
+    if (head === undefined || args.length < 2) continue;
+    out.push(
+      resolve(
+        head,
+        args
+          .slice(1)
+          .map((a) => (/^(?:'[^']*'|"[^"]*")$/.test(a) ? a.slice(1, -1) : UNKNOWN_SEGMENT))
+          .join('/'),
+      ),
+    );
+  }
+  for (const m of code.matchAll(/new URL\(\s*(?:'([^'\n]*)'|"([^"\n]*)")\s*,\s*(\w+)\s*\)/g)) {
+    const head = known.get(m[3] as string);
+    if (head !== undefined) out.push(resolve(head, (m[1] ?? m[2]) as string));
+  }
+  return out;
+}
+
+/**
+ * Which of `file`'s rooted paths land inside a package other than the one holding it.
+ *
+ * A path carrying a segment this scan could not read is a DERIVATION — `join(REPO, area, folder)`
+ * over what `readdirSync` returned — and deriving the package set is the sanctioned shape. Only a
+ * path that names a member as a literal is judged here; the `..`-headed rule above keeps its own
+ * conservative reading of a wildcard, where the segment is one the author wrote.
+ */
+export function rootedReaches(
+  file: string,
+  source: string,
+  own: string,
+  packages: string[],
+): string[] {
+  const inside = (abs: string, dir: string): boolean => abs === dir || abs.startsWith(`${dir}/`);
+  return [...new Set(rootedPathsNamed(file, source))]
+    .filter((abs) => !abs.includes(UNKNOWN_SEGMENT))
+    .filter((abs) => packages.some((dir) => dir !== own && inside(abs, dir)));
+}
+
 const PACKAGES = packageDirs(REPO);
 
 describe('no package reaches into another one by path', () => {
@@ -142,12 +224,20 @@ describe('no package reaches into another one by path', () => {
     expect(naming.length, 'no relative path found at all — the extractor stopped matching').toBeGreaterThan(20);
   });
 
-  it.each(PACKAGES.map((dir) => [relative(REPO, dir), dir] as const))('%s', (_name, own) => {
-    const offenders = filesOf(own).flatMap((f) =>
-      reachesIntoAnotherPackage(f, readFileSync(f, 'utf8'), own, PACKAGES).map(
-        (p) => `${relative(REPO, f)} → ${p}`,
-      ),
-    );
+  const rows = derivedRows(
+    'every workspace package',
+    () => PACKAGES.map((dir) => [relative(REPO, dir), dir] as const),
+    { floor: 11, witness: ['packages/bridge-core', 'packages/conformance'] },
+  );
+
+  it.each(rows)('%s', (_name, own) => {
+    const offenders = filesOf(own).flatMap((f) => {
+      const source = readFileSync(f, 'utf8');
+      return [
+        ...reachesIntoAnotherPackage(f, source, own, PACKAGES),
+        ...rootedReaches(f, source, own, PACKAGES).map((abs) => relative(REPO, abs)),
+      ].map((p) => `${relative(REPO, f)} → ${p}`);
+    });
     expect(
       offenders,
       'reaches into another package by path; import the symbol through the package name instead',
@@ -243,5 +333,40 @@ describe('the boundary rule on a planted tree', () => {
     expect(verdict(root, 'examples/demo/test/a.test.ts', body)).toEqual([
       '../../../packages/beta/src/seam.js',
     ]);
+  });
+
+  /**
+   * The same rule reached from a HEAD the scan has to resolve. Every row here starts at a repo root
+   * rather than at `..`, which is the spelling the repository's own guards use and therefore the one
+   * the next author copies — and it walked through the `..`-only rule untouched.
+   */
+  const ROOT_OF = (up: string): string =>
+    `const REPO = fileURLToPath(new URL('${up}', import.meta.url));\n`;
+  const FROM_ALPHA = ROOT_OF('../' + '../' + '../');
+
+  const rootedVerdict = (root: string, path: string, body: string): string[] => {
+    const packages = packageDirs(root);
+    const file = join(root, path);
+    const own = packages.find((d) => file.startsWith(`${d}/`)) as string;
+    return rootedReaches(file, body, own, packages).map((abs) => relative(root, abs));
+  };
+
+  it.each([
+    ['a segment list off the repo root', `${FROM_ALPHA}readFileSync(join(REPO, 'packages', 'beta', 'src', 'seam.ts'));`, ['packages/beta/src/seam.ts']],
+    ['one literal off the repo root', `${FROM_ALPHA}readFileSync(join(REPO, 'packages/beta/src/seam.ts'));`, ['packages/beta/src/seam.ts']],
+    ['a URL off the repo root', `${FROM_ALPHA}readFileSync(new URL('packages/beta/src/seam.ts', REPO));`, ['packages/beta/src/seam.ts']],
+    ['a root resolved one binding at a time', `${FROM_ALPHA}const BETA = join(REPO, 'packages', 'beta');\nreadFileSync(join(BETA, 'src', 'seam.ts'));`, ['packages/beta', 'packages/beta/src/seam.ts']],
+    ['naming the sibling package directory itself', `${FROM_ALPHA}readdirSync(join(REPO, 'packages', 'beta'));`, ['packages/beta']],
+    // The mirror rows. Deriving the package SET is the sanctioned shape, and a head this scan
+    // cannot resolve — a planted tree, a caller's argument — is not a statement about this repo.
+    ['a derived member of the package set', `${FROM_ALPHA}readdirSync(join(REPO, 'packages', folder, 'src'));`, []],
+    ['the packages root itself', `${FROM_ALPHA}readdirSync(join(REPO, 'packages'));`, []],
+    ['a repo-root document', `${FROM_ALPHA}readFileSync(join(REPO, 'DESIGN.md'));`, []],
+    ['a path under its own package', `${FROM_ALPHA}readFileSync(join(REPO, 'packages', 'alpha', 'src', 'x.ts'));`, []],
+    ['a temporary tree the scan cannot resolve', "const root = mkdtempSync('x');\nwriteFileSync(join(root, 'packages', 'beta', 'package.json'), '{}');", []],
+    ['a sibling named only in prose', `${FROM_ALPHA}// join(REPO, 'packages', 'beta')\nconst a = 1;`, []],
+  ])('judges %s', (_label, body, reached) => {
+    const root = plant({ ...TWO_PACKAGES, 'packages/alpha/src/probe.ts': '' });
+    expect(rootedVerdict(root, 'packages/alpha/src/probe.ts', body)).toEqual(reached);
   });
 });
