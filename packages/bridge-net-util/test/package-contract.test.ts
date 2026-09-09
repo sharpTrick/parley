@@ -358,7 +358,56 @@ describe('every export earns its place', () => {
       expect(seen).not.toContain('sanitizeBody');
     });
 
-    it('counts an alias, a type-only import, and a namespace read', () => {
+    /**
+     * The import grammar, EXHAUSTIVELY, each form saying whether the scan covers it. The row this
+     * replaced was titled "counts an alias, a type-only import, and a namespace read" and covered
+     * only the INLINE `{ type X }` — `import type { X } from` and `export { X } from` bind a name
+     * exactly as much and were both missed, so a consumer written either way read as importing
+     * nothing at all.
+     *
+     * A form marked `covered: false` is a stated blind spot, not an oversight: `export *` names
+     * nothing to count, and a computed namespace read is not statically a name. Both make a live
+     * import look dead, which fails toward "delete an export somebody uses" — so they are recorded
+     * here rather than papered over with a looser regex that would start counting spellings.
+     */
+    const NAME = 'statusOf';
+    const IMPORT_GRAMMAR: Array<[form: string, source: string, covered: boolean]> = [
+      ['a named import', `import { ${NAME} } from '${SELF}';\nvoid ${NAME};\n`, true],
+      ['an aliased import', `import { ${NAME} as s } from '${SELF}';\nvoid s;\n`, true],
+      ['an inline type-only specifier', `import { type ${NAME} } from '${SELF}';\n`, true],
+      ['a type-only import statement', `import type { ${NAME} } from '${SELF}';\n`, true],
+      ['a named re-export', `export { ${NAME} } from '${SELF}';\n`, true],
+      ['a type-only re-export', `export type { ${NAME} } from '${SELF}';\n`, true],
+      [
+        'a namespace import read by property',
+        `import * as net from '${SELF}';\nvoid net.${NAME};\n`,
+        true,
+      ],
+      [
+        'a dynamic import read by property',
+        `const net = await import('${SELF}');\nvoid net.${NAME};\n`,
+        true,
+      ],
+      [
+        'a vitest mock reaching the real module',
+        `type NetUtil = typeof import('${SELF}');\n` +
+          'const actual = await importOriginal<NetUtil>();\n' +
+          `void actual.${NAME};\n`,
+        true,
+      ],
+      ['a star re-export', `export * from '${SELF}';\n`, false],
+      [
+        'a computed namespace read',
+        `import * as net from '${SELF}';\nvoid net['${NAME}'];\n`,
+        false,
+      ],
+    ];
+
+    it.each(IMPORT_GRAMMAR)('%s binds a countable name: %s', (_form, source, covered) => {
+      expect(namesImported({ 'consumer/src/shapes.ts': source }).includes(NAME)).toBe(covered);
+    });
+
+    it('counts an alias and a namespace read in the same file, under their real names', () => {
       const seen = namesImported({
         'consumer/src/shapes.ts':
           `import { type FetchWithRetryOptions, HttpStatusError as Boom } from '${SELF}';\n` +
