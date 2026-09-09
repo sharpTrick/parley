@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,18 +12,9 @@ import {
 import { describe, expect, it } from 'vitest';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
-const SKIP = new Set(['node_modules', 'dist', '.git', '.claude']);
-const SOURCE = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml']);
+const SOURCE = ['.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml'];
 
-function sourceFiles(dir: string, out: string[] = []): string[] {
-  for (const entry of readdirSync(dir)) {
-    if (SKIP.has(entry)) continue;
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) sourceFiles(full, out);
-    else if (SOURCE.has(extname(entry))) out.push(full);
-  }
-  return out;
-}
+const sourceFiles = (dir: string): string[] => filesUnder(dir, SOURCE);
 
 /**
  * A raw control byte in a source file makes it `data` to file(1) and makes ripgrep refuse to print

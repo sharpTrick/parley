@@ -1,9 +1,14 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { derivedRows, withoutComments, workspacePackages } from '@sharptrick/parley-net-util/testing';
+import {
+  derivedRows,
+  filesUnder,
+  withoutComments,
+  workspacePackages,
+} from '@sharptrick/parley-net-util/testing';
 
 /**
  * CLASS: a file in one package reaching INTO another one by path.
@@ -27,16 +32,6 @@ const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 
 /** Every directory holding a manifest under a declared workspace area — the set, never a member. */
 const packageDirs = (root: string): string[] => workspacePackages(root).map((p) => p.dir);
-
-function tsFilesUnder(dir: string, out: string[] = []): string[] {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (!['node_modules', 'dist', '.git'].includes(entry.name)) tsFilesUnder(full, out);
-    } else if (entry.name.endsWith('.ts')) out.push(full);
-  }
-  return out;
-}
 
 /** What a path segment this scan cannot read stands for: anything, of any depth. */
 const UNKNOWN_SEGMENT = '*';
@@ -198,7 +193,7 @@ export function rootedReaches(
 const PACKAGES = packageDirs(REPO);
 
 describe('no package reaches into another one by path', () => {
-  const filesOf = (dir: string): string[] => tsFilesUnder(dir);
+  const filesOf = (dir: string): string[] => filesUnder(dir);
 
   it('sees every package and its sources, so the rows below are not an empty table', () => {
     expect(PACKAGES.length).toBeGreaterThan(10);
