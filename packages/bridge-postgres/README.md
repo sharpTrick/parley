@@ -28,7 +28,7 @@ drain that *fails* (a killed backend, a `statement_timeout`, a pooler hiccup) is
 doubling backoff rather than waiting for the next write to the topic: nothing is skipped, and a
 quiet topic converges without needing a doorbell that may never ring again. The channel name is
 `'parley_' || md5(convert_to(topic, 'UTF8'))`: fixed length, so any topic string stays under
-PostgreSQL's 63-byte identifier limit with no injection surface. The `convert_to` cast is
+PostgreSQL's identifier limit (`MAX_IDENTIFIER_BYTES`) with no injection surface. The `convert_to` cast is
 load-bearing and not decorative — Node hashes UTF-8 bytes, so the trigger must too, or on a
 database whose `server_encoding` is not UTF8 the two digests diverge and the whole live path goes
 silently dead. Any off-Parley `NOTIFY` producer or hand-written `LISTEN` client must use the same
@@ -45,22 +45,22 @@ cannot tell from a long-poll that timed out. Retry without it. Live delivery is 
 ```yaml
 backend_config:
   url: "postgres://parley:parley@127.0.0.1:5432/parley"   # default
-  table_name: "parley_messages"   # default; [A-Za-z0-9_] only, max 52 bytes — see below
-  pool_size: 5                     # default; max pooled query connections (LISTEN uses one extra)
+  table_name: "parley_messages"   # default; [A-Za-z0-9_] only, byte budget below
+  pool_size: 5                     # example; `DEFAULT_POOL_SIZE` pooled query connections (LISTEN uses one extra)
   retention_days: 30               # optional; omit it (or set null) to keep every message forever
 ```
 
-`table_name` is capped at 52 bytes because every other relation is derived from it by suffixing
+`table_name` is capped at `MAX_TABLE_NAME_BYTES` because every other relation is derived from it by suffixing
 (`<table_name>_senders`, `_topic_seq`, `_created_at`, `_notify`, `_notify_trg`) and PostgreSQL truncates
-identifiers at 63 bytes — a longer stem would silently make two of those the same relation. The
+identifiers at `MAX_IDENTIFIER_BYTES` — a longer stem would silently make two of those the same relation. The
 name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved word (`user`,
 `order`, `table`) is a working table name rather than a bare PostgreSQL parse error. Every
 `table_name` rejection is formatted like the other knobs': `parley-postgres: invalid
 backend_config.table_name — …`.
 
-`retention_days` (at least 1 minute — `1/1440` of a day — and at most `18250`, about 50 years)
+`retention_days` (no narrower than `MIN_RETENTION_DAYS`, no wider than `MAX_RETENTION_DAYS`)
 deletes rows older than
-the window on connect and hourly thereafter, in batches of 5000 rows per statement: the first prune after
+the window on connect and hourly thereafter, in batches of `PRUNE_BATCH` rows per statement: the first prune after
 enabling retention on a large table is many short transactions rather than one whose WAL volume,
 and whose vacuum-blocking snapshot, grow with the whole backlog. It does not hold `post()` up
 either way — deleting old rows never blocks inserting new ones. `seq` is a `BIGSERIAL` and is
@@ -82,11 +82,12 @@ after the upgrade keeps them slightly longer rather than removing them early.
 
 Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
 unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
-an integer in `1..1000`, or a `retention_days` that is not a finite number in `[1/1440, 18250]`.
-Both ends of that range are refused rather than clamped: a window shorter than a minute — `0`, a
+an integer in `[MIN_POOL_SIZE, MAX_POOL_SIZE]`, or a `retention_days` that is not a finite number
+in `[MIN_RETENTION_DAYS, MAX_RETENTION_DAYS]`.
+Both ends of that range are refused rather than clamped: a window under `MIN_RETENTION_DAYS` — `0`, a
 negative, `1e-9`, or a unit slip that meant milliseconds — empties the entire shared table on the
 prune `connect()` runs immediately, and a
-window past 18250 days puts the cutoff before any message this backend could have written, which
+window past `MAX_RETENTION_DAYS` puts the cutoff before any message this backend could have written, which
 would leave pruning silently never running while this page says rows are removed hourly.
 
 Secrets belong in the config/`.env`, never committed (CLAUDE.md conventions).
@@ -118,9 +119,9 @@ serializes same-topic commits into `seq` order (distinct topics don't contend), 
 keeps the cursor monotonic and lossless under genuinely concurrent writers.
 
 Every wait on that lock is bounded: `post()` and `connect()`'s bootstrap both run under `SET LOCAL
-lock_timeout = 5000`, so a session sitting on the key (an abandoned transaction, a `psql` holding
-`pg_advisory_lock`) makes them fail after five seconds with a `parley-postgres: gave up after
-5000ms waiting for …` naming the topic or the table, and nothing is written. An unbounded wait
+lock_timeout` = `LOCK_WAIT_MS`, so a session sitting on the key (an abandoned transaction, a `psql`
+holding `pg_advisory_lock`) makes them fail with a `parley-postgres: gave up after …ms waiting
+for …` naming the topic or the table, and nothing is written. An unbounded wait
 would instead hold a pooled connection forever and take the instance's reads down with it.
 
 A lock is not the only thing that can wait forever. A peer that completes the TCP handshake and
@@ -128,14 +129,14 @@ then never speaks — a firewalled port, a stalled pooler, a primary mid-failove
 driver exactly like a server that is merely slow, and pg's default is to wait indefinitely. So
 every socket this backend opens carries a client-side ceiling instead:
 
-- the first connection gives up after `5000ms`, with a `parley-postgres: gave up on …` naming what
+- the first connection gives up after `DIAL_WAIT_MS`, with a `parley-postgres: gave up on …` naming what
   to check rather than a bare driver string;
-- a pooled checkout after `15000ms` — deliberately wider than the lock wait, because pg applies
+- a pooled checkout after `CONNECT_WAIT_MS` — deliberately wider than the lock wait, because pg applies
   that ceiling to the queue behind a busy pool as well as to the dial, and a reader waiting its
   turn behind a contended `post()` must wait rather than fail;
-- any single statement after `15000ms`, client-side, because what goes missing is the server's
+- any single statement after `QUERY_WAIT_MS`, client-side, because what goes missing is the server's
   reply and no `statement_timeout` can notice that;
-- `disconnect()` returns within `5000ms` whatever the socket does, destroying a connection that
+- `disconnect()` returns within `TEARDOWN_WAIT_MS` whatever the socket does, destroying a connection that
   will not close rather than waiting on a FIN that is not coming — so a bridge whose database has
   gone quiet still exits on SIGTERM instead of needing SIGKILL.
 
@@ -161,9 +162,9 @@ row is stored under a value that is not the one posted. Two topics an anchored `
 pattern admits as distinct would silently share one history, two handles would collapse onto one
 `_senders` row, and `content` would read back altered.
 
-A `topic` or a handle over **2684 bytes** of UTF-8 is refused the same way. Those two are the only
+A `topic` or a handle over `MAX_INDEXED_BYTES` of UTF-8 is refused the same way. Those two are the only
 fields this backend puts into a btree index key — `content` and `in_reply_to` are indexed by nothing
-and hold megabytes — and PostgreSQL will not take an index row past 2704 bytes. Left to the server,
+and hold megabytes — and PostgreSQL will not take an index row past `BTREE_MAX_ITEM_BYTES`. Left to the server,
 `post()` comes back with `index row size 3024 exceeds btree version 4 maximum 2704 for index
 "<your table>_topic_seq"`, which names your deployment's relations rather than this plugin, while
 `subscribe()` on the same topic succeeds and registers a live path no `post()` can ever land in. The

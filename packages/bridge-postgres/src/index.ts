@@ -41,6 +41,14 @@ import { assertTableName, buildSchema, channelFor, quotedNames } from './schema.
 export { MAX_POOL_SIZE, MAX_RETENTION_DAYS, MIN_POOL_SIZE, MIN_RETENTION_DAYS } from './config.js';
 export { DEFAULT_POOL_SIZE, LOCK_WAIT_MS, type PostgresBackendConfig, usesDefaultCredentials };
 export { LISTENER_WAIT_MS, validateBackendConfig };
+export { BTREE_MAX_ITEM_BYTES, MAX_INDEXED_BYTES } from './errors.js';
+export { MAX_IDENTIFIER_BYTES, MAX_TABLE_NAME_BYTES } from './schema.js';
+export {
+  CONNECT_WAIT_MS,
+  DIAL_WAIT_MS,
+  QUERY_WAIT_MS,
+  TEARDOWN_WAIT_MS,
+} from './connection.js';
 
 /** Pruning cadence when `retention_days` is set — a cost knob only, like the pool size. */
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
