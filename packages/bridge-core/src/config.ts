@@ -109,7 +109,8 @@ const ConfigObject = z.object({
         .int()
         .positive({
           message:
-            'catchup.block_max_ms must be > 0 (ms): every caller\'s block_ms is clamped to this ' +
+            'catchup.block_max_ms must be > 0 (ms). An earlier release accepted 0 here and this ' +
+            'one refuses it: every caller\'s block_ms is clamped to this ' +
             'before it reaches a plugin, so a ceiling of 0 means no backend is ever handed a ' +
             'budget, none can refuse one, and parley_fetch_recent answers a long poll at once ' +
             'with an empty page the caller cannot tell from one that timed out. To turn the long ' +
