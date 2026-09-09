@@ -1,4 +1,6 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import { FORBIDDEN_IN_RENDER, UNSAFE_TEXT } from '@sharptrick/parley-net-util/testing';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +13,13 @@ import {
 } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MIN_RETENTION_DAYS } from '../src/config.js';
-import { captures, NatsPlugin, plaintextRemoteServer, redactUserinfo } from '../src/index.js';
+import {
+  captures,
+  NatsPlugin,
+  plaintextRemoteServer,
+  redactUserinfo,
+  serverAuthority,
+} from '../src/index.js';
 import { fakeJetStream, injectFake } from './fake-jetstream.js';
 import {
   declaredConfigKeys,
@@ -800,7 +808,7 @@ describe('nats transport safety — a credential on an unencrypted remote link w
       expect(warned).toHaveLength(warns ? 1 : 0);
       for (const line of warned) {
         expect(line).toContain('parley-nats');
-        expect(line).toContain(server);
+        expect(line).toContain(serverAuthority(server));
         expect(line).toContain('token');
         expect(line).not.toContain(SECRET);
       }
@@ -832,6 +840,33 @@ describe('nats transport safety — a credential on an unencrypted remote link w
     expect(plaintextRemoteServer('nats://alice:hunter2@127.0.0.1:4222')).toBeUndefined();
   });
 
+  /**
+   * CLASS: the warning is an OPERATOR CHANNEL carrying a `backend_config` value, and it is not a
+   * thrown message — so no refusal-rendering guard in this repo reaches it. `redactUserinfo` only
+   * strips URL userinfo — which `assertNoServerCredentials` refuses outright anyway — and its
+   * authority stops at the first `?`, so a credential spelled anywhere else survived whole; the
+   * text was unbounded and unflattened besides.
+   */
+  it.each([
+    ['a query string', `nats://h.example.com:4222?password=${SECRET}`],
+    ['a path', `nats://h.example.com:4222/${SECRET}`],
+    ['a fragment', `nats://h.example.com:4222#${SECRET}`],
+  ])('a credential spelled in %s never reaches the warning', async (_label, server) => {
+    const warned = await warningsFrom({ servers: server, token: 'another-secret' });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).not.toContain(SECRET);
+  });
+
+  it.each(UNSAFE_TEXT)('%s in a server is one bounded, harmless line', async (_label, text) => {
+    const warned = await warningsFrom({ servers: `nats://${text}`, token: SECRET });
+    expect(warned).toHaveLength(1);
+    const line = warned[0] ?? '';
+    expect(line).not.toContain(SECRET);
+    expect(line).not.toMatch(FORBIDDEN_IN_RENDER);
+    expect(line).not.toMatch(/[\n\r]/);
+    expect(line.length).toBeLessThanOrEqual(MAX_ERROR_BODY);
+  });
+
   // The `tls://` entry warns like the rest: it is a remote host, and the scheme buys it nothing.
   it('warns once per offending entry when servers is a list', async () => {
     const warned = await warningsFrom({
@@ -841,9 +876,9 @@ describe('nats transport safety — a credential on an unencrypted remote link w
 
     expect(warned).toHaveLength(3);
     expect(warned.map((l) => (/servers "([^"]+)"/.exec(l) ?? [])[1])).toEqual([
-      'nats://a.example.com:4222',
-      'tls://b.example.com:4222',
-      'nats://c.example.com:4222',
+      'a.example.com:4222',
+      'b.example.com:4222',
+      'c.example.com:4222',
     ]);
   });
 });

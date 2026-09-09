@@ -22,8 +22,9 @@ expectLabelledRefusal('nats', {
   declared: DECLARED.keys,
   ungraded: {
     servers:
-      'graded by assertNoServerCredentials, which names the field and never the value, and by ' +
-      'plaintextCredentialRisks — neither is a shape refusal',
+      'no shape refusal to grade: every string is a candidate address. What DOES render it — ' +
+      'assertNoServerCredentials and plaintextCredentialRisks — is crossed over the hostile ' +
+      'corpus in config.test.ts, which is where the value reaches an operator',
     tls: 'a nested group; assertKnownBackendConfig refuses a non-string member, naming its type',
     token: 'spent as a credential and never rendered: nothing about it is refused on shape',
     user: 'spent as a credential and never rendered: nothing about it is refused on shape',

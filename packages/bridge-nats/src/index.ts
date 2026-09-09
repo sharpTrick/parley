@@ -6,7 +6,12 @@ import { NatsLive } from './live.js';
 import { dec, enc, encodeRecord } from './payload.js';
 
 export { captures } from './naming.js';
-export { plaintextRemoteServer, redactUserinfo, type NatsBackendConfig } from './config.js';
+export {
+  plaintextRemoteServer,
+  redactUserinfo,
+  serverAuthority,
+  type NatsBackendConfig,
+} from './config.js';
 
 /**
  * NATS JetStream backend (DESIGN §6/§9) — the fabric backend. One JetStream STREAM per topic, so

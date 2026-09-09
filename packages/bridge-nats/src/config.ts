@@ -4,7 +4,7 @@ import {
   type BackendConfigKeys,
   isPlainObject,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { credsAuthenticator, nkeyAuthenticator, type ConnectionOptions } from 'nats';
 
@@ -223,19 +223,30 @@ export function redactUserinfo(server: string): string {
  * address cannot be excused by a prefix the driver never reads.
  */
 export function plaintextRemoteServer(server: string): string | undefined {
+  const host = serverHost(server);
+  return host !== '' && isLoopbackHost(host) ? undefined : redactUserinfo(server.trim());
+}
+
+/**
+ * The `host[:port]` an address names, userinfo dropped. Keep the authority split by hand rather
+ * than through `URL`, so that every scheme is classified by the same rules: `URL` canonicalizes an
+ * integer-form IPv4 host for `ws:` and leaves it alone for `nats:`, which would excuse under one
+ * scheme exactly what it warns about under the other.
+ */
+export function serverAuthority(server: string): string {
   const text = server.trim();
-  const prefix = schemePrefix(text);
-  // Keep the authority split by hand rather than through `URL`, so that every scheme is classified
-  // by the same rules: `URL` canonicalizes an integer-form IPv4 host for `ws:` and leaves it alone
-  // for `nats:`, which would excuse under one scheme exactly what it warns about under the other.
-  const authority = text.slice(prefix.length);
-  const host = authorityHead(authority)
-    .slice(userinfoEnd(authority) + 1)
+  const authority = text.slice(schemePrefix(text).length);
+  return authorityHead(authority).slice(userinfoEnd(authority) + 1);
+}
+
+const serverHost = (server: string): string =>
+  serverAuthority(server)
     .replace(/^(\[[^\]]*]):\d+$/, '$1')
     .replace(/^([^:[]*):\d+$/, '$1')
     .toLowerCase();
-  return host !== '' && isLoopbackHost(host) ? undefined : redactUserinfo(text);
-}
+
+/** Longest DNS name there is, plus a port; a diagnostic naming a server needs no more. */
+const MAX_AUTHORITY_IN_DIAGNOSTIC = 259;
 
 /**
  * nats.js builds its server list from the address's HOST alone (`servers.js` `hostPort()` keeps
@@ -262,7 +273,6 @@ export function assertNoServerCredentials(cfg: NatsBackendConfig): void {
  * sidecar, a loopback fixture, and a server whose INFO offers TLS (which nats.js then upgrades to
  * on its own) are all legitimate — but none is a reason for the mistake to be silent. Setting
  * `backend_config.tls` is what turns that opportunistic upgrade into a fail-fast guarantee.
- * The offending fields are named — never their values.
  */
 export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
   const fields = (['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const).filter(
@@ -271,15 +281,15 @@ export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
   if (fields.length === 0 || cfg.tls !== undefined) return [];
   const servers = [cfg.servers ?? DEFAULT_SERVERS].flat();
   return servers.flatMap((server) => {
-    const plaintext = plaintextRemoteServer(String(server));
-    return plaintext === undefined
-      ? []
-      : [
-          `backend_config.servers ${JSON.stringify(plaintext)} is a non-loopback host and ` +
+    const text = String(server);
+    if (plaintextRemoteServer(text) === undefined) return [];
+    const named = sanitizeBody(serverAuthority(text)).slice(0, MAX_AUTHORITY_IN_DIAGNOSTIC);
+    return [
+          `backend_config.servers ${JSON.stringify(named)} is a non-loopback host and ` +
             'backend_config.tls is unset, so nothing here forces encryption and the CONNECT frame ' +
             `may carry backend_config.${fields.join('/')} across the network in the clear. Set ` +
             'backend_config.tls — nats.js discards the URL scheme, so tls:// does not encrypt.',
-        ];
+    ];
   });
 }
 
