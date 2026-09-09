@@ -18,6 +18,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags, so the suite can grade CHANGELOG.md's `## Unreleased` section against what the
+          # published barrels held at the last release. The default shallow checkout has none.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
