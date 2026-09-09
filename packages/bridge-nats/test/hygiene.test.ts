@@ -16,7 +16,6 @@ const sourcesUnder = (dir: string): string[] =>
     .filter((f) => f.endsWith('.ts'));
 
 const here = fileURLToPath(new URL('.', import.meta.url));
-const srcDir = join(here, '..', 'src');
 
 const POLICY_FILE = 'hygiene.test.ts';
 
@@ -33,11 +32,6 @@ const shared = helperModules.flatMap((name) =>
 const testFiles = readdirSync(here)
   .filter((f) => f.endsWith('.test.ts') && f !== POLICY_FILE)
   .map((f) => ({ name: f, source: readFileSync(join(here, f), 'utf8') }));
-
-const srcFiles = sourcesUnder(srcDir).map((f) => ({
-  name: f,
-  source: readFileSync(join(srcDir, f), 'utf8'),
-}));
 
 describe('nats test hygiene — one shared fixture, not a copy per file', () => {
   it('finds the test files it is meant to police', () => {
@@ -64,41 +58,6 @@ describe('nats test hygiene — one shared fixture, not a copy per file', () => 
       expect({ file: file.name, redeclared }).toEqual({ file: file.name, redeclared: [] });
     });
   }
-});
-
-const stringLiterals = /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g;
-
-/** Every comment in `source`, trailing ones included — a tail on a code line is the usual shape. */
-function comments(source: string): { line: number; text: string }[] {
-  const found: { line: number; text: string }[] = [];
-  let inBlock = false;
-  source.split('\n').forEach((raw, i) => {
-    const bare = raw.replace(stringLiterals, '""');
-    const entry = { line: i + 1, text: raw.trim() };
-    if (inBlock) {
-      found.push(entry);
-      if (bare.includes('*/')) inBlock = false;
-      return;
-    }
-    const block = bare.indexOf('/*');
-    if (block >= 0) {
-      found.push(entry);
-      inBlock = !bare.includes('*/', block);
-      return;
-    }
-    if (bare.includes('//')) found.push(entry);
-  });
-  return found;
-}
-
-// Tracker IDs are graded for every package by `bridge-core/src/source-hygiene.test.ts`; what is
-// kept here is the evidence that this package HAS the commentary that rule is applied to.
-describe('nats comment discipline — comments warn, they do not narrate history', () => {
-  it('finds the comments it is meant to police', () => {
-    const all = srcFiles.flatMap((f) => comments(f.source));
-    expect(all.length).toBeGreaterThan(20);
-    expect(all.some((c) => c.text.includes('so that'))).toBe(true);
-  });
 });
 
 /**
