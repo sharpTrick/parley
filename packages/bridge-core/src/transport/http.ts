@@ -4,9 +4,21 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express, { type Express, type RequestHandler } from 'express';
 import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
+import { withInboundTrustBoundary } from '../inbound-trust.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
+
+/**
+ * What a reactive-only client is told before the untrusted-inbound boundary
+ * {@link withInboundTrustBoundary} appends to it. This root serves the chat front door, which reads
+ * backend history into a conversation and so needs the boundary as much as the channel does.
+ */
+const REACTIVE_INSTRUCTIONS_BODY = [
+  'Parley: a shared, topic-organized message backend. To catch up on a topic, call',
+  'parley_fetch_recent (on session start for each topic you work in, then on demand). To answer a',
+  'message, call parley_reply with the same `topic`. To publish or hand off, call parley_post.',
+];
 
 /**
  * Build a REACTIVE-ONLY MCP server (DESIGN §8/§10 remote mode): the post / fetchRecent / reply
@@ -16,7 +28,10 @@ import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
  * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain.
  */
 export function buildReactiveServer(deps: ToolDeps): McpServer {
-  const server = new McpServer({ name: 'parley', version: CORE_VERSION }, { capabilities: { tools: {} } });
+  const server = new McpServer(
+    { name: 'parley', version: CORE_VERSION },
+    { capabilities: { tools: {} }, instructions: withInboundTrustBoundary(REACTIVE_INSTRUCTIONS_BODY) },
+  );
   registerTools(server, deps);
   return server;
 }
