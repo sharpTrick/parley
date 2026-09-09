@@ -11,6 +11,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { consumersOf, derivedRows, importsIn } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
@@ -20,7 +21,15 @@ const TEST = fileURLToPath(new URL('./', import.meta.url));
 const ENTRY = 'index.ts';
 
 /** Exports with no test consumer that are nonetheless public API, each with why. */
-const ALLOWED_PUBLIC_API: Array<{ name: string; because: string }> = [];
+const ALLOWED_PUBLIC_API: Array<{ name: string; because: string }> = [
+  {
+    name: 'ZulipBackendConfig',
+    because:
+      'the shape a deployment writes under backend_config, so a consumer typing that object needs ' +
+      'it published. Every mention of it inside this package is prose or a regex reading the ' +
+      'declaration; nothing binds it, which is why counting spellings read it as consumed',
+  },
+];
 
 const NAMED_EXPORT =
   /^export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|function|class|interface|type|enum)\s+(\w+)/gm;
@@ -28,12 +37,31 @@ const NAMED_EXPORT =
 /** `export { a, b as c } from './x.js'` — a published name the entry does not itself declare. */
 const NAMED_REEXPORT = /^export\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['"][^'"]+['"];/gm;
 
-const sourceFiles = readdirSync(SRC).filter((f) => f.endsWith('.ts'));
+const sourceFiles = derivedRows(
+  'every zulip source module',
+  () => readdirSync(SRC).filter((f) => f.endsWith('.ts')),
+  { floor: 5, witness: [ENTRY, 'http.ts'] },
+);
 const sources = new Map(sourceFiles.map((f) => [f, readFileSync(`${SRC}${f}`, 'utf8')]));
-const testSources = readdirSync(TEST)
-  .filter((f) => f.endsWith('.ts'))
-  .map((f) => readFileSync(`${TEST}${f}`, 'utf8'))
-  .join('\n');
+
+/**
+ * Every file of the package as a named source, so "is this name still used?" is answered from the
+ * IMPORT that binds it rather than from how often it is spelled.
+ *
+ * Counting occurrences over concatenated text made a comment naming the symbol a consumer of it.
+ * Under this repository's comment doctrine that is the cheapest artifact available: adding one line
+ * of prose turned a red row green, watched both ways.
+ */
+const files = [
+  ...sourceFiles.map((f) => ({ path: `src/${f}`, text: readFileSync(`${SRC}${f}`, 'utf8') })),
+  ...readdirSync(TEST)
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => ({ path: `test/${f}`, text: readFileSync(`${TEST}${f}`, 'utf8') })),
+];
+
+/** Anything this package can bind one of its own names from: a sibling module, or its own barrel. */
+const withinPackage = (specifier: string): boolean =>
+  specifier.startsWith('.') || specifier === '@sharptrick/parley-zulip';
 
 const declaredExports = (source: string): string[] =>
   [...source.matchAll(NAMED_EXPORT)].map((m) => m[1] ?? '');
@@ -48,11 +76,9 @@ const reexports = (source: string): string[] =>
       .filter((entry) => entry !== ''),
   );
 
-const occurrences = (name: string): number =>
-  [...sources.values(), testSources].reduce(
-    (n, text) => n + (text.match(new RegExp(`\\b${name}\\b`, 'g'))?.length ?? 0),
-    0,
-  );
+/** The files that BIND `name` from inside this package, never counting the one that declares it. */
+const importersOf = (name: string, declaredIn: string): string[] =>
+  consumersOf(name, files, withinPackage).filter((path) => path !== `src/${declaredIn}`);
 
 describe('zulip public export surface', () => {
   const entry = sources.get(ENTRY) ?? '';
@@ -119,9 +145,16 @@ describe('zulip public export surface', () => {
     const allowed = new Set(ALLOWED_PUBLIC_API.map((e) => e.name));
     const published = [...declaredExports(entry), ...reexports(entry)];
     const orphans = published.filter(
-      (name) => !allowed.has(name) && !new RegExp(`\\b${name}\\b`).test(testSources),
+      (name) => !allowed.has(name) && importersOf(name, ENTRY).length === 0,
     );
     expect(orphans).toEqual([]);
+  });
+
+  it('reads an import of this package rather than a mention of it', () => {
+    expect(importersOf('ZulipPlugin', ENTRY)).not.toEqual([]);
+    expect(
+      consumersOf('ZulipPlugin', [{ path: 'test/prose.ts', text: '// ZulipPlugin lives here\n' }], withinPackage),
+    ).toEqual([]);
   });
 
   for (const [file, source] of sources) {
@@ -135,7 +168,7 @@ describe('zulip public export surface', () => {
     if (file === ENTRY) continue;
 
     it(`${file} exports no name the package never uses`, () => {
-      const dead = declaredExports(source).filter((name) => occurrences(name) < 2);
+      const dead = declaredExports(source).filter((name) => importersOf(name, file).length === 0);
       expect(dead).toEqual([]);
     });
   }
@@ -185,7 +218,7 @@ describe('zulip source imports nothing it does not use', () => {
 
   it('reads the import clauses it claims to grade, so a parse miss cannot pass as a clean file', () => {
     const bound = [...sources.values()].flatMap((source) =>
-      [...source.matchAll(IMPORT_STATEMENT)].flatMap((m) => importedNames(m[1] ?? '')),
+      importsIn(source).flatMap((binding) => binding.names),
     );
     expect(bound).toContain('ZulipPlugin'); // cli.ts, a default-shaped named import
     expect(bound).toContain('fetchWithRetry'); // http.ts, a single-line named clause
