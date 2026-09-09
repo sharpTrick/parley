@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
-import { isLoopbackHost, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { isBaseUrl, isLoopbackHost, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { consumerPackageSources, importingFiles, SELF } from './consumers.js';
 
 /**
@@ -390,5 +390,37 @@ describe('no consumer re-implements an export of this package', () => {
     const recorded = new Set(Object.keys(KNOWN_FORKS).map((fork) => fork.split(':')[0] as string));
     expect(named).not.toEqual([]);
     expect(named.filter((pkg) => !recorded.has(pkg))).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a base URL every request path is concatenated onto. A credential written into one
+ * authenticates nothing — every plugin here authenticates from its own config keys — while being
+ * disclosed by every diagnostic that names the base URL, which is a LABEL no response-body
+ * redaction reaches. `redactUrls` strips userinfo from a response body keyed on the request URL;
+ * the label was never sanitised. So the rule is refuse, never strip.
+ */
+describe('isBaseUrl', () => {
+  it.each([
+    ['a plain origin', 'https://matrix.example'],
+    ['an origin with a port', 'https://matrix.example:8448'],
+    ['a base path', 'https://matrix.example/_matrix'],
+    ['http', 'http://127.0.0.1:8008'],
+  ])('accepts %s', (_label, url) => {
+    expect(isBaseUrl(url)).toBe(true);
+  });
+
+  it.each([
+    ['a password in the userinfo', 'https://admin:hunter2@matrix.example'],
+    ['a bare username in the userinfo', 'https://admin@matrix.example'],
+    ['an empty username with a password', 'https://:hunter2@matrix.example'],
+    ['a query appended to every request', 'https://matrix.example/?access_token=hunter2'],
+    ['a fragment appended to every request', 'https://matrix.example/#hunter2'],
+    ['a non-http scheme', 'file:///etc/passwd'],
+    ['a bare host', 'matrix.example'],
+    ['a relative path', '/_matrix'],
+    ['the empty string', ''],
+  ])('refuses %s', (_label, url) => {
+    expect(isBaseUrl(url)).toBe(false);
   });
 });

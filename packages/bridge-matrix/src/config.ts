@@ -2,7 +2,7 @@ import { assertKnownConfigKeys, type BackendConfigKeys, MAX_TIMER_MS } from '@sh
 import {
   DEFAULT_DEADLINE_MS,
   describeConfigValue,
-  isHttpUrl,
+  isBaseUrl,
   plaintextRemoteOrigin,
 } from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
@@ -123,8 +123,8 @@ export function validateConfig(cfg: MatrixBackendConfig): void {
       reject(key, 'a non-empty string');
     }
   }
-  if (cfg.homeserver_url !== undefined && !isHttpUrl(cfg.homeserver_url)) {
-    reject('homeserver_url', 'an http(s) URL');
+  if (cfg.homeserver_url !== undefined && !isBaseUrl(cfg.homeserver_url)) {
+    reject('homeserver_url', 'an http(s) base URL carrying no userinfo, query or fragment');
   }
   // The derived path folds a topic through `sanitizeAlias` and bounds it with `boundedLocalpart`;
   // an operator-supplied localpart is used VERBATIM, so it must clear both here or the deployment

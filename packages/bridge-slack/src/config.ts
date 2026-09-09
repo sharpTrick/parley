@@ -4,7 +4,7 @@ import {
   type BackendConfigKeys,
   MAX_TIMER_MS,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isBaseUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -211,8 +211,8 @@ function validateConfig(cfg: SlackBackendConfig): void {
         `expected ${expected}`,
     );
   };
-  if (cfg.api_url !== undefined && (typeof cfg.api_url !== 'string' || !isHttpUrl(cfg.api_url))) {
-    reject('api_url', 'an http(s) URL');
+  if (cfg.api_url !== undefined && (typeof cfg.api_url !== 'string' || !isBaseUrl(cfg.api_url))) {
+    reject('api_url', 'an http(s) base URL carrying no userinfo, query or fragment');
   }
   for (const key of TIMER_CONFIG_KEYS) {
     const value = cfg[key];

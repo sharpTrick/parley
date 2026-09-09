@@ -523,6 +523,12 @@ describe('slack api_url: rejected when unusable, warned when it would leak the t
     // Shaped like loopback, resolved like any other name: a prefix match would excuse both.
     { url: 'http://127.0.0.1.example.com/api', outcome: 'warns' },
     { url: 'http://localhost.example.com/api', outcome: 'warns' },
+    // Refused, not stripped: this plugin authenticates from bot_token/app_token, so a credential
+    // in the URL authenticates nothing and is echoed by every diagnostic that names the endpoint.
+    { url: 'https://admin:hunter2@slack.example/api', outcome: 'rejects' },
+    { url: 'https://admin@slack.example/api', outcome: 'rejects' },
+    { url: 'https://slack.example/api?token=hunter2', outcome: 'rejects' },
+    { url: 'https://slack.example/api#hunter2', outcome: 'rejects' },
     { url: '', outcome: 'rejects' },
     { url: 'not-a-url', outcome: 'rejects' },
     { url: 'ftp://example.com/api', outcome: 'rejects' },
@@ -544,7 +550,7 @@ describe('slack api_url: rejected when unusable, warned when it would leak the t
       } as unknown as Record<string, unknown>;
       try {
         if (row.outcome === 'rejects') {
-          await expect(plugin.connect(config)).rejects.toThrow(/api_url[\s\S]*http\(s\) URL/);
+          await expect(plugin.connect(config)).rejects.toThrow(/api_url[\s\S]*http\(s\) base URL/);
           expect(warn, 'a refused config warns about nothing').not.toHaveBeenCalled();
           return;
         }

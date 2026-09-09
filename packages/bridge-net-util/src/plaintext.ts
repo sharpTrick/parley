@@ -41,12 +41,27 @@ export function isLoopbackHost(hostname: string): boolean {
   return Number.parseInt(tail, 16) === 1;
 }
 
-/** True for a string a fetch can dereference: an absolute URL on the `http:`/`https:` scheme. */
-export const isHttpUrl = (value: string): boolean => {
+/**
+ * True for a BASE URL a plugin may concatenate request paths onto: an http(s) URL carrying no
+ * userinfo, query or fragment.
+ *
+ * REFUSE rather than strip. A credential written into a base URL is a credential the operator
+ * believes is authenticating the link, and every plugin here authenticates from its own config
+ * keys instead — so a silently-stripped one leaves a deployment that reads as configured and
+ * connects as anonymous. It is also disclosed by every diagnostic that names the base URL, which
+ * is a label no response-body redaction reaches. A query or fragment is refused for the same
+ * reason it is in a path: it is appended to every request this plugin ever makes, and can hide a
+ * credential under a key hygiene treats as non-secret.
+ */
+export const isBaseUrl = (value: string): boolean => {
+  let parsed: URL;
   try {
-    const { protocol } = new URL(value);
-    return protocol === 'http:' || protocol === 'https:';
+    parsed = new URL(value);
   } catch {
     return false;
   }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  return (
+    parsed.username === '' && parsed.password === '' && parsed.search === '' && parsed.hash === ''
+  );
 };

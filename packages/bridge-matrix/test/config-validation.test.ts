@@ -38,6 +38,12 @@ const FIELDS: Record<string, { accepted: unknown[]; rejected: Record<string, unk
       'an empty string': '',
       'a bare host with no scheme': 'synapse.fake',
       'a non-http scheme': 'file:///etc/passwd',
+      // Refused, not stripped: this plugin authenticates from user/password, so a credential in
+      // the URL authenticates nothing and is echoed by every diagnostic that names the homeserver.
+      'a credential in the userinfo': 'https://admin:hunter2@synapse.fake',
+      'a bare username in the userinfo': 'https://admin@synapse.fake',
+      'a query appended to every request': 'https://synapse.fake/?access_token=hunter2',
+      'a fragment appended to every request': 'https://synapse.fake/#hunter2',
     },
   },
   user: {
