@@ -337,13 +337,54 @@ describe('every public workspace ships only what a consumer can run', () => {
     },
   );
 
-  /** The module a bare `import '<pkg>'` resolves to, which is the only entrypoint nothing spawns. */
-  const entrypointOf = (manifest: Record<string, unknown>): string | undefined => {
-    const root = (manifest.exports as Record<string, unknown> | undefined)?.['.'];
-    if (typeof root === 'string') return root;
-    const conditions = root as Record<string, unknown> | undefined;
-    const fallback = conditions?.default ?? conditions?.import ?? conditions?.require;
-    return typeof fallback === 'string' ? fallback : undefined;
+  /** Every subpath a manifest promises a MODULE at — `.` and each `./…` alike, not just the root. */
+  const entrypointsOf = (manifest: Record<string, unknown>): [string, string][] => {
+    const out: [string, string][] = [];
+    for (const [subpath, target] of Object.entries(
+      (manifest.exports as Record<string, unknown> | undefined) ?? {},
+    )) {
+      const conditions = target as Record<string, unknown> | undefined;
+      const file =
+        typeof target === 'string'
+          ? target
+          : conditions?.default ?? conditions?.import ?? conditions?.require;
+      if (typeof file === 'string' && file.endsWith('.js')) out.push([subpath, file]);
+    }
+    return out;
+  };
+
+  /**
+   * Load one built module in a CHILD node process, so it is resolved the way a consumer's install
+   * resolves it. In-process, this repo's alias table rewrites the built module's own
+   * `@sharptrick/...` imports back to a sibling's `src/`, so the row would load one package's
+   * ARTIFACT against every sibling's SOURCE and a stale or broken sibling `dist/` stays invisible.
+   */
+  const NEEDS_RUNNER = 'Vitest failed to access its internal state';
+  type Loaded =
+    | { keys: string[]; versions: Record<string, string> }
+    | 'needs the test runner'
+    | { failure: string };
+
+  const loadBuilt = (file: string): Loaded => {
+    const href = pathToFileURL(file).href;
+    try {
+      const json = execFileSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `const m = await import(${JSON.stringify(href)});\n` +
+            'console.log(JSON.stringify({ keys: Object.keys(m), versions: Object.fromEntries(' +
+            'Object.entries(m).filter(([k, v]) => k.endsWith("_VERSION") && typeof v === "string")) }));',
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      return JSON.parse(json) as { keys: string[]; versions: Record<string, string> };
+    } catch (err) {
+      const text = String((err as { stderr?: string }).stderr ?? err);
+      if (text.includes(NEEDS_RUNNER)) return 'needs the test runner';
+      return { failure: text.split('\n').slice(0, 6).join('\n') };
+    }
   };
 
   /**
@@ -351,29 +392,66 @@ describe('every public workspace ships only what a consumer can run', () => {
    * entrypoint — every test resolves `src/` through the vitest alias — so a `dist/index.js` that
    * exists and throws on load shipped green, and `version.ts`, whose whole job is to resolve
    * `../package.json` from wherever the emit lands, was graded only at the path `src/` gives it.
+   * Every subpath, because a SUBPATH is an entrypoint too: core's `./testing` was verified as
+   * packed and as sourced, and never once executed.
    */
-  it.each(WORKSPACES.map((w) => [w.name, w] as const))(
-    '%s loads the entrypoint its manifest promises',
-    async (_name, w) => {
-      const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
-      const entry = entrypointOf(manifest);
-      expect(entry, 'no root export condition names a module to load').toBeTypeOf('string');
-      const loaded = (await import(
-        pathToFileURL(join(REPO_ROOT, w.dir, entry!)).href
-      )) as Record<string, unknown>;
-      expect(Object.keys(loaded).length, 'the built entrypoint exports nothing').toBeGreaterThan(0);
+  it.each(
+    WORKSPACES.flatMap((w) =>
+      entrypointsOf(readJson(join(REPO_ROOT, w.dir, 'package.json'))).map(
+        ([subpath, file]) => [`${w.name} ${subpath}`, w, file] as const,
+      ),
+    ),
+  )('%s loads as a consumer would resolve it', async (_name, w, file) => {
+    const manifest = readJson(join(REPO_ROOT, w.dir, 'package.json'));
+    const path = join(REPO_ROOT, w.dir, file);
+    const loaded = loadBuilt(path);
+    if (typeof loaded === 'object' && 'failure' in loaded) {
+      expect.fail(
+        `${file} does not load as a consumer would resolve it — it throws, or one of its own ` +
+          `imports does not resolve outside this repo's alias table:\n${loaded.failure}`,
+      );
+    }
+    if (loaded === 'needs the test runner') {
+      // An entrypoint whose module graph imports the test runner cannot be loaded standalone, and
+      // this is derived from the manifest rather than from a name: a package that declares vitest
+      // as a peer is one whose fixtures only ever load under the runner. It is still EXECUTED —
+      // in this process, where the runner's state exists — so a module that is dead on arrival
+      // still reddens; only the sibling-resolution half of the row is lost.
+      expect(
+        Object.keys(
+          (manifest.peerDependencies as Record<string, string> | undefined) ?? {},
+        ).concat(Object.keys((manifest.optionalPeers as Record<string, string> | undefined) ?? {})),
+        'this entrypoint needs the test runner but its manifest does not declare one',
+      ).toContain('vitest');
+      const inProcess = (await import(pathToFileURL(path).href)) as Record<string, unknown>;
+      expect(Object.keys(inProcess).length, 'the built entrypoint exports nothing').toBeGreaterThan(0);
+      return;
+    }
+    expect(loaded.keys.length, 'the built entrypoint exports nothing').toBeGreaterThan(0);
 
-      // A version constant that reads its own manifest is the one export whose ANSWER depends on
-      // where the emit landed, so grade it from the built module rather than from `src/`.
-      for (const [name, value] of Object.entries(loaded)) {
-        if (name.endsWith('_VERSION') && typeof value === 'string') {
-          expect(value, `${name} is stale against the manifest this package publishes`).toBe(
-            manifest.version,
-          );
-        }
-      }
-    },
-  );
+    // A version constant that reads its own manifest is the one export whose ANSWER depends on
+    // where the emit landed, so grade it from the built module rather than from `src/`.
+    for (const [name, value] of Object.entries(loaded.versions)) {
+      expect(value, `${name} is stale against the manifest this package publishes`).toBe(
+        manifest.version,
+      );
+    }
+  });
+
+  it('names a subpath entrypoint as well as the root (positive control)', () => {
+    expect(
+      entrypointsOf({
+        exports: {
+          '.': { types: './dist/index.d.ts', default: './dist/index.js' },
+          './testing': { default: './dist/testing/index.js' },
+          './package.json': './package.json',
+        },
+      }),
+    ).toEqual([
+      ['.', './dist/index.js'],
+      ['./testing', './dist/testing/index.js'],
+    ]);
+  });
 
   it.each(WORKSPACES.map((w) => [w.name, w] as const))(
     '%s has a source for every path its manifest promises',
@@ -406,9 +484,9 @@ describe('every public workspace ships only what a consumer can run', () => {
       './dist/cli.js',
     ]);
     expect(unpackedPromises({ exports: { './package.json': './package.json' } }, ['package.json'])).toEqual([]);
-    expect(entrypointOf(manifest)).toBe('./dist/index.js');
-    expect(entrypointOf({ exports: { '.': './dist/index.js' } })).toBe('./dist/index.js');
-    expect(entrypointOf({ exports: { './package.json': './package.json' } })).toBeUndefined();
+    expect(entrypointsOf(manifest)).toEqual([['.', './dist/index.js']]);
+    expect(entrypointsOf({ exports: { '.': './dist/index.js' } })).toEqual([['.', './dist/index.js']]);
+    expect(entrypointsOf({ exports: { './package.json': './package.json' } })).toEqual([]);
     expect(builtFrom('./dist/cli.js')).toBe('src/cli.ts');
     expect(builtFrom('./dist/index.d.ts')).toBe('src/index.ts');
   });
