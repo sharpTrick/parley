@@ -4,6 +4,7 @@ import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   backendPackages,
+  codeOf,
   derivedRows,
   filesUnder,
   withoutComments,
@@ -599,5 +600,90 @@ describe('no file in this repo names the machine it was written on', () => {
       named(readFileSync(file, 'utf8'), HASH_SYNTAX.some((ext) => file.endsWith(ext))),
       'this path is correct on one machine — derive it from the repository root instead',
     ).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: an assertion whose expected value is read off the grading machine. The negative control
+ * divided its budget by `availableParallelism()`, so the same commit was RED on one vCPU and GREEN
+ * on eight and a developer could add work until CI reddened for a reason their box could not
+ * reproduce. It is the same shape as a timing bound calibrated on the developer's laptop, so it is
+ * graded as a class rather than at the one site that had it.
+ */
+describe('no assertion reads the machine it is being graded on', () => {
+  const HOST_READS = /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\.CI\b/g;
+
+  /**
+   * From `expect(` to the end of its statement, so the matcher's argument is scanned too: a bound
+   * hidden in `.toBeLessThan(cpus().length)` is the same defect as one hidden in the subject.
+   */
+  const assertionRegions = (code: string): string[] => {
+    const out: string[] = [];
+    for (const open of code.matchAll(/\bexpect(?:\.\w+)?\s*\(/g)) {
+      let depth = 0;
+      let at = open.index + open[0].length - 1;
+      for (; at < code.length; at++) {
+        const ch = code[at];
+        if (ch === '(') depth++;
+        else if (ch === ')' && --depth < 0) break;
+        else if (ch === ';' && depth === 0) break;
+      }
+      out.push(code.slice(open.index, at));
+    }
+    return out;
+  };
+
+  const hostReadsInAssertions = (source: string): string[] =>
+    assertionRegions(codeOf(source))
+      .flatMap((region) => [...region.matchAll(HOST_READS)])
+      .map((m) => m[0]);
+
+  it.each([
+    ['a core count as the expected value', 'expect(shards).toBe(availableParallelism());', ['availableParallelism(']],
+    ['a core count as the subject', 'expect(cpus().length).toBeGreaterThan(0);', ['cpus(']],
+    ['a memory read inside the data', 'expect([totalmem()]).toEqual(x);', ['totalmem(']],
+    ['a CI flag branching the expectation', 'expect(n).toBe(process.env.CI ? 1 : 2);', ['process.env.CI']],
+    ['a platform read in a plain argument', 'expect(a).toBe(process.platform);', ['process.platform']],
+    // Placeholders go with the literal that carries them, so a read reachable only from inside one
+    // is out of this rule's sight — the documented answer, not an oversight to be discovered.
+    ['a platform read only inside a template placeholder', 'expect(a, `on ${process.platform}`).toBe(b);', []],
+    ['the same read outside any assertion', 'const shards = availableParallelism();\nexpect(1).toBe(1);', []],
+    ['a narrated one', '// expect(n).toBe(cpus().length)\nexpect(1).toBe(1);', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(hostReadsInAssertions(source)).toEqual(found);
+  });
+
+  /**
+   * Sites allowed to grade a host read, each with the property that makes it safe. Empty is the
+   * intended state; an entry is a debt, not a permission slip.
+   */
+  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [];
+
+  const scanned = derivedRows(
+    'every test file in the repo',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(p.dir, ['.ts']))
+        .filter((f) => f.endsWith('.test.ts'))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 50,
+      witness: [
+        'packages/bridge-core/src/source-hygiene.test.ts',
+        'packages/conformance/test/negative-control.test.ts',
+      ],
+    },
+  );
+
+  it.each(scanned)('%s', (name, file) => {
+    const kept = KEEPS.find(([f]) => f === name);
+    const found = hostReadsInAssertions(readFileSync(file, 'utf8'));
+    expect(
+      kept ? [] : found,
+      'this assertion is graded against the machine running it, so the same commit passes on one ' +
+        'host and fails on another — compare against a declared constant instead',
+    ).toEqual([]);
+    if (kept) expect(found, `${name} is registered as a keep but no longer reads the host`).not.toEqual([]);
   });
 });

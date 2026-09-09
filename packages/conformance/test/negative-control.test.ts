@@ -49,6 +49,7 @@ import {
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
   brokenShards,
+  MAX_BROKEN_SHARDS,
   LATE_DELIVERY_MS,
   LIVE_DEATHS,
   MAX_BLAST_FRACTION,
@@ -125,6 +126,14 @@ const SLOWEST_CLAUSE_MS = 1_500;
 
 /** What a child vitest costs before it grades anything. */
 const CHILD_STARTUP_MS = 10_000;
+
+/**
+ * The host shape the budget row below is graded at: the two-vCPU runner CI actually uses. Keep it a
+ * constant rather than this machine's core count, so that the row grades the table's growth and not
+ * the grading machine — the shards themselves still follow the host, capped.
+ */
+const GRADED_HOST_CORES = 2;
+const GRADED_SHARDS = brokenShards(GRADED_HOST_CORES);
 
 /**
  * The wall clock the shards must be ALLOWED to spend, from the work they are asked to do.
@@ -467,12 +476,31 @@ describe('the nested run is allowed the time the table it drives will take', () 
   it('the budget covers the whole table, so growing the table reddens this instead of skipping', () => {
     expect(
       NESTED_RUN_BUDGET_MS,
-      `${BROKEN_VARIANTS.length} variants x ${CLAUSES.length} clauses over ${brokenShards()} ` +
+      `${BROKEN_VARIANTS.length} variants x ${CLAUSES.length} clauses over ${GRADED_SHARDS} ` +
         'shards no longer fit the budget. Raise it, or split the shards further — a nested run ' +
         'that runs out of time SKIPS every check in this file and reports nothing',
     ).toBeGreaterThanOrEqual(
-      requiredBudgetMs(BROKEN_VARIANTS.length, CLAUSES.length, brokenShards()),
+      requiredBudgetMs(BROKEN_VARIANTS.length, CLAUSES.length, GRADED_SHARDS),
     );
+  });
+
+  /**
+   * The same commit used to be RED on a one-core host and GREEN on eight, because the row above
+   * divided the work by `brokenShards()` — `availableParallelism()`, read off whichever machine was
+   * grading. Keep the divisor a declared constant, so that what this file demands of the budget is a
+   * property of the table and not of the box: a developer here would otherwise add variants until CI
+   * reddened for a reason their own machine could not reproduce.
+   */
+  it.each([
+    [1, 1],
+    [2, 2],
+    [4, 4],
+    [8, 8],
+    [64, MAX_BROKEN_SHARDS],
+    [128, MAX_BROKEN_SHARDS],
+  ])('a %i-core host fans out to %i children', (cores, shards) => {
+    expect(brokenShards(cores)).toBe(shards);
+    expect(brokenShards(cores)).toBeLessThanOrEqual(BROKEN_VARIANTS.length);
   });
 });
 

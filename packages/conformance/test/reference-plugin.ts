@@ -1994,6 +1994,13 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
 ];
 
 /**
+ * Keep a hard ceiling on the children, so that a many-core runner cannot spawn one full vitest per
+ * core: past ten shards the makespan is a single variant and the only thing that grows is memory,
+ * and an OOM-killed child leaves no report for `beforeAll` to read — a red row on a green tree.
+ */
+export const MAX_BROKEN_SHARDS = 8;
+
+/**
  * How many child runs the negative control splits {@link BROKEN_VARIANTS} across, and which slice a
  * given child registers.
  *
@@ -2002,8 +2009,8 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
  * `npm test`. The work and every assertion over it are unchanged; only the scheduling is. Keep the
  * slice an env var rather than one file per variant, so adding a variant costs no file.
  */
-export const brokenShards = (): number =>
-  Math.max(1, Math.min(BROKEN_VARIANTS.length, availableParallelism()));
+export const brokenShards = (cores: number = availableParallelism()): number =>
+  Math.max(1, Math.min(BROKEN_VARIANTS.length, MAX_BROKEN_SHARDS, cores));
 
 /** The variants a child identified as `i/N` registers. An unset value takes them all. */
 export const brokenShardOf = (spec: string | undefined): BrokenVariant[] => {
