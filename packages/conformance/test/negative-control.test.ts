@@ -109,6 +109,35 @@ let keptRun = '';
 let keptReportText = '';
 const PARENT_STARTED_AT = Date.now();
 
+/**
+ * Budget for the WHOLE nested suite, not for any one case in it: the child runs every clause
+ * against every broken variant. Keep the headroom large, so that a clause added to the shared
+ * suite — which is the point of the suite — cannot turn every check in this file into a SKIP.
+ */
+const NESTED_RUN_BUDGET_MS = 1_800_000;
+
+/**
+ * What one clause against one variant is allowed to cost. Pessimistic against the run itself: the
+ * suite carries real waits (SINCELESS_BLOCK_MS 12s, TAIL_BLOCK_MS 5s, STABILITY_SPAN_MS 3s) but
+ * only a few clauses pay one, so the figure has to sit above the mean without being the worst case.
+ */
+const SLOWEST_CLAUSE_MS = 1_500;
+
+/** What a child vitest costs before it grades anything. */
+const CHILD_STARTUP_MS = 10_000;
+
+/**
+ * The wall clock the shards must be ALLOWED to spend, from the work they are asked to do.
+ *
+ * Every other budget row in this file bounds a figure from ABOVE, by the harness timeout. Nothing
+ * bounded one from below, which is the direction that fails: the nested run grows MULTIPLICATIVELY
+ * — one clause is one case times every variant — so a clause or a variant added to the shared suite
+ * silently spends headroom until the day the whole file SKIPS and reports nothing. Computed from
+ * the two lengths, so adding either MOVES the required figure and reddens the row.
+ */
+const requiredBudgetMs = (variants: number, clauses: number, shards: number): number =>
+  CHILD_STARTUP_MS + Math.ceil(variants / shards) * clauses * SLOWEST_CLAUSE_MS;
+
 beforeAll(async () => {
   for (const entry of readdirSync(tmpdir())) {
     if (!entry.startsWith(KEPT_PREFIX)) continue;
@@ -169,10 +198,7 @@ beforeAll(async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  // Budget for the WHOLE nested suite, not for any one case in it: the child runs every clause
-  // against every broken variant. Keep the headroom large, so that a clause added to the shared
-  // suite — which is the point of the suite — cannot turn every check in this file into a SKIP.
-}, 1_800_000);
+}, NESTED_RUN_BUDGET_MS);
 
 const results = (): Row[] => report.testResults.flatMap((f) => f.assertionResults);
 
@@ -427,6 +453,29 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
  * run's own: a count above what that run asks for, or a clock past what it spans, is a control that
  * fires nowhere and reads in the report as coverage.
  */
+describe('the nested run is allowed the time the table it drives will take', () => {
+  it.each([
+    ['one variant, one clause, one shard', 1, 1, 1, CHILD_STARTUP_MS + SLOWEST_CLAUSE_MS],
+    ['a variant added', 2, 1, 1, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
+    ['a clause added', 1, 2, 1, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
+    ['the same work spread over two shards', 2, 1, 2, CHILD_STARTUP_MS + SLOWEST_CLAUSE_MS],
+    ['an odd split, which rounds up', 3, 1, 2, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
+  ])('%s moves the required budget', (_label, variants, clauses, shards, required) => {
+    expect(requiredBudgetMs(variants, clauses, shards)).toBe(required);
+  });
+
+  it('the budget covers the whole table, so growing the table reddens this instead of skipping', () => {
+    expect(
+      NESTED_RUN_BUDGET_MS,
+      `${BROKEN_VARIANTS.length} variants x ${CLAUSES.length} clauses over ${brokenShards()} ` +
+        'shards no longer fit the budget. Raise it, or split the shards further — a nested run ' +
+        'that runs out of time SKIPS every check in this file and reports nothing',
+    ).toBeGreaterThanOrEqual(
+      requiredBudgetMs(BROKEN_VARIANTS.length, CLAUSES.length, brokenShards()),
+    );
+  });
+});
+
 describe('every arm switch is reachable by the run built to catch it', () => {
   it('waits for fewer budgets than the long run hands out', () => {
     expect(SWITCH_AFTER_CALLS).toBeLessThan(STABILITY_READS_MIN);
