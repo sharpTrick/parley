@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import {
   asBackendMsgId,
   asCursor,
@@ -1991,3 +1992,21 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
   // never left the serving arm, it just stopped waiting, and 980 tests stayed green.
   armSwitch(ARM_SWITCHES[0] as ArmSwitch, true, 1),
 ];
+
+/**
+ * How many child runs the negative control splits {@link BROKEN_VARIANTS} across, and which slice a
+ * given child registers.
+ *
+ * vitest schedules at FILE granularity, so one file holding every variant ran ~55 conformance
+ * suites strictly serially in a single worker — 19 minutes of a 21-minute suite, inside the per-PR
+ * `npm test`. The work and every assertion over it are unchanged; only the scheduling is. Keep the
+ * slice an env var rather than one file per variant, so adding a variant costs no file.
+ */
+export const brokenShards = (): number =>
+  Math.max(1, Math.min(BROKEN_VARIANTS.length, availableParallelism()));
+
+/** The variants a child identified as `i/N` registers. An unset value takes them all. */
+export const brokenShardOf = (spec: string | undefined): BrokenVariant[] => {
+  const [index = 0, count = 1] = (spec ?? '0/1').split('/').map(Number);
+  return BROKEN_VARIANTS.filter((_, at) => at % count === index);
+};

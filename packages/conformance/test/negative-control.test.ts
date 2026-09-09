@@ -48,6 +48,7 @@ import {
   ENUMERABLE_BUDGETS,
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
+  brokenShards,
   LATE_DELIVERY_MS,
   LIVE_DEATHS,
   MAX_BLAST_FRACTION,
@@ -119,27 +120,52 @@ beforeAll(async () => {
     }
   }
   const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-run-'));
-  const out = join(dir, 'report.json');
+  const shards = brokenShards();
   try {
-    const run = await promisify(execFile)(
-      'npx',
-      ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=30000'],
-      {
-        cwd: REPO_ROOT,
-        env: { ...process.env, PARLEY_CONFORMANCE_BROKEN: '1', CI: '1' },
-        maxBuffer: 64 * 1024 * 1024,
-      },
-    ).catch((err: { stdout?: string; stderr?: string }) => err);
-    stdout = `${run.stdout ?? ''}${run.stderr ?? ''}`;
+    /**
+     * One child per shard, run CONCURRENTLY. vitest schedules at file granularity, so one file
+     * holding every variant ran them strictly serially in a single worker whatever the box had;
+     * the shards each register a slice of BROKEN_VARIANTS and their reports are read as one.
+     */
+    const runs = await Promise.all(
+      Array.from({ length: shards }, async (_, shard) => {
+        const out = join(dir, `report-${shard}.json`);
+        const run = await promisify(execFile)(
+          'npx',
+          ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=30000'],
+          {
+            cwd: REPO_ROOT,
+            env: {
+              ...process.env,
+              PARLEY_CONFORMANCE_BROKEN: '1',
+              PARLEY_CONFORMANCE_BROKEN_SHARD: `${shard}/${shards}`,
+              CI: '1',
+            },
+            maxBuffer: 64 * 1024 * 1024,
+          },
+        ).catch((err: { stdout?: string; stderr?: string }) => err);
+        return { shard, out, log: `${run.stdout ?? ''}${run.stderr ?? ''}` };
+      }),
+    );
+    stdout = runs.map((r) => r.log).join('\n');
     // Copy the evidence out BEFORE anything can throw on it: a child that produced no parseable
     // report is exactly the case whose output is worth reading.
     mkdirSync(KEPT_RUN, { recursive: true });
     writeFileSync(join(KEPT_RUN, 'run.log'), stdout);
-    const raw = readFileSync(out, 'utf8');
-    writeFileSync(join(KEPT_RUN, 'report.json'), raw);
+    for (const r of runs) writeFileSync(join(KEPT_RUN, `run-${r.shard}.log`), r.log);
+    const parsed = runs.map((r) => {
+      const raw = readFileSync(r.out, 'utf8');
+      writeFileSync(join(KEPT_RUN, `report-${r.shard}.json`), raw);
+      return JSON.parse(raw) as JsonReport;
+    });
+    const merged: JsonReport = {
+      startTime: Math.min(...parsed.map((p) => p.startTime)),
+      testResults: parsed.flatMap((p) => p.testResults),
+    };
+    keptReportText = JSON.stringify(merged);
+    writeFileSync(join(KEPT_RUN, 'report.json'), keptReportText);
     keptRun = KEPT_RUN;
-    keptReportText = raw;
-    report = JSON.parse(raw) as JsonReport;
+    report = merged;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

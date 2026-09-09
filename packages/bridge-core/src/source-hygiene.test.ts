@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { derivedRows, filesUnder, withoutComments } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
@@ -488,5 +489,72 @@ describe('source hygiene', () => {
       });
     }
     expect(offenders, `${lint.advice} — put the history in the commit message`).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: someone's own machine baked into a tool, where only running the tool somewhere else says
+ * so. Both halves of the review harness carried one — a `/home/user/parley` checkout root and a
+ * `/tmp/careening/worktrees` — and each was found by a round failing, never by a test.
+ *
+ * Only HOME roots, so that a scratch path under `/tmp` — correct on every machine — is not swept up
+ * with a checkout path that is correct on one. Judged over comment-stripped source, so that a
+ * comment recording the mistake is not itself the violation.
+ *
+ * Applied to every workspace package as well as to `scripts/` and `.claude/`. The rule used to read
+ * the two tool directories alone, from inside a published package's suite; a machine path is no
+ * more acceptable in a backend than in a workflow script, and the wider set costs nothing.
+ */
+describe('no file in this repo names the machine it was written on', () => {
+  const MACHINE_PATH = /(?<![\w./])\/(?:home|Users|root|mnt|media)\/[\w./$={}-]+/g;
+  const HASH_COMMENT = /^\s*#.*$/gm;
+
+  const named = (source: string, hash = false): string[] => [
+    ...(hash ? source.replaceAll(HASH_COMMENT, '') : withoutComments(source)).matchAll(MACHINE_PATH),
+  ].map((m) => m[0]);
+
+  it.each([
+    ['a checkout root in a constant', "const W = '/home/user/parley/.careening'", ['/home/user/parley/.careening']],
+    ['a double-quoted one', 'const R = "/home/user/parley"', ['/home/user/parley']],
+    ['an interpolated one', 'const R = `/Users/someone/src/${name}`', ['/Users/someone/src/${name}']],
+    ['one narrated in a line comment', "// this said '/home/user/parley', the path on the container", []],
+    ['one narrated in a block comment', "/* was '/home/user/parley' once */\nconst ok = 'x'", []],
+    ['a tmp path, correct everywhere', "const W = '/tmp/careening/worktrees'", []],
+    ['a bare word that is not a path', "const home = 'user/parley'", []],
+  ])('reads %s', (_label, source, found) => {
+    expect(named(source)).toEqual(found);
+  });
+
+  it.each([
+    ['a shell assignment', "dir='/home/user/parley'", ['/home/user/parley']],
+    ['a shell comment', 'root=$(git rev-parse --show-toplevel)\n# was /home/user/parley', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(named(source, true)).toEqual(found);
+  });
+
+  const HASH_SYNTAX = ['.sh', '.yml', '.yaml'];
+
+  const scanned = derivedRows(
+    'every tool and source file',
+    () =>
+      [
+        ...filesUnder(join(REPO, 'packages'), ['.ts', '.js', '.mjs', '.cjs']),
+        ...filesUnder(join(REPO, 'examples'), ['.ts', '.js', '.mjs', '.cjs']),
+        ...filesUnder(join(REPO, 'scripts'), ['.ts', '.js', '.mjs', '.cjs', '.sh', '.yml', '.yaml']),
+        ...filesUnder(join(REPO, '.claude'), ['.ts', '.js', '.mjs', '.cjs', '.sh', '.yml', '.yaml']),
+      ]
+        .filter((f) => !f.endsWith('source-hygiene.test.ts'))
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 100,
+      witness: ['packages/bridge-core/src', 'packages/conformance/src', 'scripts/', '.claude/'],
+    },
+  );
+
+  it.each(scanned)('%s', (_name, file) => {
+    expect(
+      named(readFileSync(file, 'utf8'), HASH_SYNTAX.some((ext) => file.endsWith(ext))),
+      'this path is correct on one machine — derive it from the repository root instead',
+    ).toEqual([]);
   });
 });
