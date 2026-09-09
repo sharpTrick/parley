@@ -221,22 +221,25 @@ describe('a server-controlled list is read as a list or as nothing', () => {
   });
 });
 
-describe('a 429 hint is read from either place Zulip states it, in seconds', () => {
+/**
+ * What is ZULIP's about a 429 hint is the FIELD NAME and the UNIT — a JSON `retry-after` stated in
+ * seconds, which happens to be spelled like the header and is not it. How a header and a body hint
+ * combine is net-util's rule and is graded there over both orderings; the rows that used to restate
+ * it here read the header through this function, which no longer reads one.
+ */
+describe('a 429 hint is read from the field Zulip states it in, in seconds', () => {
   const answer = (body: unknown, headers?: Record<string, string>): Response =>
     new Response(JSON.stringify(body), { status: 429, headers });
 
-  it('reads the header, in seconds', async () => {
-    await expect(readRetryAfter(answer({}, { 'retry-after': '2' }))).resolves.toBe(2000);
-  });
-
-  it('reads the JSON field when the header is absent', async () => {
+  it('reads the JSON field, in seconds', async () => {
     await expect(readRetryAfter(answer({ 'retry-after': 1.5 }))).resolves.toBe(1500);
   });
 
-  it('prefers the header over the JSON field', async () => {
+  it('reads the JSON field and not a header spelled the same way', async () => {
+    await expect(readRetryAfter(answer({}, { 'retry-after': '2' }))).resolves.toBeUndefined();
     await expect(
       readRetryAfter(answer({ 'retry-after': 1 }, { 'retry-after': '9' })),
-    ).resolves.toBe(9000);
+    ).resolves.toBe(1000);
   });
 
   const UNUSABLE: unknown[] = [{}, { 'retry-after': 0 }, { 'retry-after': -1 }, { 'retry-after': 'x' }];

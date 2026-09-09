@@ -50,14 +50,14 @@ export interface FetchWithRetryOptions {
   isStopped: () => boolean;
   /**
    * Per-backend `Retry-After` extraction → milliseconds, or undefined when the response carries no
-   * usable hint. Only the body field differs between APIs; the header, the clamp and the default
-   * are handled here. Receives the 429 `Response` (clone it before reading the body) — a body the
-   * caller never sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
+   * usable hint. Only the body field differs between APIs; the header and the default are handled
+   * here. Receives the 429 `Response` (clone it before reading the body) — a body the caller never
+   * sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
    *
    * A source of an ADDITIONAL hint, never a ceiling: the standard `Retry-After` header is a FLOOR
    * this cannot lower. Do not clamp what you return here, so that a parser bug cannot retry sooner
    * than the vendor asked — that is what escalates a rate limit into a ban. A figure past
-   * {@link MAX_BODY_WAIT_MS} is dropped here rather than honoured.
+   * {@link MAX_BODY_WAIT_MS} is dropped by the loop rather than honoured.
    */
   retryAfterOf?: (res: Response) => Promise<number | undefined> | number | undefined;
   /** Non-2xx statuses the caller treats as expected (returned, not thrown). Default: none. */
@@ -117,9 +117,10 @@ const credibleBodyHint = (ms: number | undefined): number | undefined =>
  * returns the `Response` on ok / allowStatuses, else throws `<label> → <status>: <body>`. A server
  * asking for a longer wait than this call's deadline IN THE HEADER ends the call rather than being
  * retried sooner than it asked; a body hint past {@link MAX_BODY_WAIT_MS} is dropped instead, so
- * that the call's fate rests on the RFC-defined field and not on one vendor-specific JSON number. The returned `Response` is already buffered — bounded by `maxBodyBytes` — so
- * reading it cannot fail on the deadline. Backend response *shapes* (Slack's `ok:false`, XMPP IQ)
- * are NOT unified here — interpret those in the caller.
+ * that the call's fate rests on the RFC-defined field and not on one vendor-specific JSON number.
+ * The returned `Response` is already buffered — bounded by `maxBodyBytes` — so reading it cannot
+ * fail on the deadline. Backend response *shapes* (Slack's `ok:false`, XMPP IQ) are NOT unified
+ * here — interpret those in the caller.
  */
 export async function fetchWithRetry(
   url: string,
