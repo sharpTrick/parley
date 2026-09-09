@@ -6,11 +6,15 @@ import {
   backendPackages,
   codeOf,
   commentaryLines,
+  consumedNames,
   consumersOf,
+  declaredExports,
   exportedNames,
   filesUnder,
   importedNames,
   importsIn,
+  starReexports,
+  unusedImports,
   withoutComments,
   workspacePackages,
   workspaceRoot,
@@ -183,37 +187,119 @@ describe('the code and commentary split', () => {
 
 describe('what a source imports, and from where', () => {
   const own = (spec: string): boolean => spec.startsWith('.');
+  const specifiers = (source: string): string[] => importsIn(source).map((b) => b.specifier);
 
+  /**
+   * The GRAMMAR, one row per spelling, because five hand-rolled readers of it were in the tree and
+   * every one had a hole a row here would have found: a side-effect import binding nothing, a
+   * dynamic import, `require`, an `import x = require()`, and — live — an `export { a };` with no
+   * `from`, which the shared reader ERASED the next import and FABRICATED `a` out of.
+   */
   it.each([
-    ['a named clause', "import { a, b } from './x.js';", ['a', 'b']],
-    ['an aliased name', "import { a as renamed } from './x.js';", ['renamed']],
-    ['a type-only clause', "import type { T } from './x.js';", ['T']],
-    ['a type entry inside a value clause', "import { type T, v } from './x.js';", ['T', 'v']],
-    ['a re-export', "export { a } from './x.js';", ['a']],
-    ['a namespace import', "import * as ns from './x.js';\nns.reached();", ['ns', 'reached']],
-    ['a default import', "import Thing from './x.js';", ['Thing']],
-    ['a name only spelled, never bound', "// mentions a\nconst o = { a: 1 };", []],
-    ['a name bound from elsewhere', "import { a } from 'other';", []],
-  ])('reads %s', (_label, source, names) => {
-    expect([...importedNames(source, own)].sort()).toEqual([...names].sort());
+    ['a named clause', "import { a, b } from './x.js';", ['./x.js']],
+    ['a side-effect import', "import './x.js';", ['./x.js']],
+    ['a type-only import', "import type { T } from './x.js';", ['./x.js']],
+    ['a dynamic import', "const m = await import('./x.js');", ['./x.js']],
+    ['a require call', "const m = require('./x.js');", ['./x.js']],
+    ['an import-equals', "import m = require('./x.js');", ['./x.js']],
+    ['a re-export', "export { a } from './x.js';", ['./x.js']],
+    ['a wholesale re-export', "export * from './x.js';", ['./x.js']],
+    ['a namespace re-export', "export * as ns from './x.js';", ['./x.js']],
+    ['an export with no module at all', 'const a = 1;\nexport { a };', []],
+    ['an import quoted inside a string', 'const s = "import { X } from \'./x.js\';";', []],
+    ['an import named only in a comment', "// import { X } from './x.js';\nconst a = 1;", []],
+    [
+      'a live import beside a module-less export',
+      "const a = 1;\nexport { a };\nimport { X } from './x.js';",
+      ['./x.js'],
+    ],
+  ])('reads the module of %s', (_label, source, modules) => {
+    expect(specifiers(source)).toEqual(modules);
   });
 
-  it('reads the module of a dynamic import', () => {
-    expect(importsIn("const m = await import('./x.js');").map((b) => b.specifier)).toEqual(['./x.js']);
+  /**
+   * The ALIAS fork, which is the distinction the shared reader had backwards. `import { x as y }`
+   * is a rename and nothing else: the LOCAL name is what an unused-import rule asks about, and the
+   * SOURCE name is what "who consumes this export" asks about. One function cannot answer both,
+   * and answering the second with the first failed a live guard on a pure rename.
+   */
+  it.each([
+    ['a named clause', "import { a, b } from './x.js';", ['a', 'b'], ['a', 'b']],
+    ['an aliased name', "import { a as renamed } from './x.js';", ['renamed'], ['a']],
+    ['a type-only clause', "import type { T as U } from './x.js';", ['U'], ['T']],
+    ['a type entry inside a value clause', "import { type T, v } from './x.js';", ['T', 'v'], ['T', 'v']],
+    ['a default import', "import Thing from './x.js';", ['Thing'], ['default']],
+    ['an aliased re-export', "export { a as b } from './x.js';", ['b'], ['a']],
+    ['a namespace import', "import * as ns from './x.js';\nns.reached();", ['ns', 'reached'], ['reached']],
+    ['a side-effect import', "import './x.js';", [], []],
+    ['a name only spelled, never bound', '// mentions a\nconst o = { a: 1 };', [], []],
+    ['a name bound from elsewhere', "import { a } from 'other';", [], []],
+  ])('reads %s as local %j and source %j', (_label, source, local, from) => {
+    expect([...importedNames(source, own)].sort()).toEqual([...local].sort());
+    expect([...consumedNames(source, own)].sort()).toEqual([...from].sort());
   });
 
-  it('counts a barrel type-only export as published surface', () => {
-    expect([...exportedNames("export type { Only } from './t.js';\nexport const v = 1;\n")].sort()).toEqual([
-      'Only',
-      'v',
-    ]);
+  /**
+   * A re-export moves a name onward; it is not something needing it. Counting one as a consumer is
+   * what let fifteen symbols whose only in-repo reader is a barrel read as live, and it is why the
+   * one package that noticed subtracts its own barrel by hand.
+   */
+  it.each([
+    ['an import', "import { wanted } from './x.js';", ['a.ts']],
+    ['an aliased import', "import { wanted as w } from './x.js';", ['a.ts']],
+    ['a namespace read', "import * as ns from './x.js';\nns.wanted();", ['a.ts']],
+    ['a re-export', "export { wanted } from './x.js';", []],
+    ['an aliased re-export', "export { wanted as onward } from './x.js';", []],
+    ['a mention in prose', '// wanted is described here\nconst wanted = 1;', []],
+    ['an import from elsewhere', "import { wanted } from 'other';", []],
+  ])('counts %s as a consumer: %j', (_label, text, consumers) => {
+    expect(consumersOf('wanted', [{ path: 'a.ts', text }], own)).toEqual(consumers);
   });
 
-  it('names the files that bind a symbol, and no file that merely spells it', () => {
-    const files = [
-      { path: 'a.ts', text: "import { wanted } from './x.js';" },
-      { path: 'b.ts', text: '// wanted is described here\nconst wanted = 1;' },
-    ];
-    expect(consumersOf('wanted', files, own)).toEqual(['a.ts']);
+  /** What a barrel PUBLISHES, including the two shapes a runtime key enumeration cannot see. */
+  it.each([
+    ['a declaration', 'export const v = 1;', ['v'], ['v']],
+    ['an indented declaration', '  export const v = 1;', ['v'], ['v']],
+    ['a type-only re-export', "export type { Only } from './t.js';", [], ['Only']],
+    ['an aliased re-export', "export { a as b } from './x.js';", [], ['b']],
+    ['a default export', 'const foo = 1;\nexport default foo;', [], ['default']],
+    ['a default declaration', 'export default function foo(): void {}', [], ['default']],
+    ['a namespace re-export', "export * as ns from './x.js';", [], ['ns']],
+    ['a wholesale re-export', "export * from './a.js';", [], []],
+    ['a local that is not exported', 'const v = 1;', [], []],
+    ['a name only spelled in a string', "const s = 'export const v = 1;';", [], []],
+  ])('publishes %s as declared %j and exported %j', (_label, source, declared, exported) => {
+    expect(declaredExports(source)).toEqual(declared);
+    expect([...exportedNames(source)].sort()).toEqual([...exported].sort());
+  });
+
+  /**
+   * `export *` republishes names this reader cannot enumerate, so a guard built on
+   * {@link exportedNames} alone reads a barrel using one as publishing nothing. Naming the module
+   * is what lets a rule ban it rather than silently under-report.
+   */
+  it.each([
+    ['a wholesale re-export', "export * from './a.js';", ['./a.js']],
+    ['a type-only wholesale re-export', "export type * from './a.js';", ['./a.js']],
+    ['a named re-export', "export { a } from './a.js';", []],
+    ['a namespace re-export', "export * as ns from './a.js';", []],
+    ['an import', "import './a.js';", []],
+  ])('names the module of %s', (_label, source, modules) => {
+    expect(starReexports(source)).toEqual(modules);
+  });
+
+  /** An import nothing references, across the spellings that keep one alive. */
+  it.each([
+    ['a name the body calls', "import { a } from './x.js';\na();", []],
+    ['a name used in a type position', "import type { T } from './x.js';\nconst v: T = 1;", []],
+    ['a name re-exported by the same file', "import { a } from './x.js';\nexport { a };", []],
+    ['a name read off a namespace', "import * as ns from './x.js';\nns.a();", []],
+    ['a name nothing references', "import { a } from './x.js';", ['a']],
+    ['an alias nothing references', "import { a as b } from './x.js';\na();", ['b']],
+    ['a name kept alive only by a comment', "import { a } from './x.js';\n// a is fine\n", ['a']],
+    ['a name kept alive only by a string', "import { a } from './x.js';\nconst s = 'a';", ['a']],
+    ['a re-exported name binding nothing locally', "export { a } from './x.js';", []],
+  ])('reports %s as unused: %j', (_label, source, dead) => {
+    expect(unusedImports(source)).toEqual(dead);
   });
 });

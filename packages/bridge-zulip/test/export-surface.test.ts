@@ -11,7 +11,15 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { consumersOf, derivedRows, importsIn } from '@sharptrick/parley-net-util/testing';
+import {
+  consumersOf,
+  declaredExports,
+  derivedRows,
+  exportedNames,
+  importsIn,
+  starReexports,
+  unusedImports,
+} from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
@@ -26,16 +34,10 @@ const ALLOWED_PUBLIC_API: Array<{ name: string; because: string }> = [
     name: 'ZulipBackendConfig',
     because:
       'the shape a deployment writes under backend_config, so a consumer typing that object needs ' +
-      'it published. Every mention of it inside this package is prose or a regex reading the ' +
-      'declaration; nothing binds it, which is why counting spellings read it as consumed',
+      'it published. Nothing inside this package binds it: the barrel moves it onward, which is a ' +
+      're-export rather than a consumer of it',
   },
 ];
-
-const NAMED_EXPORT =
-  /^export\s+(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:const|let|var|function|class|interface|type|enum)\s+(\w+)/gm;
-
-/** `export { a, b as c } from './x.js'` — a published name the entry does not itself declare. */
-const NAMED_REEXPORT = /^export\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['"][^'"]+['"];/gm;
 
 const sourceFiles = derivedRows(
   'every zulip source module',
@@ -63,18 +65,11 @@ const files = [
 const withinPackage = (specifier: string): boolean =>
   specifier.startsWith('.') || specifier === '@sharptrick/parley-zulip';
 
-const declaredExports = (source: string): string[] =>
-  [...source.matchAll(NAMED_EXPORT)].map((m) => m[1] ?? '');
-
-const reexports = (source: string): string[] =>
-  [...source.matchAll(NAMED_REEXPORT)].flatMap((m) =>
-    (m[1] ?? '')
-      .split(',')
-      .map((entry) => entry.trim().replace(/^type\s+/, ''))
-      .map((entry) => (/\sas\s/.test(entry) ? entry.split(/\sas\s/)[1] : entry) ?? '')
-      .map((entry) => entry.trim())
-      .filter((entry) => entry !== ''),
-  );
+/** A published name the module does not itself declare — `export { a, b as c } from './x.js'`. */
+const reexports = (source: string): string[] => {
+  const declared = new Set(declaredExports(source));
+  return [...exportedNames(source)].filter((name) => !declared.has(name));
+};
 
 /** The files that BIND `name` from inside this package, never counting the one that declares it. */
 const importersOf = (name: string, declaredIn: string): string[] =>
@@ -88,13 +83,10 @@ describe('zulip public export surface', () => {
   });
 
   /**
-   * The parser, against a fixture that carries one export of every shape and three non-exports.
-   * Naming a REAL export as the witness for a shape grades nothing: `declaredExports` matches any
-   * export spelling of a name, so deleting `(?:async\s+)?` from the regex left the suite green (31
-   * passed) and so did rewriting the witness itself as an `export const` (31 passed). A
-   * name-presence assertion cannot fail for the reason it claims, and the hole it advertised as
-   * guarded was already open. An exact expected SET fails the moment a shape branch is dropped, and
-   * cannot be satisfied by a differently-spelled real export.
+   * The parser, against a fixture that carries one export of every shape and two non-exports.
+   * Naming a REAL export as the witness for a shape grades nothing: a name-presence assertion
+   * cannot fail for the reason it claims. An exact expected SET fails the moment a shape stops
+   * being read, and cannot be satisfied by a differently-spelled real export.
    */
   const SHAPE_FIXTURE = [
     'export const aConst = 1;',
@@ -108,7 +100,7 @@ describe('zulip public export surface', () => {
     'export type AType = string;',
     'export enum AnEnum { A }',
     'export declare const aDeclaredConst: number;',
-    '  export const notAtColumnZero = 1;',
+    '  export const indentedInsideNothing = 1;',
     'const notExported = 1;',
     "const mentions = 'export function notADeclaration()';",
   ].join('\n');
@@ -132,6 +124,7 @@ describe('zulip public export surface', () => {
       'AType',
       'AnEnum',
       'aDeclaredConst',
+      'indentedInsideNothing',
     ]);
     expect(reexports(REEXPORT_FIXTURE)).toEqual(['aName', 'renamed', 'AType']);
   });
@@ -141,10 +134,11 @@ describe('zulip public export surface', () => {
     expect(reexports(entry).length).toBeGreaterThan(0);
   });
 
+  const published = new Set([...declaredExports(entry), ...reexports(entry)]);
+
   it('the entry publishes only names a test consumes or the allowlist admits', () => {
     const allowed = new Set(ALLOWED_PUBLIC_API.map((e) => e.name));
-    const published = [...declaredExports(entry), ...reexports(entry)];
-    const orphans = published.filter(
+    const orphans = [...published].filter(
       (name) => !allowed.has(name) && importersOf(name, ENTRY).length === 0,
     );
     expect(orphans).toEqual([]);
@@ -159,16 +153,15 @@ describe('zulip public export surface', () => {
 
   for (const [file, source] of sources) {
     it(`${file} re-exports nothing wholesale, so the published list stays enumerable`, () => {
-      const wildcards = source
-        .split('\n')
-        .filter((line) => /^export\s+(?:type\s+)?\*/.test(line.trim()));
-      expect(wildcards).toEqual([]);
+      expect(starReexports(source)).toEqual([]);
     });
 
     if (file === ENTRY) continue;
 
     it(`${file} exports no name the package never uses`, () => {
-      const dead = declaredExports(source).filter((name) => importersOf(name, file).length === 0);
+      const dead = declaredExports(source)
+        .filter((name) => !published.has(name))
+        .filter((name) => importersOf(name, file).length === 0);
       expect(dead).toEqual([]);
     });
   }
@@ -180,39 +173,13 @@ describe('zulip public export surface', () => {
 
 /**
  * The mirror of the block above, and the same CLASS: a name the source declares that nothing
- * consumes. An unused IMPORT is the cheaper half to acquire and the more misleading to read — it
- * asserts a dependency edge on a symbol no code needs, pointing the next reader at the wrong place
- * for a decision — and nothing else in the repo catches one: `tsconfig.base.json` sets neither
- * `noUnusedLocals` nor `noUnusedParameters`, and there is no linter. This grades imports only,
- * which is what a regex over source can grade honestly; the compiler flags cover locals and
- * parameters too and remain the better guard the day the packages they would newly fail are clean.
+ * consumes. `unusedImports` is the shared reader's answer; what this file adds is that the rule
+ * runs over every module of this package.
  */
-const IMPORT_STATEMENT = /^import\s+(?!type\s+['"])([\s\S]*?)\s+from\s+['"][^'"]+['"];/gm;
-
-/** Every local name an import clause binds: named, aliased, default and namespace alike. */
-function importedNames(clause: string): string[] {
-  const braces = /\{([\s\S]*?)\}/.exec(clause)?.[1] ?? '';
-  const outside = clause.replace(/\{[\s\S]*?\}/, '').replace(/^type\s+/, '');
-  const named = braces
-    .split(',')
-    .map((entry) => entry.trim().replace(/^type\s+/, ''))
-    .filter((entry) => entry !== '')
-    .map((entry) => (/\sas\s/.test(entry) ? entry.split(/\sas\s/)[1] : entry) ?? '');
-  const bare = outside
-    .split(',')
-    .map((entry) => entry.trim().replace(/^\*\s+as\s+/, ''))
-    .filter((entry) => /^\w+$/.test(entry));
-  return [...named, ...bare].map((name) => name.trim()).filter((name) => name !== '');
-}
-
 describe('zulip source imports nothing it does not use', () => {
   for (const [file, source] of sources) {
     it(`${file} binds no import name the rest of the file never references`, () => {
-      const body = source.replace(IMPORT_STATEMENT, '');
-      const dead = [...source.matchAll(IMPORT_STATEMENT)]
-        .flatMap((m) => importedNames(m[1] ?? ''))
-        .filter((name) => !new RegExp(`\\b${name}\\b`).test(body));
-      expect(dead).toEqual([]);
+      expect(unusedImports(source)).toEqual([]);
     });
   }
 

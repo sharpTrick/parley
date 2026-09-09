@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
+import { consumedNames } from '@sharptrick/parley-net-util/testing';
 
 /**
  * The repo scan two checks in this package share. Both of them ask a question about a PACKAGE — does
@@ -102,51 +103,38 @@ export function importingFiles(root: URL = PACKAGES, selfDir: string = SELF_DIR)
 }
 
 /**
- * The names a file IMPORTS from this package. Word-matching the file's text instead counts a name
- * that merely happens to be SPELLED somewhere in it: `label` is a property at half a dozen call
- * sites, so appending `export const label = 1;` here — imported by nothing — passed the dead-export
- * guard, and the whole surface count it produced was wrong. Resolved from the import SPECIFIER, so
- * a name counts only where it was actually bound.
+ * The names a file IMPORTS from this package, under the names THIS package publishes them: an
+ * `import { x as y }` rename next door is not a change to what this package owes.
  *
- * BOTH binding keywords, and the type-only spelling of each. `import\s*\{` alone missed
- * `import type { X } from` and `export { X } from` entirely — a consumer written either way read
- * as importing nothing, which makes a live export look dead in one direction and a fork look
- * unrecorded in the other. What is deliberately NOT covered is stated as rows in this package's
- * own grammar table.
+ * Word-matching the file's text instead counts a name that merely happens to be SPELLED in it:
+ * `label` is a property at half a dozen call sites, so appending `export const label = 1;` here —
+ * imported by nothing — passed the dead-export guard, and the whole surface count it produced was
+ * wrong.
  */
 export function importedNames(file: SourceFile): Set<string> {
-  const out = new Set<string>();
-  const FROM = `['"]${SELF}['"]`;
-  const CLAUSE = `(?:import|export)\\s+type\\s*\\{([^}]*)\\}|(?:import|export)\\s*\\{([^}]*)\\}`;
-  for (const m of file.code.matchAll(new RegExp(`(?:${CLAUSE})\\s*from\\s*${FROM}`, 'g'))) {
-    for (const entry of (m[1] ?? m[2] ?? '').split(',')) {
-      const name = entry.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]?.trim();
-      if (name !== undefined && name !== '') out.add(name);
-    }
-  }
-  for (const ns of namespaceBindings(file.code, FROM))
+  const out = consumedNames(file.text, (specifier) => specifier === SELF);
+  for (const ns of mockedNamespaces(file.code))
     for (const read of file.code.matchAll(new RegExp(`\\b${ns}\\.(\\w+)`, 'g')))
       out.add(read[1] as string);
   return out;
 }
 
 /**
- * Every identifier holding this package's NAMESPACE, in the three forms it is obtained in: a star
- * import, a dynamic import, and a value of the `typeof import(…)` type — which is how a vitest
- * module mock reaches the real module (`importOriginal<NetUtil>()`), and the form that makes
- * `actual.HttpStatusError` a real consumption rather than a spelling.
+ * The identifiers holding this package's namespace through a vitest module mock —
+ * `type T = typeof import(SELF)` then `await importOriginal<T>()`, which is how a mock reaches the
+ * real module and the form that makes `actual.HttpStatusError` a consumption rather than a
+ * spelling. A star import and a dynamic one are the import graph's own business and are read off
+ * the parse tree.
  */
-function namespaceBindings(code: string, FROM: string): string[] {
+function mockedNamespaces(code: string): string[] {
   const out = new Set<string>();
-  const add = (pattern: string): void => {
-    for (const m of code.matchAll(new RegExp(pattern, 'g'))) out.add(m[1] as string);
-  };
-  add(`import\\s*\\*\\s*as\\s+(\\w+)\\s*from\\s*${FROM}`);
-  add(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+import\\(\\s*${FROM}\\s*\\)`);
+  const FROM = `['"]${SELF}['"]`;
   for (const alias of code.matchAll(
     new RegExp(`type\\s+(\\w+)\\s*=\\s*typeof\\s+import\\(\\s*${FROM}\\s*\\)`, 'g'),
-  )) {
-    add(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+\\w+<${alias[1] as string}>\\(`);
-  }
+  ))
+    for (const m of code.matchAll(
+      new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+\\w+<${alias[1] as string}>\\(`, 'g'),
+    ))
+      out.add(m[1] as string);
   return [...out];
 }

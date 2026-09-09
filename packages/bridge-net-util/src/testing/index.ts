@@ -18,10 +18,15 @@ export {
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
 export {
+  consumedNames,
+  consumersOf,
+  declaredExports,
+  exportedNames,
+  type ImportBinding,
   importedNames,
   importsIn,
-  exportedNames,
-  consumersOf,
+  starReexports,
+  unusedImports,
 } from './imports.js';
 export {
   codeOf,

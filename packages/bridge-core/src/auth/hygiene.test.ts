@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { consumedNames } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 const AUTH_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -84,17 +85,6 @@ describe('auth-layer comments never regain a phrasing this package has already r
  * driven by a test. An entry point whose only coverage is an env-gated e2e file has none in the
  * offline gate that decides whether a change lands.
  */
-function importedNames(source: string): Set<string> {
-  const names = new Set<string>();
-  for (const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/[\w.-]+\.js'/g)) {
-    for (const raw of (match[1] ?? '').split(',')) {
-      const name = raw.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0];
-      if (name !== undefined && name !== '') names.add(name);
-    }
-  }
-  return names;
-}
-
 function barrelExportedAuthValues(): string[] {
   const barrel = readFileSync(`${CORE_SRC}index.ts`, 'utf8');
   const out: string[] = [];
@@ -112,7 +102,8 @@ describe('every public auth entry point is driven by the offline suite', () => {
   const covered = new Set<string>();
   for (const file of tsFiles(AUTH_DIR)) {
     if (!file.endsWith('.test.ts') || file.endsWith('.e2e.test.ts')) continue;
-    for (const name of importedNames(readFileSync(file, 'utf8'))) covered.add(name);
+    for (const name of consumedNames(readFileSync(file, 'utf8'), (s) => s.startsWith('./')))
+      covered.add(name);
   }
 
   const exported = barrelExportedAuthValues();

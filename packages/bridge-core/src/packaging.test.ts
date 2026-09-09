@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { importsIn } from '@sharptrick/parley-net-util/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
@@ -72,18 +73,12 @@ function isEmitted(tsconfig: Record<string, unknown>, file: string): boolean {
   );
 }
 
-/**
- * Every third-party module a built file imports — the set a consumer's install has to satisfy.
- * Anchored at statement starts, so that the word "from" inside a prose string is not read as one.
- */
-const IMPORT_STATEMENT =
-  /^\s*(?:import|export)\b[^'"\n]*\bfrom\s*['"]([^'"]+)['"]|^\s*import\s*['"]([^'"]+)['"]|\brequire\(\s*['"]([^'"]+)['"]\s*\)/gm;
-
-function bareImports(js: string): string[] {
-  const specifiers = [...js.matchAll(IMPORT_STATEMENT)].map((m) => m[1] ?? m[2] ?? m[3]!);
+/** Every third-party module a file loads — the set a consumer's install has to satisfy. */
+function bareImports(source: string): string[] {
   return [
     ...new Set(
-      specifiers
+      importsIn(source)
+        .map((binding) => binding.specifier)
         .filter((id) => !id.startsWith('.') && !id.startsWith('node:'))
         .map((id) => id.split('/').slice(0, id.startsWith('@') ? 2 : 1).join('/')),
     ),
