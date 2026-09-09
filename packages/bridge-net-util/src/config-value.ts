@@ -74,6 +74,6 @@ function render(value: unknown): string {
  * structure in the error core renders into model context.
  */
 export function describeConfigValue(key: string, value: unknown): string {
-  if (RENDERED_BY_VALUE[key] === undefined) return describeConfigShape(value);
+  if (!Object.hasOwn(RENDERED_BY_VALUE, key)) return describeConfigShape(value);
   return sanitizeBody(render(value));
 }

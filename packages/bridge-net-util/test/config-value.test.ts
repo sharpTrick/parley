@@ -218,6 +218,22 @@ describe('an unrecognised backend_config key is described, never rendered by con
     ).not.toContain(SECRET);
   });
 
+  /**
+   * A string-keyed policy table read with `[key]` answers for every name `Object.prototype` carries,
+   * and no exhaustiveness row can see one: they all walk `Object.keys`, which never yields an
+   * inherited name. Generated from the prototype rather than from the eight names that were found,
+   * so a name added to `Object.prototype` by a future runtime is covered by existing.
+   */
+  it.each(Object.getOwnPropertyNames(Object.prototype))(
+    'a config key named %s is described, not rendered',
+    (key) => {
+      expect(
+        describeConfigValue(key, `scheme://parley:${SECRET}@host/db`),
+        `${key} is inherited from Object.prototype, so the policy table answers for it`,
+      ).not.toContain(SECRET);
+    },
+  );
+
   it('records no key no backend declares or renders', () => {
     expect(
       Object.keys(RENDERED_BY_VALUE).filter((key) => !everyKey.includes(key)),
