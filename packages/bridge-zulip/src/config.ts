@@ -216,7 +216,7 @@ function describeShape(value: unknown): string {
   if (value === null) return 'null';
   if (Array.isArray(value)) return `an array of ${value.length}`;
   if (typeof value === 'string') return `a ${value.length}-character string`;
-  return `a ${typeof value}`;
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
 }
 
 /**

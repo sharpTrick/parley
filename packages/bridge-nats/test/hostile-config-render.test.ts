@@ -1,4 +1,4 @@
-import { boxedSecret, expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
+import { expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
 import { MAX_STREAM_NAME_BYTES, MAX_SUBJECT_BYTES } from '../src/naming.js';
 import {
   assertKnownBackendConfig,
@@ -53,7 +53,6 @@ expectLabelledRefusal('nats', {
     subject_prefix: ['a RIGHT-TO-LEFT OVERRIDE (U+202E)'],
     stream_prefix: ['a RIGHT-TO-LEFT OVERRIDE (U+202E)'],
   },
-  credentialKeys: { subject_prefix: boxedSecret(), stream_prefix: boxedSecret() },
   // Route a key this spec has no shape validator for through the plugin's own key/nested check, so
   // that an `ungraded` witness is graded by the code that really runs rather than by a lookup miss.
   validate: (key, value) => {

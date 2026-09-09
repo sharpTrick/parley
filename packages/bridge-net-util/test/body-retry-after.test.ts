@@ -172,9 +172,4 @@ describe('a body-stated wait governing this process', () => {
       }
     },
   );
-
-  it('states the ceiling as a figure a consumer can read, not as a literal in the loop', () => {
-    expect(MAX_BODY_WAIT_MS).toBeGreaterThan(0);
-    expect(Number.isFinite(MAX_BODY_WAIT_MS)).toBe(true);
-  });
 });

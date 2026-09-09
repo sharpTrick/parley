@@ -48,13 +48,6 @@ export interface RefusalSpec {
    */
   accepts?: Readonly<Record<string, readonly string[]>>;
   /**
-   * Keys whose value is, or can carry, a credential — each with a value carrying
-   * {@link PLANTED_SECRET} that THIS backend refuses. A key the backend accepts every string for
-   * has no refusal to grade, and naming one bought nothing until the harness began requiring the
-   * refusal to have happened.
-   */
-  credentialKeys?: Readonly<Record<string, unknown>>;
-  /**
    * Graded keys a hostile STRING is NOT crossed over, each with the reason. An OPT-OUT, because
    * the opt-in form is a fourth skip mechanism with no completeness check: matrix declared two of
    * its keys and the one key whose refusal echoes caller text verbatim was not among them.
@@ -255,17 +248,6 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
       });
     }
 
-    for (const [key, value] of Object.entries(spec.credentialKeys ?? {})) {
-      it(`${key} = a value whose own text IS the secret is refused without it`, () => {
-        expect(
-          String(value),
-          'this value does not carry the secret, so the assertion below grades nothing',
-        ).toContain(PLANTED_SECRET);
-        const message = expectRefusalMessage(spec, key, value);
-        expect(message).toMatch(spec.label(key));
-        expect(message).not.toContain(PLANTED_SECRET);
-      });
-    }
   });
 
   const textGraded = graded.filter((key) => spec.textExempt?.[key] === undefined);

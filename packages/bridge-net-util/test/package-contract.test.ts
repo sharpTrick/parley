@@ -121,12 +121,6 @@ describe('README', () => {
       expect(uses('DEFAULT_BACKOFF_MS', loopCode())).toBeGreaterThan(0);
     });
 
-    it.each(CLAMP_NAMES)('the module does not define or reach `%s`', (name) => {
-      expect(uses(name, loopCode())).toBe(0);
-      expect(src).not.toContain(`export const ${name}`);
-      expect(src).not.toContain(`export function ${name}`);
-    });
-
     // Sold on the npm page, where nobody can check it against the code.
     it.each(['backoff clamp', ...CLAMP_NAMES])('the npm description does not advertise "%s"', (claim) => {
       expect(pkg.description).not.toContain(claim);

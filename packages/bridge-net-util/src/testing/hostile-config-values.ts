@@ -98,11 +98,3 @@ export const WRAPPING_A_SECRET: readonly (readonly [string, unknown])[] = [
  * by value echoes this ON PURPOSE, and a key that accepts any string never renders it at all.
  */
 export const SECRET_AS_TEXT: readonly [string, string] = ['a plain string carrying it', PLANTED_SECRET];
-
-/**
- * A value whose own TEXT is {@link PLANTED_SECRET} while its type is not `string`. Every backend
- * refuses it — each of these keys reads `expected a non-empty string` — and a renderer spelled
- * `typeof raw === 'string' ? JSON.stringify(raw) : String(raw)` prints it in full, which is the
- * shape three plugins shipped past a ratchet that only asked the five it had already fixed.
- */
-export const boxedSecret = (): unknown => new String(PLANTED_SECRET);

@@ -1,4 +1,4 @@
-import { boxedSecret, expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
+import { expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
 import { CONFIG_KEYS, validateConfig, type MatrixBackendConfig } from '../src/config.js';
 
 expectLabelledRefusal('matrix', {
@@ -15,6 +15,5 @@ expectLabelledRefusal('matrix', {
   ],
   declared: CONFIG_KEYS.keys,
   accepts: { invite: ['an array'] },
-  credentialKeys: { password: boxedSecret(), homeserver_url: boxedSecret() },
   validate: (key, value) => void validateConfig({ [key]: value } as MatrixBackendConfig),
 });

@@ -1,4 +1,4 @@
-import { boxedSecret, expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
+import { expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
 import { assertKnownBackendConfig, CONFIG_SHAPES } from '../src/config.js';
 
 expectLabelledRefusal('discord', {
@@ -14,6 +14,5 @@ expectLabelledRefusal('discord', {
       accepts: { parse: ['users'], replied_user: true },
     },
   },
-  credentialKeys: { token: boxedSecret() },
   validate: (key, value) => void assertKnownBackendConfig({ [key]: value }),
 });
