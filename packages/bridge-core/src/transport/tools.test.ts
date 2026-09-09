@@ -413,42 +413,97 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
       }
     ).messages.map((m) => m.content);
 
-  /** A session that read this topic once, and was then away while more than one page arrived. */
-  const awayAfterReading = async (): Promise<{
+  /**
+   * A session that read this topic `priorReads` times, then was away while more than one page
+   * arrived. `priorReads` is a PARAMETER and `0` is a real value: catch-up-on-start deliberately
+   * leaves the read position alone, so a never-read topic is the state every fresh boot produces on
+   * every topic, not an edge case. A fixture that always performs an opening read hides every
+   * defect that needs the stored position to be ABSENT — which is what this one used to do.
+   */
+  const awayAfterReading = async (
+    opts: { priorReads?: number; populated?: boolean } = {},
+  ): Promise<{
     client: Client;
+    readState: ReturnType<typeof memoryReadState>;
     cursor: string;
     missed: string[];
   }> => {
-    const { client, plugin } = await harness({ readState: memoryReadState() });
-    await plugin.post(T, bob, 'read-in-session-one');
-    const opening = parse(
-      await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
-    ) as { nextCursor?: string };
-    for (let i = 0; i < MISSED; i++) await plugin.post(T, bob, `missed-${i}`);
-    return {
-      client,
-      cursor: opening.nextCursor!,
-      missed: Array.from({ length: MISSED }, (_unused, i) => `missed-${i}`),
-    };
+    const priorReads = opts.priorReads ?? 1;
+    const populated = opts.populated !== false;
+    const readState = memoryReadState();
+    const { client, plugin } = await harness({ readState });
+    let cursor: string | undefined;
+    for (let r = 0; r < priorReads; r++) {
+      if (populated) await plugin.post(T, bob, `read-in-session-${r}`);
+      const opening = parse(
+        await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: PAGE } }),
+      ) as { nextCursor?: string };
+      cursor = opening.nextCursor;
+    }
+    const missed = populated
+      ? Array.from({ length: MISSED }, (_unused, i) => `missed-${i}`)
+      : [];
+    for (const content of missed) await plugin.post(T, bob, content);
+    return { client, readState, cursor: cursor!, missed };
   };
 
-  it.each(INTENTS)('an agent can spell the intent: %s', async (_intent, spell, holds) => {
-    const { client, cursor, missed } = await awayAfterReading();
+  it.each(
+    [1, 2].flatMap((priorReads) =>
+      INTENTS.map(([intent, spell, holds]) => [`${intent} (after ${priorReads} read(s))`, priorReads, spell, holds] as const),
+    ),
+  )('an agent can spell the intent: %s', async (_name, priorReads, spell, holds) => {
+    const { client, cursor, missed } = await awayAfterReading({ priorReads });
     holds(await read(client, { topic: 'ctx', limit: PAGE, ...spell(cursor) }), missed);
   });
 
   /**
    * The newest page is a READ, not a seek: an agent that asks what is happening now must not lose
    * the backlog by asking, since the stored position is the only thing that keeps it reachable.
+   *
+   * Parameterised over the PRIOR-READ state because the guard that enforces it is a comparison
+   * against the stored position, and a comparison whose two operands are both ABSENT collapses into
+   * agreement — which is the never-read topic, the state catch-up leaves behind at every boot.
+   * Graded on byte-identity of the position across the call, so "it wrote the same value back" and
+   * "it wrote a value where there was none" both fail.
    */
-  it('asking for the newest page does not consume the backlog', async () => {
-    const { client, missed } = await awayAfterReading();
-    await read(client, { topic: 'ctx', limit: PAGE, from: 'recent' });
+  it.each(
+    [0, 1, 2].flatMap((priorReads) =>
+      ([
+        ['a topic with a backlog', true],
+        ['an empty topic', false],
+      ] as const).flatMap(([population, populated]) =>
+        ([
+          ['from: recent', { from: 'recent' }],
+          ['from: recent with a limit', { from: 'recent', limit: PAGE }],
+          ['from: recent while long-polling', { from: 'recent', limit: PAGE, block_ms: 1 }],
+        ] as const).map(
+          ([spelling, args]) =>
+            [`${spelling}, ${priorReads} prior read(s), ${population}`, priorReads, populated, args] as const,
+        ),
+      ),
+    ),
+  )('a newest-page read moves nothing: %s', async (_name, priorReads, populated, args) => {
+    // The control is the SAME session without the head read, so what an agent may reach is read
+    // off the tool rather than restated here — a cold start legitimately reaches only the newest
+    // window, and hard-coding that number would make this case agree with whatever core does.
+    const control = await awayAfterReading({ priorReads, populated });
+    const reachableWithoutTheHeadRead = await drainAsAnAgentWould(control.client);
+
+    const { client, readState } = await awayAfterReading({ priorReads, populated });
+    const before = readState.get(T);
+    await read(client, { topic: 'ctx', ...args });
+    expect(
+      readState.get(T),
+      'a read of the newest page moved where this session resumes from. On a topic it has never ' +
+        'read there is no position to agree with, so the backlog it skipped is now unreachable ' +
+        'by resuming — which is every topic at every fresh boot, since catch-up leaves the ' +
+        'position alone on purpose',
+    ).toBe(before);
     expect(
       await drainAsAnAgentWould(client),
       'a read of the newest page dragged the stored position past the backlog, so everything ' +
         'between the two is now unreachable by resuming',
-    ).toEqual(missed);
+    ).toEqual(reachableWithoutTheHeadRead);
   });
 
   it('a session that was down reaches every message it missed, oldest first', async () => {

@@ -156,14 +156,13 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // session had never been handed — is unreachable: the agent's next call asks for the recent
       // window again, and the window has only moved forward.
       //
-      // `from: 'recent'` asks for that window ON PURPOSE. It does not advance the stored position
-      // (the compare-and-set below refuses it), so the backlog it skipped stays reachable.
-      const resumeFrom =
-        since !== undefined
+      // `from: 'recent'` asks for that window ON PURPOSE, so the backlog it skipped stays reachable.
+      const readsHead = since === undefined && from === 'recent';
+      const resumeFrom = readsHead
+        ? undefined
+        : since !== undefined
           ? asCursor(since)
-          : from === 'recent'
-            ? undefined
-            : deps.readState?.get(t);
+          : deps.readState?.get(t);
       if (resumeFrom !== undefined) args.since = resumeFrom;
       if (limit !== undefined) args.limit = Math.min(limit, MAX_FETCH_LIMIT);
       const blockMs = block_ms !== undefined ? Math.min(block_ms, deps.blockMaxMs) : 0;
@@ -228,8 +227,13 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // Keep this BEFORE the dedup warm-up, so that a cursor the store refuses takes the whole call
       // down without first recording these ids as delivered — a page the agent never received but
       // the push loop will now suppress is lost on both paths at once.
+      //
+      // A head read never satisfies it, whatever the store holds. `resumeFrom` is absent there
+      // because the call asked to start from NOWHERE, and on a topic this instance has never read
+      // the position is absent too — two absent values are not the same claim, and treating them as
+      // agreement drags the position to the head of a backlog the agent was never handed.
       const readState = deps.readState;
-      if (readState !== undefined && nextCursor !== undefined) {
+      if (readState !== undefined && nextCursor !== undefined && !readsHead) {
         const stored = readState.get(t);
         if (resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
       }
