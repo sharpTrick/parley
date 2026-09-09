@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import {
   derivedRows,
   filesUnder,
+  starReexports,
   workspaceAreas,
   workspacePackages,
   workspaceRoot,
@@ -974,6 +975,52 @@ describe('every workspace alias matches its specifier and nothing under it', () 
       'an alias matched a path UNDER its specifier. A vite string alias is a prefix, so the id is ' +
         "rewritten to the specifier's own source file with the rest appended — a resolution " +
         'failure whose message names neither the alias nor the file',
+    ).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a published surface nothing can enumerate. `export * from './x.js'` republishes whatever
+ * that module happens to export, so every guard built on reading the barrel — the README rule, the
+ * dead-export rule, the semver surface count — reads a name that is not there and misses one that
+ * is. A type-only name republished that way is invisible to a runtime key enumeration too, and
+ * ships as a `.d.ts` compatibility obligation nobody documented or noticed.
+ *
+ * One package had this rule over its own sources. It belongs to every published entry point,
+ * derived from the `exports` map so a second subpath is covered the day the manifest declares it.
+ */
+describe('no published entry point re-exports wholesale', () => {
+  /** Each entry the manifest publishes, as the SOURCE the build compiles it from. */
+  const entryPoints = (): { specifier: string; path: string }[] =>
+    published().flatMap(({ dir, pkg }) =>
+      Object.entries((pkg as { exports?: Record<string, unknown> }).exports ?? {})
+        .filter(([sub]) => sub !== './package.json')
+        .map(([sub, target]) => {
+          const built = typeof target === 'object' && target !== null
+            ? ((target as Record<string, string>).default ?? '')
+            : String(target);
+          return {
+            specifier: sub === '.' ? (pkg.name as string) : `${pkg.name as string}${sub.slice(1)}`,
+            path: join(packagesDir.pathname, dir, built.replace(/^\.\/dist\//, 'src/').replace(/\.js$/, '.ts')),
+          };
+        }),
+    );
+
+  const rows = derivedRows(
+    'every published entry point',
+    () => entryPoints().map((e) => [e.specifier, e.path] as const),
+    { floor: 13, witness: ['@sharptrick/parley-core', '@sharptrick/parley-net-util/testing'] },
+  );
+
+  it('resolves every entry point to a source file that exists', () => {
+    expect(rows.filter(([, path]) => !existsSync(path))).toEqual([]);
+  });
+
+  it.each(rows)('%s enumerates what it publishes', (_specifier, path) => {
+    expect(
+      starReexports(readFileSync(path, 'utf8')),
+      'a wholesale re-export from a published entry point; name what it publishes instead, so the ' +
+        'surface stays countable',
     ).toEqual([]);
   });
 });

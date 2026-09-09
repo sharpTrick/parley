@@ -1,11 +1,11 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
 import { DEFAULT_DEADLINE_MS, fetchWithRetry } from '@sharptrick/parley-net-util';
-import { derivedRows, exportedNames } from '@sharptrick/parley-net-util/testing';
+import { checkedExports, derivedRows, exportedNames } from '@sharptrick/parley-net-util/testing';
 import {
   importedNames,
   importingFiles,
@@ -32,12 +32,23 @@ resetGlobalsAfterEach();
  * no runtime key to enumerate — so a table built from it alone declared a type-only export
  * unpublished, and `export interface NobodyImportsThis` left the file at "118 tests" green.
  */
-const BARREL = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const BARREL_PATH = fileURLToPath(new URL('../src/index.ts', import.meta.url));
+const BARREL = readFileSync(BARREL_PATH, 'utf8');
 
+/**
+ * A floor and two witnesses cannot see a surface narrowing while it stays above them: this table
+ * declared a floor of 12 against a real 19, so seven names could evaporate with both witnesses
+ * intact. `size` is the compiler's own count of the same module, which moves the moment the
+ * syntax-side reader stops reaching something.
+ */
 const SURFACE = derivedRows(
   'the published surface',
   () => [...new Set([...Object.keys(api), ...exportedNames(BARREL)])].sort(),
-  { floor: 12, witness: ['fetchWithRetry', 'FetchWithRetryOptions'] },
+  {
+    floor: 12,
+    witness: ['fetchWithRetry', 'FetchWithRetryOptions'],
+    size: () => checkedExports(BARREL_PATH).length,
+  },
 );
 // The README is the only description an npm consumer reads, and every exported name is a semver
 // commitment. Generated from the entry point, so a new export fails until it is documented.

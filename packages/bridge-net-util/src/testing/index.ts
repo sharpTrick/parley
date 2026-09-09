@@ -18,6 +18,7 @@ export {
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
 export {
+  checkedExports,
   consumedNames,
   consumersOf,
   declaredExports,

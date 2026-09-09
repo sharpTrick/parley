@@ -245,3 +245,25 @@ export function unusedImports(source: string): string[] {
     .flatMap((binding) => binding.names)
     .filter((name) => !used.has(name));
 }
+
+/**
+ * The names a module publishes according to the COMPILER, resolved through whatever it re-exports.
+ *
+ * A second, independent count of a barrel's surface: {@link exportedNames} reads one file's syntax
+ * and cannot follow a wholesale `export *`, while this resolves the module graph. Costed on the
+ * repository's own barrels at under a second — the price of a table that cannot narrow in silence.
+ */
+export function checkedExports(entry: string): string[] {
+  const program = ts.createProgram([entry], {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    skipLibCheck: true,
+    noEmit: true,
+  });
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(entry);
+  const symbol = source === undefined ? undefined : checker.getSymbolAtLocation(source);
+  if (symbol === undefined) throw new Error(`no module symbol for ${entry}`);
+  return checker.getExportsOfModule(symbol).map((s) => s.name);
+}
