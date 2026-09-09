@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -11,6 +11,7 @@ import {
   workspacePackages,
 } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
+import { defaultReadStatePath } from './engine/read-state.js';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 const SOURCE = ['.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml'];
@@ -685,5 +686,31 @@ describe('no assertion reads the machine it is being graded on', () => {
         'host and fails on another — compare against a declared constant instead',
     ).toEqual([]);
     if (kept) expect(found, `${name} is registered as a keep but no longer reads the host`).not.toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a test that reaches a real user directory. `state_path` is optional and falls back to
+ * `${XDG_STATE_HOME:-~/.local/state}/parley/<instance>/read-state.json`, so a test that omits it
+ * opens the file a person's own bridge writes — reading a stale position, and advancing it. Twelve
+ * test files across two packages built a config naming neither; three remembered to redirect.
+ *
+ * Graded here rather than in the twelve, because the defect IS that a file has to remember.
+ */
+describe('the suite runs against a sandboxed state directory, not the developer’s', () => {
+  const sandbox = process.env.XDG_STATE_HOME ?? '';
+
+  it('has XDG_STATE_HOME redirected under the temp directory', () => {
+    expect(
+      sandbox,
+      'XDG_STATE_HOME is not a temp path — vitest.setup.ts is what puts it there, and without it ' +
+        'every config that omits `state_path` opens the real ~/.local/state/parley file',
+    ).toMatch(new RegExp(`^${tmpdir().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
+  it('resolves a default read-state path inside that sandbox and nowhere near the real home', () => {
+    const path = defaultReadStatePath('probe-instance');
+    expect(path.startsWith(sandbox), `${path} is outside ${sandbox}`).toBe(true);
+    expect(path.startsWith(join(homedir(), '.local'))).toBe(false);
   });
 });
