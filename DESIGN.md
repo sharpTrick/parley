@@ -244,8 +244,10 @@ is now the ORDINARY path rather than a reconnect edge case. To make this determi
 - Catch-up is **cursor-based, not timestamp-based**: `fetchRecent({ since })` returns
   everything after the stored cursor and a `nextCursor` to persist.
 
-Because correctness rests on the cursor, **any notify mechanism can be best-effort** — a
-dropped or duplicated push is harmless; core reconciles against the store via `fetchRecent`.
+Because correctness rests on the cursor, **any notify mechanism can be best-effort about what it
+DROPS** — core reconciles against the store via `fetchRecent`. It may not be best-effort about
+repeats: "never twice" above is a conformance obligation on `subscribe`, and core's `backendMsgId`
+dedup is a second line under it, not a licence for a plugin to deliver a message twice.
 
 ---
 
@@ -306,7 +308,8 @@ families:
 - **Polling** (SQLite): the server runs a poll loop —
   `SELECT WHERE cursor > :lastSeen` per subscribed topic on an interval — normalizes new
   rows, invokes handler, advances `lastSeen`. Silent at the MCP-protocol level.
-- **Event-driven / blocking** (Redis `XREAD BLOCK`, Matrix sync, XMPP PubSub, NATS subscribe):
+- **Event-driven / blocking** (Redis `XREAD BLOCK`, Matrix sync, XMPP's joined-MUC message
+  stream, NATS subscribe):
   handler is driven by genuine backend events instead of a timer.
 
 Because core's emit-to-channel handler is identical across mechanisms, **push developed
@@ -324,9 +327,13 @@ dumb and dependency-free: poll, reconcile via cursor, done.
 - **Event-driven push is introduced by `bridge-redis` (v0.3)**, the first backend that
   drives `subscribe` from a real blocking event source (`XREAD BLOCK`). That milestone
   inherits the job of proving the push path works against genuine events, not a timer.
-- Poll interval (e.g. 500ms–2s) is a latency/cost knob on the SQLite plugin with **no
-  correctness impact** — the cursor guarantees a poll tick misses nothing, whatever the cadence.
-  What push does not cover is the start-up window above, and catch-up is what closes that.
+- Poll interval (e.g. 500ms–2s) is a latency/cost knob on the SQLite plugin. The cursor makes a
+  poll tick miss nothing **that is still in the store**, whatever the cadence — but retention is
+  not cursor-aware: `bridge-sqlite`'s prune deletes by row `ts` age, independent of any
+  subscriber's position, so at the documented floor (`retention_days: 1/1440`, 60s) with a longer
+  poll interval, rows are deleted before the tick that would have delivered them. Keep the interval
+  well below the retention window. What push does not cover is the start-up window above, and
+  catch-up is what closes that.
 - **Multi-process** (N sessions → N bridges on one host, §10) is safe with SQLite **WAL mode**
   (already specified) plus a busy-timeout/retry so simultaneous `post`s from different
   instances don't error. With UDS gone, that concurrent-write handling is the *only*
@@ -447,10 +454,13 @@ catchup:
                                 # kept below client tool timeouts so a blocked call never trips them
   block_poll_interval_ms: 250    # how often core re-drives fetchRecent AFTER a plugin came back
                                  # from a budget early with nothing for the topic asked for. NOT the
-                                 # delivery latency: Redis and NATS park inside one fetchRecent, so
-                                 # the nap is never reached (measured: 402ms arrival, ~1205ms idle
-                                 # return, identical at cadence 250 and 5000), and the eight that
-                                 # refuse block_ms never start the loop at all.
+                                 # delivery latency while a plugin is parked: Redis and NATS spend
+                                 # the budget inside one fetchRecent (measured: 402ms arrival,
+                                 # ~1205ms idle return, identical at cadence 250 and 5000), and the
+                                 # eight that refuse block_ms never start the loop at all. Redis
+                                 # does return early — a disconnect mid-budget, a caught reader
+                                 # failure, or a caller past its concurrent-reader cap — and this
+                                 # cadence is what honours the rest of that budget.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
@@ -577,7 +587,9 @@ parley/
 ├── packages/
 │   ├── bridge-core/          # seam, Message type, cursor/dedup, channel emit, reactive tools
 │   │   ├── transport/        #   local-stdio + remote-HTTP transports
-│   │   └── auth/             #   OAuth front door for remote mode (v0.2); absent in local mode
+│   │   ├── auth/             #   OAuth front door for remote mode (v0.2); absent in local mode
+│   │   └── testing/          #   published `@sharptrick/parley-core/testing` subpath: fixtures a
+│   │                         #   plugin's own suite imports
 │   │                         # ZERO backend dependencies
 │   ├── bridge-sqlite/        # v0.1 — zero-infra on-ramp; polling-only
 │   ├── bridge-redis/         # v0.3 — first event-driven push; first networked local-ish backend
@@ -588,7 +600,10 @@ parley/
 │   ├── bridge-zulip/         # v0.6 — self-hosted; closest native fit (streams+topics)
 │   ├── bridge-discord/       # v0.6 — hosted SaaS; gateway push
 │   ├── bridge-telegram/      # v0.6 — hosted SaaS; local observed store (no history API)
-│   └── bridge-slack/         # v0.6 — hosted SaaS; Socket Mode push
+│   ├── bridge-slack/         # v0.6 — hosted SaaS; Socket Mode push
+│   ├── bridge-net-util/      # PUBLISHED: fetch+retry, credential/loopback classifier, delay —
+│   │                         #   shared BELOW the seam by every backend but SQLite
+│   └── conformance/          # PUBLISHED: the shared seam suite every plugin runs
 ├── examples/
 │   ├── fakechat-loopback/    # local test harness for the channel path
 │   ├── self-host-remote/     # reference deployment for remote/chat mode (public + OAuth)
@@ -839,8 +854,10 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
 - [x] Design handed to a Code instance; `CLAUDE.md` and `TASKS.md` written and worked to
       completion. v0.1–v1 plus the post-v1 OIDC mode all shipped.
 - [ ] **Cut 1.0.** The seam has been frozen since v0.1 and survived ten backends, one post-freeze
-      capability (`block_ms`) and its later WITHDRAWAL from eight of them — both additively, both
-      as optional fields — with no method changes; see `docs/1.0-readiness.md` for the
+      capability (`block_ms`) and its later WITHDRAWAL from eight of them, with no method changes:
+      the capability landed as one optional field, and the withdrawal added NO field at all — the
+      `capabilities` declaration written for it was built and then removed, and a backend that
+      cannot park refuses the argument at the moment it is used. See `docs/1.0-readiness.md` for the
       evidence, what 1.0 would and would not freeze, and the mechanics. Deliberately not
       automatic: per `CLAUDE.md`, breaking changes land as `feat:` until 1.0 is cut on purpose.
 - [ ] Deferred by choice, not oversight (see `TASKS.md`): spawn-on-unknown-handle, richer
