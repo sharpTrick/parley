@@ -3,7 +3,7 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
 import { assertXmlSafe, attributeNormalizedCodepoint, codepointLabel } from './stanzas.js';
@@ -73,18 +73,22 @@ const ENCRYPTED_SCHEMES = ['xmpps:', 'wss:'];
  * classified at all — but the loopback question is `isLoopbackHost`'s, so that this backend and
  * every other one answer it identically.
  */
-export function isPlaintextRemote(service: string): boolean {
+export function plaintextRemoteHost(service: string): string | undefined {
   const trimmed = service.trim();
   const mark = trimmed.indexOf('://');
   const scheme = mark === -1 ? undefined : trimmed.slice(0, mark + 1).toLowerCase();
-  if (scheme !== undefined && ENCRYPTED_SCHEMES.includes(scheme)) return false;
+  if (scheme !== undefined && ENCRYPTED_SCHEMES.includes(scheme)) return undefined;
   const authority = (mark === -1 ? trimmed : trimmed.slice(mark + 3)).replace(/^\/\//, '');
   const host = (/^([^/?#]*)/.exec(authority)?.[1] ?? '')
     .replace(/^[^@]*@/, '')
     .replace(/^(\[[^\]]*]):\d+$/, '$1')
     .replace(/^\[(.*)]$/, '$1')
     .replace(/^([^:]*):\d+$/, '$1');
-  return host !== '' && !isLoopbackHost(host);
+  return host !== '' && !isLoopbackHost(host) ? host : undefined;
+}
+
+export function isPlaintextRemote(service: string): boolean {
+  return plaintextRemoteHost(service) !== undefined;
 }
 
 const bad = (key: string, reason: string): Error =>
@@ -160,6 +164,9 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
   return cfg as XmppBackendConfig;
 }
 
+/** Longest DNS name there is; a diagnostic naming a host never needs more than this. */
+const MAX_HOST_IN_DIAGNOSTIC = 253;
+
 /**
  * What the connection about to be dialled exposes the SASL credential to. Neither is a load error —
  * a loopback dev instance on the built-in password is the documented quickstart — so the operator
@@ -173,10 +180,12 @@ export function warnInsecureConfig(service: string, password: string | undefined
         'XMPP account provisioned with this password is world-readable/injectable.',
     );
   }
-  if (isPlaintextRemote(service)) {
+  const host = plaintextRemoteHost(service);
+  if (host !== undefined) {
     console.warn(
-      `[parley-xmpp] SECURITY: backend_config.service ${service} can put ` +
-        'backend_config.password on the network in the clear — it names a non-loopback host over ' +
+      `[parley-xmpp] SECURITY: backend_config.service names the host ` +
+        `${JSON.stringify(sanitizeBody(host).slice(0, MAX_HOST_IN_DIAGNOSTIC))}, which can put ` +
+        'backend_config.password on the network in the clear — it is a non-loopback host over ' +
         'a plaintext scheme, or over no scheme at all, which @xmpp/resolve answers by DNS-SRV ' +
         'whose candidate list ends at ' +
         "a cleartext xmpp://…:5222. @xmpp/client's STARTTLS is opportunistic and SASL PLAIN is " +

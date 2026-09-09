@@ -19,7 +19,13 @@ vi.mock('@xmpp/client', async () => {
   return { ...actual, client: () => mockState.client };
 });
 
-import { isLoopbackHost } from '@sharptrick/parley-net-util';
+import { isLoopbackHost, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import {
+  FORBIDDEN_IN_RENDER,
+  PLANTED_SECRET,
+  UNSAFE_TEXT,
+} from '@sharptrick/parley-net-util/testing';
+import { warnInsecureConfig } from '../src/config.js';
 import { isPlaintextRemote, XmppPlugin } from '../src/index.js';
 import { FakeXmpp } from './fake-xmpp.js';
 
@@ -180,5 +186,37 @@ describe('XMPP transport safety', () => {
     // Nothing else was reported, so a cell that must warn cannot be riding another's line.
     expect(warned).toHaveLength(credential.length + transport.length);
     expect(warned.every((m) => m.includes('parley-xmpp'))).toBe(true);
+  });
+});
+
+/**
+ * CLASS: the diagnostic above is an OPERATOR CHANNEL that carries a `backend_config` value, and it
+ * is not a thrown message — so none of the refusal-rendering guards this repo grades reaches it.
+ * `service` is caller-authored: it may carry a password in its userinfo, and its text may forge
+ * line structure or run unbounded, which turns an operator's log into a place an attacker can
+ * write a forged `[parley-xmpp] SECURITY:` line of their own choosing.
+ */
+describe('the transport warning names a host and nothing else the caller wrote', () => {
+  const lines = (service: string): string[] => {
+    const warn = spyWarn();
+    warnInsecureConfig(service, 'a-real-password');
+    return warn.mock.calls.map((c) => String(c[0]));
+  };
+
+  it('never carries a password written into the address', () => {
+    const warned = lines(`xmpp://bot:${PLANTED_SECRET}@evil.example.com:5222`);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).not.toContain(PLANTED_SECRET);
+    expect(warned[0]).toContain('evil.example.com');
+  });
+
+  it.each(UNSAFE_TEXT)('%s in the host is one bounded, harmless line', (_label, text) => {
+    const warned = lines(`xmpp://bot:${PLANTED_SECRET}@${text}`);
+    expect(warned).toHaveLength(1);
+    const line = warned[0] ?? '';
+    expect(line).not.toContain(PLANTED_SECRET);
+    expect(line).not.toMatch(FORBIDDEN_IN_RENDER);
+    expect(line).not.toMatch(/[\n\r]/);
+    expect(line.length).toBeLessThanOrEqual(MAX_ERROR_BODY);
   });
 });
