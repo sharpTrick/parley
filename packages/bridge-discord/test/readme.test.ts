@@ -1,9 +1,5 @@
 import { asCursor, asHandle, asTopic, type Cursor } from '@sharptrick/parley-core';
-import {
-  DEFAULT_BACKOFF_MS,
-  DEFAULT_DEADLINE_MS,
-  MAX_BACKOFF_MS,
-} from '@sharptrick/parley-net-util';
+import { DEFAULT_BACKOFF_MS, DEFAULT_DEADLINE_MS } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
@@ -29,7 +25,6 @@ describe('bridge-discord README — the documented 429 rule is net-util’s actu
 
   const NUMBERS: Array<[string, number]> = [
     ['the hintless default wait', DEFAULT_BACKOFF_MS],
-    ['the ceiling on a self-invented backoff', MAX_BACKOFF_MS],
     ['the per-call deadline', DEFAULT_DEADLINE_MS],
   ];
 
@@ -217,7 +212,48 @@ describe('bridge-discord 429 behaviour matches what the README promises', () => 
     await fake.close();
   });
 
-  it('refuses a stated wait past the call deadline instead of clamping it to the ceiling', async () => {
+  /**
+   * The README states a rule that belongs to a DEPENDENCY, so the case has to DRIVE it rather than
+   * check that the numbers beside it are the exported ones. The sentence said "falling back to" the
+   * body field, which is a different rule from the one the loop runs, and every README-truth row
+   * here graded three CONSTANTS — so the prose was wrong for as long as 500/30000 stayed 500/30000.
+   *
+   * Both orderings, because "the header wins" and "the header is a floor" agree on exactly one of
+   * them, and a table that asks only that one cannot tell the rules apart.
+   */
+  const BOTH_HINTS: Array<[label: string, headerS: number, bodyS: number]> = [
+    ['the header asking for longer', 0.5, 0.05],
+    ['the body asking for longer', 0.05, 0.5],
+  ];
+
+  it('says the header is a floor rather than a fallback', () => {
+    expect(RATE_LIMITS).toMatch(/floor/i);
+    expect(RATE_LIMITS).not.toMatch(/falling back to/i);
+    expect(RATE_LIMITS).toMatch(/longer of the two/i);
+  });
+
+  it.each(BOTH_HINTS)('waits the longer of the two when a 429 carries %s', async (_label, h, b) => {
+    fake.injectFault({
+      status: 429,
+      path: '/channels/',
+      headers: { 'retry-after': String(h) },
+      body: { retry_after: b },
+    });
+
+    const started = Date.now();
+    await plugin.post(topic, asHandle('writer'), 'hi');
+    const elapsed = Date.now() - started;
+
+    expect(
+      elapsed,
+      'the call retried before the longer of the two stated waits — the header is a FLOOR the ' +
+        'body cannot lower and the body is a hint the header cannot cap, so whichever states ' +
+        'longer is what is waited',
+    ).toBeGreaterThanOrEqual(Math.max(h, b) * 1000 * 0.8);
+    expect(fake.requestCount('/messages')).toBe(2);
+  });
+
+  it('refuses a stated wait past the call deadline instead of shortening it', async () => {
     const askedMs = 2 * DEFAULT_DEADLINE_MS;
     fake.injectFault({
       status: 429,
@@ -233,8 +269,8 @@ describe('bridge-discord 429 behaviour matches what the README promises', () => 
     // Both numbers, so the operator can see whose budget ran out and by how much.
     expect(String(err)).toContain(String(askedMs));
     expect(String(err)).toContain(String(DEFAULT_DEADLINE_MS));
-    // A clamped hint would have slept MAX_BACKOFF_MS and then SUCCEEDED on the retry.
-    expect(elapsed).toBeLessThan(MAX_BACKOFF_MS);
+    // A shortened hint would have slept and then SUCCEEDED on the retry, well inside the deadline.
+    expect(elapsed).toBeLessThan(DEFAULT_DEADLINE_MS / 2);
     expect(fake.requestCount('/messages')).toBe(1);
   });
 });

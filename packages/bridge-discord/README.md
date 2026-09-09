@@ -72,13 +72,16 @@ spelled `10s` reaches `setTimeout` as `NaN`.
 ## Rate limits (429)
 
 The retry loop is `@sharptrick/parley-net-util`'s, shared by every HTTP backend, and one cap does
-not describe it. The plugin reads Discord's hint from the standard `Retry-After` header, falling
-back to Discord's own `retry_after` body field (seconds, float):
+not describe it. What this plugin contributes is the field and the unit: Discord's own
+`retry_after` body field, in seconds (float). The standard `Retry-After` header is a **floor**, not
+a fallback — whichever of the two states the longer wait is the one waited, so a CDN stamping
+`Retry-After: 1` in front of Discord asking 60 s does not retry 59 s early:
 
 | what the 429 carries | what the call does |
 | -------------------- | ------------------ |
-| no usable hint       | waits the shared default of **500 ms**. The **5000 ms** ceiling bounds only a backoff the client invented for itself. |
-| a stated hint        | waits it **in full**, past 5000 ms when that is what Discord asked for. Retrying sooner than the vendor asked is what turns a rate limit into a ban. |
+| no usable hint       | waits the shared default of **500 ms**. Nothing here clamps a wait. |
+| a stated hint        | waits it **in full**, however long Discord asked for. Retrying sooner than the vendor asked is what turns a rate limit into a ban. |
+| both a header and a body hint | waits **the longer of the two**, in either order. |
 | a hint longer than the call's remaining budget (**30000 ms**) | the call **fails** with an error naming both numbers instead of sleeping past its budget. Nothing is retried. |
 
 Discord's *global* rate limits routinely ask for longer than 30000 ms. When one lands, the tool
