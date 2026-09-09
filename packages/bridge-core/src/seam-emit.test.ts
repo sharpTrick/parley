@@ -1,29 +1,38 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 /**
- * CLASS: a module this package publishes as TYPES AND DOC COMMENTS is the contract every backend
- * author reads, and a helper parked in one publishes an implementation from the declaration of an
- * interface — the two things this repo's prime directive keeps apart.
+ * CLASS: the module a seam type is DECLARED in is the contract every backend author reads, and a
+ * helper parked in one publishes an implementation from the declaration of an interface — the two
+ * things this repo's prime directive keeps apart.
  *
- * The modules are derived from the BARREL: every specifier `src/index.ts` re-exports only types
- * from, and transitively every specifier those re-export only types from. Anchoring on a SET rather
- * than on a symbol is the point. Finding the file by asking which one declares `BackendPlugin` let
- * a split hide the defect — moving that one interface to a sibling, leaving every other seam type,
- * the whole contract doc block and `export const HELPER = …` behind in `seam.ts`, took the guard
- * off the file it was written about and left three rows green. A set survives the split, a rename,
- * and a second declaration file.
+ * The set is resolved with the TypeScript CHECKER, from the seam's own type names to whatever
+ * source file declares each of them. Two earlier spellings were both moved off the file they were
+ * written about without going red: one anchored on the symbol `BackendPlugin` (a split to a sibling
+ * took the guard with it), and one derived the set from the barrel's type-only re-export
+ * specifiers — a derivation under the MUTATOR's control, since adding any value re-export from the
+ * same specifier drops that module out of the set. A name the checker resolves cannot be moved out
+ * of the set by anything written in the barrel.
  *
  * Transpiled rather than scanned as text: a search for `export function` cannot see a `const`
- * arrow, a decorator, or a side-effecting import, and is the failure mode this repo has hit four
- * times. The options come from `tsconfig.base.json`, so the emit graded here is the one the build
- * performs rather than a second dialect that drifts from it — under an `.mts` name, because
- * `NodeNext` decides ESM-or-CJS from the file and a bare `probe.ts` transpiles to CommonJS, whose
- * two prologue statements read as runtime code in every module including an empty one.
+ * arrow, a decorator, or a side-effecting import. The options come from `tsconfig.base.json` so the
+ * emit graded is the one the build performs, under an `.mts` name because `NodeNext` decides
+ * ESM-or-CJS from the file and a bare `probe.ts` transpiles to CommonJS, whose two prologue
+ * statements read as runtime code in every module including an empty one.
  */
 const SRC = new URL('./', import.meta.url);
-const BARREL = 'index.ts';
+
+/** The seam (DESIGN §5/§11). Every type a backend author implements against, by name. */
+const SEAM_TYPES = [
+  'BackendPlugin',
+  'BackendConfig',
+  'BackendIdentity',
+  'FetchRecentArgs',
+  'FetchRecentResult',
+  'MessageHandler',
+] as const;
 
 const BUILD_OPTIONS = ts.convertCompilerOptionsFromJson(
   (
@@ -34,50 +43,24 @@ const BUILD_OPTIONS = ts.convertCompilerOptionsFromJson(
   '.',
 ).options;
 
-/**
- * The relative specifiers a module re-exports ONLY types from. A specifier that also carries a
- * value export anywhere in the module is excluded, so `export { asTopic } from './message.js'`
- * beside `export type { Topic } from './message.js'` keeps `message.ts` out — it is allowed to emit.
- */
-function typeOnlySpecifiers(text: string): string[] {
-  const parsed = ts.createSourceFile('probe.ts', text, ts.ScriptTarget.ESNext, true);
-  const typeOnly = new Set<string>();
-  const value = new Set<string>();
-  for (const st of parsed.statements) {
-    if (!ts.isExportDeclaration(st)) continue;
-    const from = st.moduleSpecifier;
-    if (from === undefined || !ts.isStringLiteral(from)) continue;
-    const clause = st.exportClause;
-    const allTypes =
-      st.isTypeOnly ||
-      (clause !== undefined &&
-        ts.isNamedExports(clause) &&
-        clause.elements.length > 0 &&
-        clause.elements.every((e) => e.isTypeOnly));
-    (allTypes ? typeOnly : value).add(from.text);
+/** Each seam type's DECLARING source file, resolved through the barrel's export aliases. */
+function declaringFiles(): Map<string, string> {
+  const barrel = fileURLToPath(new URL('index.ts', SRC));
+  const program = ts.createProgram([barrel], BUILD_OPTIONS);
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(barrel);
+  expect(source, 'the barrel did not load, so nothing below resolves').toBeDefined();
+  const moduleSymbol = checker.getSymbolAtLocation(source as ts.SourceFile);
+  expect(moduleSymbol, 'the barrel is not a module symbol').toBeDefined();
+  const exported = checker.getExportsOfModule(moduleSymbol as ts.Symbol);
+  const found = new Map<string, string>();
+  for (const name of SEAM_TYPES) {
+    const alias = exported.find((s) => s.getName() === name);
+    if (alias === undefined) continue;
+    const symbol = alias.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(alias) : alias;
+    const file = symbol.declarations?.[0]?.getSourceFile().fileName;
+    if (file !== undefined) found.set(name, file);
   }
-  for (const spelled of value) typeOnly.delete(spelled);
-  return [...typeOnly];
-}
-
-const resolveFrom = (from: string, spec: string): string | undefined => {
-  if (!spec.startsWith('.')) return undefined;
-  const dir = from.includes('/') ? from.slice(0, from.lastIndexOf('/') + 1) : '';
-  return new URL(spec, `file:///${dir}`).pathname.slice(1).replace(/\.js$/, '.ts');
-};
-
-/** Every module reachable from `entry` through type-only re-exports, transitively. */
-function typeOnlyModules(entry: string, read: (path: string) => string): string[] {
-  const found: string[] = [];
-  const walk = (from: string): void => {
-    for (const spec of typeOnlySpecifiers(read(from))) {
-      const path = resolveFrom(from, spec);
-      if (path === undefined || found.includes(path)) continue;
-      found.push(path);
-      walk(path);
-    }
-  };
-  walk(entry);
   return found;
 }
 
@@ -101,20 +84,9 @@ const emitted = (source: string): string[] => {
     .map((st) => st.getText(out).split('\n')[0] as string);
 };
 
-const readSource = (path: string): string => readFileSync(new URL(path, SRC), 'utf8');
+const DECLARED = declaringFiles();
 
-const typeOnlyModulesOfBarrel = (): string[] => typeOnlyModules(BARREL, readSource);
-
-/** Whether every module of a synthetic package still emits nothing — the check, run in miniature. */
-const checkPasses = (files: Record<string, string>): boolean => {
-  const modules = typeOnlyModules(BARREL, (p) => files[p] ?? '');
-  return modules.length > 0 && modules.every((m) => emitted(files[m] ?? '').length === 0);
-};
-
-const SEAM = 'export interface BackendPlugin { connect(): Promise<void> }\n';
-const HELPER = 'export const HELPER = (m: string): string => m;\n';
-
-describe('the modules the barrel publishes as types emit nothing', () => {
+describe('the modules declaring the seam emit nothing', () => {
   it('reads the emit, so a row below cannot pass by finding none', () => {
     expect(emitted('export interface A { b: string }')).toEqual([]);
     expect(emitted('export function f(): void {}')).not.toEqual([]);
@@ -122,73 +94,15 @@ describe('the modules the barrel publishes as types emit nothing', () => {
     expect(emitted("import './side-effect.js';")).not.toEqual([]);
   });
 
-  it('derives a non-empty set from the barrel, including the module declaring the seam', () => {
-    const modules = typeOnlyModulesOfBarrel();
-    expect(modules.length).toBeGreaterThan(0);
-    expect(modules.filter((m) => readSource(m).includes('interface BackendPlugin'))).not.toEqual([]);
+  it.each(SEAM_TYPES)('%s is exported by the barrel and resolves to a file', (name) => {
+    expect(DECLARED.get(name), `${name} no longer resolves, so no row below grades it`).toBeDefined();
   });
 
-  it('leaves a module the barrel also re-exports a value from out of the set', () => {
-    expect(typeOnlyModulesOfBarrel()).not.toContain('message.ts');
-  });
-
-  it.each(typeOnlyModulesOfBarrel())('%s emits no runtime code', (module) => {
+  it.each([...new Set(DECLARED.values())])('%s emits no runtime code', (file) => {
     expect(
-      emitted(readSource(module)),
-      `${module} is published by the barrel as types only and now emits runtime code — the ` +
-        'implementation belongs in its own module, re-exported from the barrel',
+      emitted(readFileSync(file, 'utf8')),
+      `${file} declares part of the seam and now emits runtime code — the implementation belongs ` +
+        'in its own module, re-exported from the barrel',
     ).toEqual([]);
   });
-
-  /**
-   * The check against the shapes it exists to catch, run over a synthetic package so the plant is
-   * real rather than described. The SPLIT rows are the ones the symbol-anchored predecessor let
-   * through: `BackendPlugin` moves to a sibling and the runtime code stays behind.
-   */
-  it.each([
-    [
-      'a clean seam',
-      { [BARREL]: "export type { BackendPlugin } from './seam.js';\n", 'seam.ts': SEAM },
-      true,
-    ],
-    [
-      'runtime code in the seam module',
-      { [BARREL]: "export type { BackendPlugin } from './seam.js';\n", 'seam.ts': SEAM + HELPER },
-      false,
-    ],
-    [
-      'the seam interface split to a sibling the barrel names, helper left behind',
-      {
-        [BARREL]:
-          "export type { BackendPlugin } from './seam-plugin.js';\n" +
-          "export type { MessageHandler } from './seam.js';\n",
-        'seam-plugin.ts': SEAM,
-        'seam.ts': 'export type MessageHandler = (m: string) => void;\n' + HELPER,
-      },
-      false,
-    ],
-    [
-      'the seam interface split to a sibling only the seam module names',
-      {
-        [BARREL]: "export type { BackendPlugin } from './seam.js';\n",
-        'seam.ts': "export type { BackendPlugin } from './seam-plugin.js';\n" + HELPER,
-        'seam-plugin.ts': SEAM,
-      },
-      false,
-    ],
-    [
-      'runtime code in a module reached only through the seam module',
-      {
-        [BARREL]: "export type { BackendPlugin } from './seam.js';\n",
-        'seam.ts': "export type { BackendPlugin } from './seam-plugin.js';\n",
-        'seam-plugin.ts': SEAM + HELPER,
-      },
-      false,
-    ],
-  ] as Array<[string, Record<string, string>, boolean]>)(
-    'the check reports %s as passing=%s',
-    (_label, files, passes) => {
-      expect(checkPasses(files)).toBe(passes);
-    },
-  );
 });
