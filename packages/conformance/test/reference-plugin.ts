@@ -18,6 +18,7 @@ import {
   safeDeliver,
   type Topic,
 } from '@sharptrick/parley-core';
+import { FAILURE_SHAPE_NAMES } from '@sharptrick/parley-core/testing';
 import {
   CALLER_BLOCK_RETURN_MS,
   carriesControlCharacter,
@@ -348,20 +349,26 @@ const NARROW_BLAST_RADIUS = 4;
 const SERVER_BATCH = 50;
 
 /**
- * The widest any control may be declared, whatever it corrupts. `since` is threaded through most of
- * the suite, so the one variant that re-delivers at a cursor legitimately reaches half of it — but
- * past half a control has stopped discriminating, and no figure recorded here can buy that back.
+ * The widest any control may be declared, whatever it corrupts — as a FRACTION of the suite rather
+ * than as a figure. `since` is threaded through most of the suite, so the one variant that
+ * re-delivers at a cursor legitimately reaches a large share of it; past half a control has stopped
+ * discriminating, and no figure recorded beside a variant can buy that back.
  *
- * The two handler-fault controls scale with the SHARED fault table rather than with anything they
- * corrupt: each fails one row per rejecting shape per fault position, so a shape added to
- * `FAILURE_SHAPES` widens them by {@link FAULT_POSITIONS_PER_SHAPE}. That is what raised this from
- * 16, and it stays a bound on the same terms — the row beside it still refuses anything past half
- * the suite.
+ * The handler-fault controls scale with the SHARED fault table rather than with anything they
+ * corrupt: each fails one row per shape it mishandles per fault position, so a shape added to
+ * `FAILURE_SHAPES` widens three of them at once by {@link FAULT_POSITIONS_PER_SHAPE}. Twice now
+ * that has arrived as a bookkeeping raise of a literal — and the last one refused the awaiting
+ * control outright, because the clause the ceiling bounds had grown to 21 of the 57 rows the
+ * ceiling is a fraction OF. Stated as a fraction, a clause that grows its own rows moves the
+ * ceiling with it and never needs another raise.
  */
-export const MAX_BLAST_RADIUS = 18;
+export const MAX_BLAST_FRACTION = 2 / 5;
 
 /** Positions in a run the shared clause drives each fault shape at (first, middle, every). */
 const FAULT_POSITIONS_PER_SHAPE = 3;
+
+/** Every shape the shared handler-fault clause drives, so a control's radius grows with the table. */
+const ALL_SHAPES = FAILURE_SHAPE_NAMES.length;
 
 /**
  * Shapes whose failure arrives as a REJECTION. A control that never attaches to what the handler
@@ -1003,6 +1010,36 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
             // reaches the process — which is the whole of this defect.
             void handler(m);
           }),
+      })),
+  },
+  {
+    /**
+     * AWAITING the handler — the containment a live path reaches for first, and the one the
+     * `never settles` arm of the fault table exists to forbid. It absorbs every rejecting shape,
+     * which is why it reads as a fix; a handler that never settles then parks the subscription and
+     * every later message behind it. Without this control that arm had NO negative coverage at all:
+     * measured over 4,503 child rows, every other shape was n=237 failed=6 and `never settles` was
+     * n=237 failed=0, so the stalling half of the clause could be deleted with the negative control
+     * staying green.
+     */
+    name: 'a live path that awaits the handler it was given',
+    blastRadius: ALL_SHAPES * FAULT_POSITIONS_PER_SHAPE,
+    mutates: 'handler-fault-does-not-stop-delivery',
+    mustFail: 'survives a handler that',
+    make: () =>
+      wrap((inner) => ({
+        subscribe: (topic, handler) => {
+          // The delivery CHAIN is what makes awaiting a containment rather than a no-op: awaiting
+          // inside a callback the path itself fires and forgets changes nothing, and the first
+          // version of this control did exactly that and failed no case at all.
+          let chain: Promise<unknown> = Promise.resolve();
+          return inner.subscribe(topic, (m) => {
+            chain = chain.then(async () => {
+              await handler(m);
+            });
+            return chain;
+          });
+        },
       })),
   },
   {

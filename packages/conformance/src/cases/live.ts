@@ -1,11 +1,9 @@
+import { asHandle, type Handle, type Message, parseMentions } from '@sharptrick/parley-core';
 import {
-  asHandle,
   FAILURE_SHAPE_NAMES,
   FAILURE_SHAPES,
-  type Handle,
-  type Message,
-  parseMentions,
-} from '@sharptrick/parley-core';
+  unhandledDuring,
+} from '@sharptrick/parley-core/testing';
 import { expect, it, vi } from 'vitest';
 import { drainAll, expectWellFormedMessage } from '../assertions.js';
 import type { ConformanceContext } from '../factory.js';
@@ -410,13 +408,6 @@ export function liveCases(ctx: ConformanceContext): void {
    */
   it.each(FAULT_MATRIX)('a live path survives a handler that %s', async (_label, fault, faultsAt) => {
     const noise: string[] = [];
-    const escaped: unknown[] = [];
-    const collect = (reason: unknown): void => {
-      escaped.push(reason);
-    };
-    // Collected here rather than left to the runner's global accounting, so the row that produced
-    // an escaped rejection is the row that fails.
-    process.on('unhandledRejection', collect);
     const onStderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk): boolean => {
       noise.push(String(chunk));
       return true;
@@ -426,37 +417,46 @@ export function liveCases(ctx: ConformanceContext): void {
     });
     const writer = liveWriter();
     try {
-      const t = ctx.freshTopic();
-      const offered: string[] = [];
-      const sent: string[] = [];
-      let nth = 0;
-      await ctx.plugin.subscribe(t, (m) => {
-        offered.push(m.content);
-        return faultsAt(nth++) ? fault() : undefined;
+      // Collected per row rather than left to the runner's global accounting, so the row that
+      // produced the escape is the row that fails. `unhandledDuring` listens for BOTH shapes: a
+      // synchronous throw that leaves a detached task is an `uncaughtException`, not a rejection,
+      // and a rejection-only listener reports it as clean while the run exits non-zero with no row
+      // red — green to anything reading the report.
+      const escaped = await unhandledDuring(async () => {
+        const t = ctx.freshTopic();
+        const offered: string[] = [];
+        const sent: string[] = [];
+        let nth = 0;
+        await ctx.plugin.subscribe(t, (m) => {
+          offered.push(m.content);
+          return faultsAt(nth++) ? fault() : undefined;
+        });
+
+        for (let i = 0; i < FAULTED_POSTS; i++) {
+          const content = livePayload();
+          await ctx.plugin.post(t, writer, content);
+          sent.push(content);
+          await delivered(DELIVERY_MS, () =>
+            expect(
+              offered,
+              'handler-fault-does-not-stop-delivery: a failing handler took the rest of the topic ' +
+                'down with it. The messages were sent one at a time, each awaited before the ' +
+                'next, so none of them is a burst a delivery window may drop — and the failure is ' +
+                'the consumer\'s, never the backend\'s',
+            ).toEqual(sent),
+          );
+        }
+
+        await sleep(FAULT_SETTLE_MS);
       });
 
-      for (let i = 0; i < FAULTED_POSTS; i++) {
-        const content = livePayload();
-        await ctx.plugin.post(t, writer, content);
-        sent.push(content);
-        await delivered(DELIVERY_MS, () =>
-          expect(
-            offered,
-            'handler-fault-does-not-stop-delivery: a failing handler took the rest of the topic ' +
-              'down with it. The messages were sent one at a time, each awaited before the next, ' +
-              'so none of them is a burst a delivery window may drop — and the failure is the ' +
-              'consumer\'s, never the backend\'s',
-          ).toEqual(sent),
-        );
-      }
-
-      await sleep(FAULT_SETTLE_MS);
       expect(
         escaped,
-        'handler-fault-reaches-no-unhandled-rejection: a handler\'s rejection escaped to the ' +
+        'handler-fault-reaches-no-unhandled-rejection: a handler\'s failure escaped to the ' +
           'process. The seam types the handler `=> void`, which does not forbid an `async` one, ' +
           'and under Node\'s default `--unhandled-rejections=throw` an unattached rejection ends ' +
-          'the whole bridge — every topic, not just this one',
+          'the whole bridge — every topic, not just this one. A synchronous throw that leaves a ' +
+          'detached task arrives here as an uncaughtException and ends it just the same',
       ).toEqual([]);
       expect(
         noise,
@@ -467,7 +467,6 @@ export function liveCases(ctx: ConformanceContext): void {
     } finally {
       onStderr.mockRestore();
       onConsole.mockRestore();
-      process.off('unhandledRejection', collect);
     }
   });
 

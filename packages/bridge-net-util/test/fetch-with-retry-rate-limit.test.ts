@@ -146,11 +146,11 @@ describe('fetchWithRetry', () => {
     ['HTTP-date past the deadline', () => [pinnedDate(120_000)], 120_000, 'stop'],
     ['delay-seconds well within the deadline', () => ['2'], 2_000, 'retry'],
     ['HTTP-date well within the deadline', () => [pinnedDate(3_000)], 3_000, 'retry'],
-    // The discriminating pair: above MAX_BACKOFF_MS, which bounds only a backoff we invented, and
-    // inside the deadline — so the wait must be the server's full figure, not the 5s clamp. This is
-    // the ordinary Slack/Telegram rate limit, and clamping it is what escalates a 429 into a ban.
-    ['delay-seconds above the self-imposed clamp', () => ['10'], 10_000, 'retry'],
-    ['HTTP-date above the self-imposed clamp', () => [pinnedDate(9_000)], 8_000, 'retry'],
+    // The discriminating pair: an order of magnitude above the hintless default and inside the
+    // deadline — so the wait must be the server's full figure. This is the ordinary Slack/Telegram
+    // rate limit, and shortening it is what escalates a 429 into a ban.
+    ['delay-seconds an order of magnitude above the default', () => ['10'], 10_000, 'retry'],
+    ['HTTP-date an order of magnitude above the default', () => [pinnedDate(9_000)], 8_000, 'retry'],
     ['zero', () => ['0'], 0, 'retry'],
     ['empty', () => [''], 0, 'retry'],
     ['unparseable', () => ['abc'], 0, 'retry'],

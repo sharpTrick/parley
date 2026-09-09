@@ -18,12 +18,11 @@
 import {
   asHandle,
   asTopic,
-  FAILURE_SHAPE_NAMES,
-  FAILURE_SHAPES,
   type Message,
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
+import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from '@sharptrick/parley-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { SlackPlugin } from '../src/index.js';

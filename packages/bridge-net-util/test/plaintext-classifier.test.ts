@@ -155,8 +155,27 @@ describe('no consumer re-implements an export of this package', () => {
    * A loopback literal in a decision. Anchored on what the classification is MADE of rather than on
    * what the function is called: `isPlaintextRemote`, `plaintextRemoteServer` and `isLoopbackHost`
    * are three names for one question, and only the third collides with an export here.
+   *
+   * Held as BRANCHES, each with a sample only it matches and a near-miss it must not, because an
+   * alternation is only as good as its weakest arm and nothing asks an arm on its own. The
+   * `\b127\.\d` arm could not see `/^127(\.\d{1,3}){3}$/` — the historical xmpp fork the whole
+   * detector exists for — because `127` is followed by `(`, and every self-test row carried a
+   * quoted `localhost` as well, so the arm was never exercised. A live fork planted in bridge-redis
+   * went undetected with 94 passed.
    */
-  const LOOPBACK_LITERAL = /'localhost'|"localhost"|`localhost`|\b127\.\d|::1/;
+  const LOOPBACK_BRANCHES: Array<[what: string, arm: RegExp, hit: string, miss: string]> = [
+    ['a quoted localhost', /(['"`])localhost\1/, "h === 'localhost'", 'h === localhostish'],
+    ['a dotted 127/8 literal', /\b127\.\d/, "h === '127.0.0.1'", "h === '10.0.0.1'"],
+    [
+      'a 127/8 test whose octets are a pattern',
+      /\b127(?=\s*[([\\])/,
+      '/^127(\\.\\d{1,3}){3}$/.test(h)',
+      'h.length === 1270',
+    ],
+    ['the IPv6 loopback', /::1/, "h === '::1'", "h === '2001:db8::2'"],
+  ];
+
+  const LOOPBACK_LITERAL = new RegExp(LOOPBACK_BRANCHES.map(([, arm]) => arm.source).join('|'));
   const DELEGATES = /\b(?:isLoopbackHost|plaintextRemoteOrigin)\s*\(/;
 
   /** A module-level declaration and the source down to the next one — its body, near enough. */
@@ -290,6 +309,38 @@ describe('no consumer re-implements an export of this package', () => {
       writeFileSync(new URL('./fake-consumer/src/config.ts', root), body);
       return root;
     };
+
+    /**
+     * One row per ALTERNATION BRANCH, each planting a classifier whose only loopback signal is that
+     * branch — so an arm that stops matching fails on its own instead of riding on a sibling.
+     */
+    it.each(LOOPBACK_BRANCHES.map(([what, , hit]) => [what, hit] as const))(
+      'a classifier whose only loopback signal is %s is reported',
+      (_what, hit) => {
+        const body = `export function decides(h: string): boolean {\n  return ${hit};\n}\n`;
+        expect(classifiers(plantConsumer(body), 'nothing-here').length).toBeGreaterThan(0);
+      },
+    );
+
+    it.each(LOOPBACK_BRANCHES.map(([what, , , miss]) => [what, miss] as const))(
+      'a near-miss for %s is not reported',
+      (_what, miss) => {
+        const body = `export function decides(h: string): boolean {\n  return ${miss};\n}\n`;
+        expect(classifiers(plantConsumer(body), 'nothing-here')).toEqual([]);
+      },
+    );
+
+    it.each(LOOPBACK_BRANCHES.map(([what], i) => [what, i] as const))(
+      '%s is the only branch its own sample reaches',
+      (_what, index) => {
+        const hit = (LOOPBACK_BRANCHES[index] as (typeof LOOPBACK_BRANCHES)[number])[2];
+        expect(
+          LOOPBACK_BRANCHES.flatMap(([name, arm]) => (arm.test(hit) ? [name] : [])),
+          'two branches match the same sample, so neither is graded on its own — merge them or ' +
+            'give this one a sample only it reaches',
+        ).toEqual([_what]);
+      },
+    );
 
     it.each([
       [

@@ -1158,3 +1158,63 @@ describe('no tool in this repo names the machine it was written on', () => {
     expect(flag("const joined = join(ROOT, '..', '.careening', 'worktrees')\n")).toEqual([]);
   });
 });
+
+/**
+ * CLASS: a module-resolution table whose entries do not all match the way they are read. Vitest
+ * resolves `@sharptrick/parley-*` to each package's TypeScript SOURCE so no test grades a stale
+ * `dist/`, and a vite STRING alias matches by PREFIX — so an entry left as a string silently
+ * rewrites `<specifier>/anything` under the source path of the specifier itself. Only the bare
+ * package name had become an anchored RegExp; every SUBPATH was still a string, and the escape it
+ * used (`.replace('/', '\\/')`) replaced the first `/` only.
+ *
+ * Graded by DRIVING the config's own builder over vite's matching rule, not by reading the file:
+ * a text check cannot tell an anchored pattern from one that merely looks like one.
+ */
+describe('every workspace alias matches its specifier and nothing under it', () => {
+  const loadAliases = async (): Promise<{ find: string | RegExp; replacement: string }[]> => {
+    const mod = (await import(
+      new URL('../../../vitest.config.ts', import.meta.url).href
+    )) as unknown as { packageAliases: () => { find: string | RegExp; replacement: string }[] };
+    return mod.packageAliases();
+  };
+
+  /** Vite's own rule: a string alias is a PREFIX, a RegExp is a test. */
+  const matches = (find: string | RegExp, id: string): boolean =>
+    typeof find === 'string' ? id.startsWith(find) : find.test(id);
+
+  /** Every specifier the workspace publishes, from the same manifests the config reads. */
+  const specifiers = (): string[] =>
+    manifests().flatMap(({ pkg }) => {
+      const exports = (pkg as { exports?: Record<string, unknown> }).exports ?? {};
+      return Object.keys(exports)
+        .filter((sub) => sub !== './package.json')
+        .map((sub) => (sub === '.' ? (pkg.name as string) : `${pkg.name}${sub.slice(1)}`));
+    });
+
+  it('finds specifiers and aliases, so the rows below are not reading empty sets', async () => {
+    expect(specifiers().length).toBeGreaterThan(5);
+    expect(specifiers()).toContain('@sharptrick/parley-core/testing');
+    expect(await loadAliases()).toHaveLength(specifiers().length);
+  });
+
+  it('resolves each specifier through exactly one alias', async () => {
+    const aliases = await loadAliases();
+    const wrong = specifiers()
+      .map((id) => [id, aliases.filter((a) => matches(a.find, id)).length] as const)
+      .filter(([, n]) => n !== 1);
+    expect(wrong, 'a specifier no alias resolves, or one that two resolve').toEqual([]);
+  });
+
+  it('resolves nothing UNDER a specifier through that specifier’s alias', async () => {
+    const aliases = await loadAliases();
+    const leaked = specifiers()
+      .flatMap((id) => [`${id}/anything`, `${id}-other`, `${id}.js`])
+      .filter((id) => aliases.some((a) => matches(a.find, id)));
+    expect(
+      leaked,
+      'an alias matched a path UNDER its specifier. A vite string alias is a prefix, so the id is ' +
+        "rewritten to the specifier's own source file with the rest appended — a resolution " +
+        'failure whose message names neither the alias nor the file',
+    ).toEqual([]);
+  });
+});

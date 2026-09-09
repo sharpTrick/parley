@@ -4,12 +4,15 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
+import { DEFAULT_DEADLINE_MS, fetchWithRetry } from '@sharptrick/parley-net-util';
 import {
-  DEFAULT_DEADLINE_MS,
-  fetchWithRetry,
-  MAX_BACKOFF_MS,
-} from '@sharptrick/parley-net-util';
-import { importedNames, importingFiles, SELF } from './consumers.js';
+  importedNames,
+  importingFiles,
+  packageDocs,
+  packageSources,
+  type SourceFile,
+  SELF,
+} from './consumers.js';
 import {
   captureWaits,
   loop,
@@ -59,11 +62,18 @@ describe('README', () => {
       return hits[0] as string;
     };
 
+    /**
+     * The knob the README's own sentence claims decides it, resolved to a figure. Held as a table
+     * of candidates rather than as `DEFAULT_DEADLINE_MS`, so that a sentence renaming the governor
+     * fails the lookup instead of silently grading the deadline it no longer names.
+     */
+    const GOVERNORS: Record<string, number> = { deadlineMs: DEFAULT_DEADLINE_MS };
+
     const documentedThreshold = (): number => {
       const s = sentence();
-      const names = ['MAX_BACKOFF_MS', 'deadlineMs'].filter((n) => s.includes(n));
+      const names = Object.keys(GOVERNORS).filter((n) => s.includes(n));
       expect(names).toHaveLength(1); // exactly one constant is claimed to govern
-      return names[0] === 'MAX_BACKOFF_MS' ? MAX_BACKOFF_MS : DEFAULT_DEADLINE_MS;
+      return GOVERNORS[names[0] as string] as number;
     };
 
     it.each([2_000, 6_000, 10_000, 60_000, 120_000])(
@@ -85,9 +95,10 @@ describe('README', () => {
 
   // The mechanism the loop actually runs, against what the docs attribute to it. `fetchWithRetry`
   // has never clamped anything — the only backoff it invents is the fixed `DEFAULT_BACKOFF_MS` —
-  // while the npm description sold a "backoff clamp" as one of its features and the README named
-  // `MAX_BACKOFF_MS` as one of the loop's own bounds. Derived from the source with the clamp helper
-  // cut out, so wiring the clamp into the loop and advertising it again have to happen together.
+  // while the npm description sold a "backoff clamp" as one of its features, the README named
+  // `MAX_BACKOFF_MS` as one of the loop's own bounds, and three backends' READMEs documented the
+  // clamp as their own rate-limit behaviour. The clamp is gone; the names are what the docs may not
+  // reintroduce without the mechanism.
   describe('the docs attribute to the loop only what the loop reaches', () => {
     const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
@@ -95,28 +106,25 @@ describe('README', () => {
     };
     const CLAMP_NAMES = ['clampBackoff', 'MAX_BACKOFF_MS'];
 
-    /** Comments stripped, and the clamp helper — which is a plugin's tool, not the loop's — removed. */
-    const loopCode = (): string => {
-      const bare = src.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
-      const from = bare.indexOf('export function clampBackoff');
-      const to = bare.indexOf('\n}', from);
-      return bare.slice(0, from) + bare.slice(to + 2);
-    };
+    /** Comments stripped, so a name discussed in prose does not read as code. */
+    const loopCode = (): string =>
+      src.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
 
     /** Mentions that are a USE, i.e. everything but the name's own `export` line. */
     const uses = (name: string, text: string): number =>
       [...text.matchAll(new RegExp(`\\b${name}\\b`, 'g'))].length -
       [...text.matchAll(new RegExp(`export (?:const|function) ${name}\\b`, 'g'))].length;
 
-    it('finds the loop and the clamp, so the rows below are not reading an empty string', () => {
+    it('finds the loop, so the rows below are not reading an empty string', () => {
       expect(loopCode()).toContain('export async function fetchWithRetry');
       expect(loopCode().length).toBeGreaterThan(1_000);
       expect(uses('DEFAULT_BACKOFF_MS', loopCode())).toBeGreaterThan(0);
-      expect(src).toContain('export function clampBackoff');
     });
 
-    it.each(CLAMP_NAMES)('the loop does not reach `%s`', (name) => {
+    it.each(CLAMP_NAMES)('the module does not define or reach `%s`', (name) => {
       expect(uses(name, loopCode())).toBe(0);
+      expect(src).not.toContain(`export const ${name}`);
+      expect(src).not.toContain(`export function ${name}`);
     });
 
     // Sold on the npm page, where nobody can check it against the code.
@@ -124,14 +132,8 @@ describe('README', () => {
       expect(pkg.description).not.toContain(claim);
     });
 
-    // Prose is the risk here, so the check is over the BULLET that names it: whichever bullet
-    // mentions the clamp must be the one that says the loop does not apply it.
-    it.each(CLAMP_NAMES)('every README bullet naming `%s` says the loop does not use it', (name) => {
-      const bullets = readme.split(/\n(?=-\s)/).filter((b) => b.includes(name));
-      expect(bullets.length).toBeGreaterThan(0);
-      for (const bullet of bullets) {
-        expect(bullet).toMatch(/never calls it|does not call them|not to anything `fetchWithRetry` does/);
-      }
+    it.each(CLAMP_NAMES)('the README does not name `%s` either', (name) => {
+      expect(readme).not.toContain(name);
     });
   });
 
@@ -231,8 +233,8 @@ describe('every shipped default is graded on the path it governs', () => {
     DEFAULT_MAX_ATTEMPTS: 'maxAttempts',
     DEFAULT_DEADLINE_MS: 'deadlineMs',
     MAX_RESPONSE_BYTES: 'maxBodyBytes',
+    MAX_BODY_WAIT_MS: 'none',
     DEFAULT_BACKOFF_MS: 'none',
-    MAX_BACKOFF_MS: 'none',
     MAX_ERROR_BODY: 'none',
     STOP_POLL_MS: 'none',
   };
@@ -295,9 +297,10 @@ describe('every shipped default is graded on the path it governs', () => {
  */
 describe('every export earns its place', () => {
   const INTENTIONALLY_UNCONSUMED: Record<string, string> = {
-    clampBackoff:
-      'the applier of MAX_BACKOFF_MS, which three backends read and two document by name',
     DEFAULT_MAX_ATTEMPTS: 'the documented default of FetchWithRetryOptions.maxAttempts',
+    MAX_BODY_WAIT_MS:
+      'the ceiling this loop applies to a body-stated wait before adopting it — a figure a ' +
+      'consumer diagnosing an ignored hint has to be able to name, not override',
     MAX_RESPONSE_BYTES: 'the documented default of FetchWithRetryOptions.maxBodyBytes',
     retryAfterFromHeader:
       'the RFC 9110 header parse, both forms — the FLOOR every `bodyRetryAfter` hook is built on ' +
@@ -355,7 +358,56 @@ describe('every export earns its place', () => {
       expect(seen).not.toContain('sanitizeBody');
     });
 
-    it('counts an alias, a type-only import, and a namespace read', () => {
+    /**
+     * The import grammar, EXHAUSTIVELY, each form saying whether the scan covers it. The row this
+     * replaced was titled "counts an alias, a type-only import, and a namespace read" and covered
+     * only the INLINE `{ type X }` — `import type { X } from` and `export { X } from` bind a name
+     * exactly as much and were both missed, so a consumer written either way read as importing
+     * nothing at all.
+     *
+     * A form marked `covered: false` is a stated blind spot, not an oversight: `export *` names
+     * nothing to count, and a computed namespace read is not statically a name. Both make a live
+     * import look dead, which fails toward "delete an export somebody uses" — so they are recorded
+     * here rather than papered over with a looser regex that would start counting spellings.
+     */
+    const NAME = 'statusOf';
+    const IMPORT_GRAMMAR: Array<[form: string, source: string, covered: boolean]> = [
+      ['a named import', `import { ${NAME} } from '${SELF}';\nvoid ${NAME};\n`, true],
+      ['an aliased import', `import { ${NAME} as s } from '${SELF}';\nvoid s;\n`, true],
+      ['an inline type-only specifier', `import { type ${NAME} } from '${SELF}';\n`, true],
+      ['a type-only import statement', `import type { ${NAME} } from '${SELF}';\n`, true],
+      ['a named re-export', `export { ${NAME} } from '${SELF}';\n`, true],
+      ['a type-only re-export', `export type { ${NAME} } from '${SELF}';\n`, true],
+      [
+        'a namespace import read by property',
+        `import * as net from '${SELF}';\nvoid net.${NAME};\n`,
+        true,
+      ],
+      [
+        'a dynamic import read by property',
+        `const net = await import('${SELF}');\nvoid net.${NAME};\n`,
+        true,
+      ],
+      [
+        'a vitest mock reaching the real module',
+        `type NetUtil = typeof import('${SELF}');\n` +
+          'const actual = await importOriginal<NetUtil>();\n' +
+          `void actual.${NAME};\n`,
+        true,
+      ],
+      ['a star re-export', `export * from '${SELF}';\n`, false],
+      [
+        'a computed namespace read',
+        `import * as net from '${SELF}';\nvoid net['${NAME}'];\n`,
+        false,
+      ],
+    ];
+
+    it.each(IMPORT_GRAMMAR)('%s binds a countable name: %s', (_form, source, covered) => {
+      expect(namesImported({ 'consumer/src/shapes.ts': source }).includes(NAME)).toBe(covered);
+    });
+
+    it('counts an alias and a namespace read in the same file, under their real names', () => {
       const seen = namesImported({
         'consumer/src/shapes.ts':
           `import { type FetchWithRetryOptions, HttpStatusError as Boom } from '${SELF}';\n` +
@@ -373,6 +425,65 @@ describe('every export earns its place', () => {
       ).toEqual([]);
     });
   });
+
+  /**
+   * A name kept for nobody is kept on the strength of a REASON, and the reason is only true while
+   * no consumer believes otherwise. `clampBackoff` had zero callers and TWO packages documenting it
+   * as live — a comment in zulip's wire and one in matrix's rate-limit test — while its recorded
+   * reason ("the applier of MAX_BACKOFF_MS, which three backends read and two document by name")
+   * was a true statement about MAX_BACKOFF_MS, which was not the excused entry. Nothing could see
+   * the gap, because the dead-export check reads IMPORTS and prose is not one.
+   *
+   * So: outside this package, every mention of an excused name must be an import, or must say the
+   * name is not reached. Describing one as live is the failure mode, and it is the only one prose
+   * can commit.
+   */
+  const DISCLAIMED =
+    /\b(?:does not|do not|never|no longer|not)\b[^.]{0,140}?\b(?:call|calls|reach|reaches|use|uses|apply|applies|import|imports)\b/i;
+
+  const mentionSources = (): SourceFile[] => [...packageSources(['src', 'test']), ...packageDocs()];
+
+  const unexcusedMentions = (name: string, files: SourceFile[]): string[] => {
+    const out: string[] = [];
+    for (const file of files) {
+      if (!file.text.includes(name) || importedNames(file).has(name)) continue;
+      for (const sentence of file.text.split(/(?<=[.!?])\s+|\n\n/)) {
+        if (sentence.includes(name) && !DISCLAIMED.test(sentence))
+          out.push(`${file.path}: ${sentence.trim().replaceAll(/\s+/g, ' ').slice(0, 140)}`);
+      }
+    }
+    return out;
+  };
+
+  /** The RULER: a mention that describes the name as live, and one that denies it. */
+  it('reads prose about an unconsumed name, so the rows below are not finding nothing', () => {
+    const live: SourceFile = {
+      pkg: 'p',
+      path: 'p/src/wire.ts',
+      text: '// the shared ceiling stays in clampBackoff rather than per backend.\n',
+      code: '',
+    };
+    const denied: SourceFile = {
+      pkg: 'p',
+      path: 'p/src/wire.ts',
+      text: '// the loop does not call clampBackoff.\n',
+      code: '',
+    };
+    expect(unexcusedMentions('clampBackoff', [live])).toHaveLength(1);
+    expect(unexcusedMentions('clampBackoff', [denied])).toEqual([]);
+  });
+
+  it.each(Object.keys(INTENTIONALLY_UNCONSUMED))(
+    'every mention of `%s` outside this package is an import or a stated non-use',
+    (name) => {
+      expect(
+        unexcusedMentions(name, mentionSources()),
+        `a package describes \`${name}\` as something it reaches, and nothing imports it. Either ` +
+          'the mention is wrong, or the name has a consumer and does not belong in ' +
+          'INTENTIONALLY_UNCONSUMED',
+      ).toEqual([]);
+    },
+  );
 
   it.each(Object.keys(api).sort())('`%s` is imported somewhere, or kept on purpose', (name) => {
     const importers = consumers(name);

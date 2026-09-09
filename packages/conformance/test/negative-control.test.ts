@@ -16,6 +16,7 @@ import { promisify } from 'node:util';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { asTopic, buildMessage } from '@sharptrick/parley-core';
 import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
+import { FAILURE_SHAPE_NAMES } from '@sharptrick/parley-core/testing';
 import {
   ASSERTED_PROPERTIES,
   BURST_POSTS_MAX,
@@ -49,7 +50,7 @@ import {
   BROKEN_VARIANTS,
   LATE_DELIVERY_MS,
   LIVE_DEATHS,
-  MAX_BLAST_RADIUS,
+  MAX_BLAST_FRACTION,
   ReferencePlugin,
   REORDER_ABOVE,
   SUBSCRIPTION_CAP,
@@ -628,6 +629,14 @@ describe('the suite rejects a non-conformant plugin', () => {
 
   const suiteCases = (): number => rowsOf(BROKEN_VARIANTS[0]!.name).length;
 
+  /**
+   * The ceiling, as the fraction of the suite it always was. Held as a literal it took a manual
+   * raise every time a shared clause grew its own rows, and the last raise still refused the
+   * control the `never settles` arm needed — 21 rows against a ceiling of 18, while the clause it
+   * bounds was 21 of 57 cases. Derived, a clause that grows moves the ceiling with it.
+   */
+  const maxBlastRadius = (): number => Math.ceil(suiteCases() * MAX_BLAST_FRACTION);
+
   it('every variant ran the same whole suite, so a failure count is a fraction of something known', () => {
     const collected = BROKEN_VARIANTS.map((v) => [v.name, rowsOf(v.name).length] as const);
     expect(
@@ -636,9 +645,53 @@ describe('the suite rejects a non-conformant plugin', () => {
         'fails cannot be compared against one that ran a different suite',
     ).toEqual([]);
     expect(suiteCases()).toBeGreaterThanOrEqual(MIN_SUITE_CASES);
-    // The ceiling below is only a bound if it is well under the whole suite: a figure at or past
-    // the case count would admit a plugin that fails everything as a control for each case in turn.
-    expect(MAX_BLAST_RADIUS * 2).toBeLessThanOrEqual(suiteCases());
+    // The ceiling is only a bound if it is well under the whole suite: a fraction at or past 1
+    // would admit a plugin that fails everything as a control for each case in turn.
+    expect(MAX_BLAST_FRACTION).toBeLessThanOrEqual(1 / 2);
+    expect(maxBlastRadius() * 2).toBeLessThanOrEqual(suiteCases());
+  });
+
+  /**
+   * A parameterised clause is one `it.each` with a control calibrated against it, so a control that
+   * fails MOST of its rows reads as coverage for ALL of them — the arm no variant touches is
+   * invisible in every check above, which count rows without asking WHICH. Measured over the child
+   * run at d4beaee: every shape of the handler-fault clause was n=237 failed=6 and `never settles`
+   * was n=237 failed=0. The stalling arm — the one the clause's own doc calls "AWAITING the
+   * handler, the obvious containment" — could have been deleted with this file green.
+   *
+   * Derived from the shared fault table, so a shape added there arrives needing a control rather
+   * than inheriting one.
+   */
+  const FAULT_MARK = 'survives a handler that ';
+
+  const faultTitle = (row: Row): string | undefined => {
+    const at = row.fullName.indexOf(FAULT_MARK);
+    return at < 0 ? undefined : row.fullName.slice(at);
+  };
+
+  const shapeOf = (row: Row): string | undefined => {
+    const title = faultTitle(row);
+    if (title === undefined) return undefined;
+    const rest = title.slice(FAULT_MARK.length);
+    return [...FAILURE_SHAPE_NAMES]
+      .filter((shape) => rest.startsWith(`${shape} `))
+      .sort((a, b) => b.length - a.length)[0];
+  };
+
+  it.each(FAILURE_SHAPE_NAMES)('some variant fails every handler-fault row for "%s"', (shape) => {
+    const rows = results().filter((row) => shapeOf(row) === shape);
+    expect(
+      rows.length,
+      `no report row drives the "${shape}" arm of the shared fault table — the clause is not ` +
+        'asking every backend for it',
+    ).toBeGreaterThan(0);
+    const titles = [...new Set(rows.map((row) => faultTitle(row) as string))];
+    expect(
+      titles.filter((title) => !rows.some((r) => r.status === 'failed' && faultTitle(r) === title)),
+      `no broken plugin fails these rows, so the "${shape}" arm of the clause is asserted by ` +
+        'nothing. Every other arm has a control; an arm without one can be deleted with this ' +
+        'whole file green',
+    ).toEqual([]);
   });
 
   /**
@@ -651,10 +704,11 @@ describe('the suite rejects a non-conformant plugin', () => {
     (name, radius) => {
       expect(
         radius,
-        `"${name}" is declared to fail ${radius} of ${suiteCases()} cases — a control that breaks ` +
-          `more than half the suite demonstrates nothing about the one case it names. Narrow the ` +
-          `mutation until it is aimed at that case`,
-      ).toBeLessThanOrEqual(MAX_BLAST_RADIUS);
+        `"${name}" is declared to fail ${radius} of ${suiteCases()} cases, past the ceiling of ` +
+          `${maxBlastRadius()} — a control that breaks more than its share of the suite ` +
+          `demonstrates nothing about the one case it names. Narrow the mutation until it is ` +
+          `aimed at that case`,
+      ).toBeLessThanOrEqual(maxBlastRadius());
     },
   );
 

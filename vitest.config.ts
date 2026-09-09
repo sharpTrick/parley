@@ -11,13 +11,17 @@ const fromHere = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 /**
  * Derive this from each package's own `exports` map rather than hand-listing it, so that a package
  * or a SUBPATH missing from the table cannot resolve through the workspace symlink and have its
- * tests grade a stale `dist/` build. A vite string alias matches by PREFIX, so `<pkg>/testing` would
- * otherwise be rewritten to `<pkg>/src/index.ts/testing` — longest key first, and exact-match on the
- * bare package name, is what keeps the two apart.
+ * tests grade a stale `dist/` build.
+ *
+ * EVERY entry is an anchored RegExp over the fully-escaped specifier. A vite STRING alias matches by
+ * PREFIX, so `<pkg>/testing` left as a string rewrites `<pkg>/testing/anything` to
+ * `<pkg>/src/testing/index.ts/anything` — a resolution failure with no message that names the
+ * alias. Escaping every regex metacharacter matters for the same reason: a package name carries a
+ * `/` and a `-`, and escaping only the first `/` leaves the rest of the pattern unanchored.
  */
-function packageAliases(): { find: string | RegExp; replacement: string }[] {
+export function packageAliases(): { find: RegExp; replacement: string }[] {
   const root = new URL('./packages/', import.meta.url);
-  const out: { find: string | RegExp; replacement: string }[] = [];
+  const out: { find: RegExp; replacement: string }[] = [];
   for (const dir of readdirSync(root)) {
     const manifest = new URL(`${dir}/package.json`, root);
     const { name, exports } = JSON.parse(readFileSync(manifest, 'utf8')) as {
@@ -29,13 +33,14 @@ function packageAliases(): { find: string | RegExp; replacement: string }[] {
       const dist = typeof target === 'string' ? target : target.default;
       if (dist === undefined) continue;
       const src = dist.replace(/^\.\/dist\//, './src/').replace(/\.js$/, '.ts');
+      const specifier = subpath === '.' ? name : `${name}${subpath.slice(1)}`;
       out.push({
-        find: subpath === '.' ? new RegExp(`^${name.replace('/', '\\/')}$`) : `${name}${subpath.slice(1)}`,
+        find: new RegExp(`^${specifier.replaceAll(/[.*+?^${}()|[\]\\/-]/g, '\\$&')}$`),
         replacement: fromHere(`./packages/${dir}/${src.slice(2)}`),
       });
     }
   }
-  return out.sort((a, b) => String(b.find).length - String(a.find).length);
+  return out;
 }
 
 export default defineConfig({

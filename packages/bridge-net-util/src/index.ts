@@ -24,8 +24,15 @@ export { delay, STOP_POLL_MS } from './timing.js';
 
 /** Wait applied when a 429 carries no usable hint. */
 export const DEFAULT_BACKOFF_MS = 500;
-/** Ceiling on a backoff we invented ourselves. A server-stated hint is honoured past it. */
-export const MAX_BACKOFF_MS = 5_000;
+/**
+ * Ceiling past which a wait read out of a 429's BODY stops being a wait and becomes a unit error.
+ * The body field and its unit are a per-backend GUESS in this repo — four vendors state the same
+ * thing in four field names and two units — so a hint above this is dropped, exactly as an
+ * unparseable body is, rather than adopted. Keep it, so that one server-controlled JSON number
+ * cannot exceed the deadline and REFUSE every call through the shared loop; the RFC-defined
+ * `Retry-After` header is not bounded by it and still governs alone.
+ */
+export const MAX_BODY_WAIT_MS = 3_600_000;
 /** Attempts a single call will make before giving up. */
 export const DEFAULT_MAX_ATTEMPTS = 8;
 /** Wall-clock ceiling on a single call, kept under `catchup.block_max_ms` (DESIGN §11). */
@@ -36,20 +43,6 @@ export const DEFAULT_DEADLINE_MS = 30_000;
  */
 export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
-/**
- * Normalize a backoff a PLUGIN chose itself (a reconnect ladder, a poll interval) into
- * `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`. `Number(null)` and `Number('')` are both `0`, so an
- * unchecked parse reads as "retry now"; the floor turns that — and every other figure under it —
- * into a wait, so a ladder built on a misparsed hint cannot hot-spin.
- *
- * It does NOT bound a wait the server asked for, and {@link fetchWithRetry} deliberately does not
- * put it on a stated hint: see there.
- */
-export function clampBackoff(ms: number | undefined): number {
-  if (ms === undefined || !Number.isFinite(ms)) return DEFAULT_BACKOFF_MS;
-  return Math.min(Math.max(ms, DEFAULT_BACKOFF_MS), MAX_BACKOFF_MS);
-}
-
 export interface FetchWithRetryOptions {
   /** Error-message prefix, e.g. `Slack chat.postMessage` or `Matrix GET /sync`. */
   label: string;
@@ -57,13 +50,14 @@ export interface FetchWithRetryOptions {
   isStopped: () => boolean;
   /**
    * Per-backend `Retry-After` extraction → milliseconds, or undefined when the response carries no
-   * usable hint. Only the body field differs between APIs; the header, the clamp and the default
-   * are handled here. Receives the 429 `Response` (clone it before reading the body) — a body the
-   * caller never sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
+   * usable hint. Only the body field differs between APIs; the header and the default are handled
+   * here. Receives the 429 `Response` (clone it before reading the body) — a body the caller never
+   * sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
    *
    * A source of an ADDITIONAL hint, never a ceiling: the standard `Retry-After` header is a FLOOR
    * this cannot lower. Do not clamp what you return here, so that a parser bug cannot retry sooner
-   * than the vendor asked — that is what escalates a rate limit into a ban.
+   * than the vendor asked — that is what escalates a rate limit into a ban. A figure past
+   * {@link MAX_BODY_WAIT_MS} is dropped by the loop rather than honoured.
    */
   retryAfterOf?: (res: Response) => Promise<number | undefined> | number | undefined;
   /** Non-2xx statuses the caller treats as expected (returned, not thrown). Default: none. */
@@ -110,14 +104,23 @@ async function callerHint(
 }
 
 /**
+ * A wait the caller's parser read out of a body, or undefined when it is too long to be one. See
+ * {@link MAX_BODY_WAIT_MS}.
+ */
+const credibleBodyHint = (ms: number | undefined): number | undefined =>
+  ms !== undefined && ms <= MAX_BODY_WAIT_MS ? ms : undefined;
+
+/**
  * Shared HTTP-with-429-retry loop. Builds nothing itself — the caller passes a fully-formed `init`
  * (auth headers + encoded body + optional `signal`). Retries 429 within a bounded attempt and
  * wall-clock budget, abandons a backoff within {@link STOP_POLL_MS} of `isStopped()` turning true,
  * returns the `Response` on ok / allowStatuses, else throws `<label> → <status>: <body>`. A server
- * asking for a longer wait than this call's deadline ends the call rather than being retried sooner
- * than it asked. The returned `Response` is already buffered — bounded by `maxBodyBytes` — so
- * reading it cannot fail on the deadline. Backend response *shapes* (Slack's `ok:false`, XMPP IQ)
- * are NOT unified here — interpret those in the caller.
+ * asking for a longer wait than this call's deadline IN THE HEADER ends the call rather than being
+ * retried sooner than it asked; a body hint past {@link MAX_BODY_WAIT_MS} is dropped instead, so
+ * that the call's fate rests on the RFC-defined field and not on one vendor-specific JSON number.
+ * The returned `Response` is already buffered — bounded by `maxBodyBytes` — so reading it cannot
+ * fail on the deadline. Backend response *shapes* (Slack's `ok:false`, XMPP IQ) are NOT unified
+ * here — interpret those in the caller.
  */
 export async function fetchWithRetry(
   url: string,
@@ -186,9 +189,9 @@ export async function fetchWithRetry(
 
     // Honour a server-stated wait IN FULL, so that we never retry sooner than the vendor asked —
     // that is what escalates a rate limit into a ban. The header is a FLOOR the caller's parser
-    // cannot lower, and an unreasonable hint is refused by the deadline below, not shortened.
+    // cannot lower, and a header past this call's deadline is refused below, not shortened.
     const header = usableHint(retryAfterFromHeader(res));
-    const parsed = usableHint(await callerHint(opts.retryAfterOf, res));
+    const parsed = credibleBodyHint(usableHint(await callerHint(opts.retryAfterOf, res)));
     const hinted = header === undefined ? parsed : Math.max(header, parsed ?? 0);
     const stated = hinted !== undefined;
     const wait = hinted ?? DEFAULT_BACKOFF_MS;

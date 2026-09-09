@@ -158,10 +158,11 @@ export function eventToMessage(topic: Topic, e: MessageEvent): Message {
 }
 
 /**
- * Matrix 429s carry `retry_after_ms` (MS) in the JSON body; Synapse ALSO sends the standard
- * `Retry-After` header (both RFC 9110 forms). Prefer the header, then the body. Returned UNCLAMPED
- * and `undefined` when there is no usable hint, so that we never retry sooner than the homeserver
- * asked — that is what escalates a rate limit into a ban — and the ceiling stays in net-util.
+ * Matrix 429s carry `retry_after_ms` in the JSON body, in MILLISECONDS — the field name and the
+ * unit are the whole of what is Matrix-specific here. Synapse ALSO sends the standard `Retry-After`
+ * header, and how the two combine is net-util's rule, graded there: the header is a FLOOR, not the
+ * answer, and neither is shortened. `undefined` when there is no usable hint, so the shared default
+ * applies rather than a wait re-tuned here.
  */
 export const readRetryAfter = bodyRetryAfter<{ retry_after_ms?: number }>(
   (b) => b.retry_after_ms,

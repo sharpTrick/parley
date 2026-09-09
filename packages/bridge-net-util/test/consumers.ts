@@ -56,6 +56,22 @@ export function packageSources(
   return out;
 }
 
+/** Every package's README, as a source file, so a claim in prose is scanned with the code. */
+export function packageDocs(root: URL = PACKAGES, selfDir: string = SELF_DIR): SourceFile[] {
+  const out: SourceFile[] = [];
+  for (const pkg of readdirSync(root)) {
+    if (pkg === selfDir) continue;
+    const path = `${pkg}/README.md`;
+    try {
+      const text = readFileSync(new URL(path, root), 'utf8');
+      out.push({ pkg, path, text, code: text });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
 /**
  * Whether a file loads this package as a MODULE — `from '…'`, `import('…')`, `vi.mock('…')` — rather
  * than merely spelling its name. Keep the module position required, so that a package listing this
@@ -91,12 +107,19 @@ export function importingFiles(root: URL = PACKAGES, selfDir: string = SELF_DIR)
  * sites, so appending `export const label = 1;` here — imported by nothing — passed the dead-export
  * guard, and the whole surface count it produced was wrong. Resolved from the import SPECIFIER, so
  * a name counts only where it was actually bound.
+ *
+ * BOTH binding keywords, and the type-only spelling of each. `import\s*\{` alone missed
+ * `import type { X } from` and `export { X } from` entirely — a consumer written either way read
+ * as importing nothing, which makes a live export look dead in one direction and a fork look
+ * unrecorded in the other. What is deliberately NOT covered is stated as rows in this package's
+ * own grammar table.
  */
 export function importedNames(file: SourceFile): Set<string> {
   const out = new Set<string>();
   const FROM = `['"]${SELF}['"]`;
-  for (const m of file.code.matchAll(new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*${FROM}`, 'g'))) {
-    for (const entry of (m[1] ?? '').split(',')) {
+  const CLAUSE = `(?:import|export)\\s+type\\s*\\{([^}]*)\\}|(?:import|export)\\s*\\{([^}]*)\\}`;
+  for (const m of file.code.matchAll(new RegExp(`(?:${CLAUSE})\\s*from\\s*${FROM}`, 'g'))) {
+    for (const entry of (m[1] ?? m[2] ?? '').split(',')) {
       const name = entry.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]?.trim();
       if (name !== undefined && name !== '') out.add(name);
     }

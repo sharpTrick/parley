@@ -129,19 +129,3 @@ export {
   type RemoteAuthOptions,
   type RemoteAuthServer,
 } from './auth/remote-auth.js';
-
-// A fake OIDC issuer, for wiring an external-IdP deployment up in a test without one. It ships in
-// the tarball either way (`src/testing` is compiled, only `*.test.ts` is excluded); named here so
-// that reaching it does not mean a relative path into this package's `src/`, which pins a consumer
-// to core's internal layout.
-export { startFakeOidc, type FakeOidc, type FakeOidcClaims } from './testing/fake-oidc.js';
-
-// Every SHAPE a fire-and-forget seam call's failure can arrive in. Published for the same reason as
-// the fake issuer above: the conformance suite runs OUT of this repo against a backend nobody here
-// wrote, and its handler-fault clause has to grade the same table core grades itself against — one
-// row added here reaches every backend rather than each one restating a list that drifts.
-export {
-  FAILURE_SHAPE_NAMES,
-  FAILURE_SHAPES,
-  type FailureShape,
-} from './testing/failure-shapes.js';

@@ -110,14 +110,16 @@ export const usableHint = (ms: number | undefined): number | undefined =>
   ms !== undefined && Number.isFinite(ms) && ms > 0 ? ms : undefined;
 
 /**
- * A 429's BODY hint, alongside the standard header. Four vendors state the same thing in four
- * places (`retry_after`, `retry_after_ms`, `retry-after`, `parameters.retry_after`) and in two
- * units, and only that differs: the LONGER of the two wins, a body a parser cannot read means "no
- * usable hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED so
- * that nothing here retries sooner than the vendor asked — which is what escalates a rate limit
- * into a ban. Reading the header as the ANSWER rather than as a floor is the same defect in the
- * other direction: a CDN stamping `Retry-After: 1` in front of a vendor asking 60s retries 59s
- * early.
+ * A 429's BODY hint. Four vendors state the same thing in four places (`retry_after`,
+ * `retry_after_ms`, `retry-after`, `parameters.retry_after`) and in two units, and ONLY that
+ * differs — which is all this builds. The standard header is read by `fetchWithRetry`, which takes
+ * the longer of the two, so reading it here as well was a second computation of a figure the loop
+ * recomputes and no caller can observe.
+ *
+ * A body a parser cannot read means "no usable hint" rather than an error out of the retry loop,
+ * and the figure reported is the one the vendor stated: nothing here shortens it, because retrying
+ * sooner than asked is what escalates a rate limit into a ban. A body long enough to end the call
+ * is refused by `fetchWithRetry`'s own ceiling, not shortened here.
  *
  * `hintOf` reads the parsed body; anything it returns that is not a positive number is no hint.
  * `unitMs` scales it — 1000 for a vendor stating seconds, the default 1 for milliseconds.
@@ -127,14 +129,12 @@ export function bodyRetryAfter<T>(
   unitMs = 1,
 ): (res: Response) => Promise<number | undefined> {
   return async (res: Response): Promise<number | undefined> => {
-    const header = retryAfterFromHeader(res);
-    let body: number | undefined;
     try {
       const stated = hintOf((await res.clone().json()) as T);
-      if (typeof stated === 'number' && stated > 0) body = stated * unitMs;
+      if (typeof stated === 'number' && stated > 0) return stated * unitMs;
     } catch {
       /* no usable body hint */
     }
-    return header === undefined ? body : Math.max(header, body ?? 0);
+    return undefined;
   };
 }

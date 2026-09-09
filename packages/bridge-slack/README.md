@@ -86,11 +86,11 @@ reactive-only deployment with `live_push.enabled: false` is guarded too), naming
 Folding them would silently drop one topic's subscription and deliver that channel's traffic under
 the other topic's name.
 
-**Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured **in full**:
-only a backoff the bridge invents for itself is clamped, at `MAX_BACKOFF_MS` = 5 s. A stated hint
-that would not fit the call's `DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure
-rather than retrying sooner than Slack asked; a 429 with no usable hint waits
-`DEFAULT_BACKOFF_MS` = 500 ms. All three constants live in `@sharptrick/parley-net-util`.
+**Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured **in full**,
+however long — nothing clamps a stated wait. A stated hint that would not fit the call's
+`DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure rather than retrying sooner
+than Slack asked; a 429 with no usable hint waits `DEFAULT_BACKOFF_MS` = 500 ms. Both constants
+live in `@sharptrick/parley-net-util`.
 `apps.connections.open` is dialled on a capped ladder that starts at `DIAL_BACKOFF_MS` = 500 ms and
 doubles to `MAX_DIAL_BACKOFF_MS` = 5 s, so an unavailable Socket Mode cannot be redialled at its own
 round-trip rate against Slack's tightest-limit endpoint.
