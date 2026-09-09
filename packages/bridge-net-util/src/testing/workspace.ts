@@ -92,7 +92,11 @@ export function filesUnder(
   out: string[] = [],
 ): string[] {
   if (!existsSync(dir)) return out;
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  // Sorted, so that a table derived from this walk registers its rows in the same order on every
+  // machine: readdirSync answers in filesystem order, and a report that is not reproducible cannot
+  // be diffed between a developer's box and CI.
+  const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (!NEVER_WALKED.has(entry.name)) filesUnder(full, extensions, out);
