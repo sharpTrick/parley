@@ -1,11 +1,5 @@
-import {
-  asHandle,
-  FAILURE_SHAPE_NAMES,
-  FAILURE_SHAPES,
-  type Handle,
-  type Message,
-  parseMentions,
-} from '@sharptrick/parley-core';
+import { asHandle, type Handle, type Message, parseMentions } from '@sharptrick/parley-core';
+import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from '@sharptrick/parley-core/testing';
 import { expect, it, vi } from 'vitest';
 import { drainAll, expectWellFormedMessage } from '../assertions.js';
 import type { ConformanceContext } from '../factory.js';

@@ -3,7 +3,7 @@ import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { startFakeOidc, type FakeOidc } from '@sharptrick/parley-core';
+import { startFakeOidc, type FakeOidc } from '@sharptrick/parley-core/testing';
 import { startRemoteServer, type RemoteServerHandle } from '../server.js';
 
 function freePort(): Promise<number> {

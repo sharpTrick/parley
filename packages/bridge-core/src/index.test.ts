@@ -45,8 +45,7 @@ describe('public barrel surface', () => {
     'BlockingFetchOptions', 'BlockingFetchUnsupportedError', 'BuildMessageInput',
     'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
     'CatchUpArgs', 'ConfigSchema', 'ConsentError', 'Cursor', 'DEFAULT_HASH_LEN',
-    'FAILURE_SHAPES', 'FAILURE_SHAPE_NAMES', 'FailureShape', 'FakeOidc',
-    'FakeOidcClaims', 'FetchAbortedError', 'FetchRecentArgs', 'FetchRecentResult', 'Handle',
+    'FetchAbortedError', 'FetchRecentArgs', 'FetchRecentResult', 'Handle',
     'MAX_BLOCK_MS', 'MAX_HASH_LEN', 'MAX_MATCH_INPUT', 'MAX_TIMER_MS', 'MIN_HASH_LEN', 'Message',
     'MessageHandler', 'NoSuchTopicError', 'OAuthRemoteOptions', 'OAuthRemoteServer',
     'OidcAuthConfig', 'OidcAuthSchema', 'OidcRemoteOptions', 'OidcRemoteServer',
@@ -64,7 +63,7 @@ describe('public barrel surface', () => {
     'isBlockingFetchUnsupportedError', 'isFetchAbortedError', 'isNoSuchTopicError', 'isPlainObject', 'loadConfig', 'makeOwnerVerifier', 'ownerVerifierFromPassphrase',
     'parseArgs', 'parseConfig', 'parseMentions', 'registerTools', 'runBackendCli', 'safeDeliver',
     'safeName',
-    'startFakeOidc', 'startPushLoop', 'toolDepsFor', 'usageFor',
+    'startPushLoop', 'toolDepsFor', 'usageFor',
   ] as const;
 
   it.each(trimmed)('still defines the trimmed internal %s somewhere in src', (name) => {
@@ -89,6 +88,56 @@ describe('public barrel surface', () => {
 
   it('publishes exactly this surface, and nothing more', () => {
     expect(published()).toEqual([...SURFACE]);
+  });
+
+  /**
+   * `src/testing/` is fixtures a CONSUMER's tests need, and every one of them on the barrel is a
+   * production semver commitment for test code. `FailureShape` is the worked example: a union this
+   * repo widened twice in one chunk, which a consumer writing `Record<FailureShape, X>` — as this
+   * repo itself does — breaks on, under a release process where a merge to `main` publishes and
+   * `feat:` is a minor. They ship from the `./testing` subpath instead.
+   *
+   * Derived from the DIRECTORY rather than from a list of names the pin above would accept as long
+   * as somebody updated it: a fixture added to `src/testing/` and re-exported here fails this
+   * without anyone remembering the rule.
+   */
+  const TESTING = new URL('./testing/', import.meta.url);
+
+  const testingExports = (): string[] => {
+    const names = new Set<string>();
+    for (const file of readdirSync(fileURLToPath(TESTING), { recursive: true }).map(String)) {
+      if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue;
+      const parsed = ts.createSourceFile(
+        file,
+        readFileSync(fileURLToPath(new URL(file, TESTING)), 'utf8'),
+        ts.ScriptTarget.ESNext,
+        true,
+      );
+      for (const st of parsed.statements) {
+        if ((ts.getCombinedModifierFlags(st as unknown as ts.Declaration) & ts.ModifierFlags.Export) !== 0) {
+          if (ts.isVariableStatement(st))
+            for (const d of st.declarationList.declarations) names.add(d.name.getText(parsed));
+          else if ('name' in st && st.name !== undefined) names.add(String((st.name as ts.Identifier).text));
+        }
+        if (ts.isExportDeclaration(st) && st.exportClause !== undefined && ts.isNamedExports(st.exportClause))
+          for (const e of st.exportClause.elements) names.add(e.name.text);
+      }
+    }
+    return [...names];
+  };
+
+  it('finds the fixtures, so the row below is not comparing against an empty set', () => {
+    expect(testingExports()).toContain('FAILURE_SHAPES');
+    expect(testingExports()).toContain('startFakeOidc');
+  });
+
+  it('publishes no fixture from src/testing on the production barrel', () => {
+    expect(
+      testingExports().filter((name) => published().includes(name)),
+      'a `src/testing/` fixture reached the production entry point. It is a semver commitment ' +
+        'made to every consumer for something only test code imports — publish it from ' +
+        '`@sharptrick/parley-core/testing` instead',
+    ).toEqual([]);
   });
 
   // The scan above reads export CLAUSES, so a star re-export widens the surface past everything it
@@ -169,11 +218,6 @@ describe('public barrel surface', () => {
     BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
     ConsentError: ['constructor', 'name'],
-    FakeOidc: ['close', 'issuer', 'jwksUri', 'mint'],
-    FakeOidcClaims: [
-      'aud', 'azp', 'expiresInS', 'issuerOverride', 'notBeforeInS', 'omit', 'preferred_username',
-      'realm_access', 'scope', 'signWithRogueKey', 'sub',
-    ],
     BlockingFetchUnsupportedError: ['constructor', 'name'],
     FetchAbortedError: ['constructor', 'name'],
     FetchRecentArgs: ['blockMs', 'limit', 'since', 'topic'],
