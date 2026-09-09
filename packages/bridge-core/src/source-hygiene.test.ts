@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
@@ -18,6 +19,22 @@ const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 const SOURCE = ['.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml'];
 
 const sourceFiles = (dir: string): string[] => filesUnder(dir, SOURCE);
+
+/**
+ * A SECOND count of a universe, taken a different way: what git has under these prefixes. A floor
+ * only ever proves a table is non-empty — the walks below carry floors of 50, 100 and 200 against
+ * real universes of 324, 568 and 547, so most of each could evaporate on its shipped floor with its
+ * shipped witnesses intact. The walk is a superset of what git tracks (an untracked file is walked
+ * and not counted), so a table that reads FEWER rows than this has stopped reaching tracked ground.
+ */
+const trackedFiles = (
+  areas: ReadonlyArray<readonly [prefix: string, extensions: readonly string[]]>,
+): number =>
+  execFileSync('git', ['-C', REPO, 'ls-files'], { encoding: 'utf8' })
+    .split('\n')
+    .filter((file) => areas.some(([prefix, exts]) => file.startsWith(prefix) && exts.some((e) => file.endsWith(e))))
+    .filter((file) => !file.endsWith('source-hygiene.test.ts'))
+    .length;
 
 /**
  * A raw control byte in a source file makes it `data` to file(1) and makes ripgrep refuse to print
@@ -491,6 +508,13 @@ describe('no file in this repo names the machine it was written on', () => {
     {
       floor: 100,
       witness: ['packages/bridge-core/src', 'packages/conformance/src', 'scripts/', '.claude/'],
+      size: () =>
+        trackedFiles([
+          ['packages/', ['.ts', '.js', '.mjs', '.cjs']],
+          ['examples/', ['.ts', '.js', '.mjs', '.cjs']],
+          ['scripts/', ['.ts', '.js', '.mjs', '.cjs', '.sh', '.yml', '.yaml']],
+          ['.claude/', ['.ts', '.js', '.mjs', '.cjs', '.sh', '.yml', '.yaml']],
+        ]),
     },
   );
 
@@ -777,6 +801,7 @@ describe('no assertion reads the machine it is being graded on', () => {
         'packages/bridge-core/src/source-hygiene.test.ts',
         'packages/conformance/test/negative-control.test.ts',
       ],
+      size: () => trackedFiles([['packages/', ['.test.ts']]]),
     },
   );
 
@@ -789,6 +814,63 @@ describe('no assertion reads the machine it is being graded on', () => {
         'host and fails on another — compare against a declared constant instead',
     ).toEqual([]);
     if (kept) expect(found, `${name} is registered as a keep but no longer reads the host`).not.toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a witness derived from the thing it witnesses. `witness: [...FAILURE_SHAPE_NAMES]` over
+ * `produce: () => [...FAILURE_SHAPE_NAMES]` is satisfied by construction — the two sides narrow
+ * together, so the half of a derivation that catches a narrowing is switched off while reading as
+ * present. A witness has to be a member NAMED BY HAND: that is the only spelling a scan cannot
+ * agree with by accident.
+ */
+describe('a derived table names its witnesses instead of deriving them', () => {
+  const derivedWitnesses = (source: string): string[] => {
+    const code = codeOf(source);
+    const out: string[] = [];
+    for (const spread of code.matchAll(/witness:\s*\[\s*\.\.\.([A-Za-z_$][\w$]*)/g))
+      out.push(`witness: [...${spread[1]!}]`);
+    for (const collection of code.matchAll(/witness:\s*([A-Z][A-Z0-9_]*)\b/g))
+      out.push(`witness: ${collection[1]!}`);
+    return out;
+  };
+
+  it.each([
+    ['a spread of the table it grades', 'witness: [...FAILURE_SHAPE_NAMES],', ['witness: [...FAILURE_SHAPE_NAMES]']],
+    ['a spread with a cast after it', 'witness: [...NAMES] as unknown as [string, ...string[]],', ['witness: [...NAMES]']],
+    ['the collection itself', 'witness: NAMES,', ['witness: NAMES']],
+    ['names written out', "witness: ['index.ts', 'archive.ts'],", []],
+    ['a name held in a constant', "witness: [BARREL, 'failure-shapes.ts'],", []],
+    ['the field\'s own type', 'witness: readonly [string, ...string[]];', []],
+    ['a row\'s witness column, handed to the ruler under test', 'witness: witness as [string, ...string[]],', []],
+    ['a rest parameter, which is not a witness', 'const f = (...args: string[]) => args;', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(derivedWitnesses(source)).toEqual(found);
+  });
+
+  const witnessed = derivedRows(
+    'every source and test file in the repo',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(p.dir, ['.ts']))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 200,
+      witness: [
+        'packages/bridge-net-util/test/derived-rows.test.ts',
+        'packages/conformance/test/suite-shape.test.ts',
+      ],
+      size: () => trackedFiles([['packages/', ['.ts']]]),
+    },
+  );
+
+  it.each(witnessed)('%s', (_name, file) => {
+    expect(
+      derivedWitnesses(readFileSync(file, 'utf8')),
+      'this witness is derived from the same expression as the rows, so it narrows with them and ' +
+        'proves nothing — name the members the scan must reach',
+    ).toEqual([]);
   });
 });
 
@@ -998,6 +1080,7 @@ describe('no it.each table can register nothing', () => {
         'packages/bridge-redis/test/test-hygiene.test.ts',
         'packages/bridge-telegram/test/docs.test.ts',
       ],
+      size: () => trackedFiles([['packages/', ['.ts']]]),
     },
   );
 
