@@ -26,6 +26,10 @@ const groupOf = (file, assertion) => [file.name, ...(assertion.ancestorTitles ??
  * Every group of the run in which NOTHING ran, as reportable lines. Keyed off the report's own
  * shape rather than a list of the gates the repo uses today, so a new way to skip is graded the day
  * it lands.
+ *
+ * A group that registered ZERO cases has no key here to report — `it.each([])` produces no
+ * assertion result to iterate — so the file-level check in {@link main} carries that half, and
+ * `derivedRows` carries it within a file that still holds other cases.
  */
 function removedCoverage(report) {
   const groups = new Map();
@@ -53,6 +57,14 @@ function main(argv) {
   const files = report.testResults ?? [];
   if (files.length === 0) {
     process.stderr.write(`${path} reports no test files at all — the suite did not run\n`);
+    return 1;
+  }
+  const silent = files.filter((f) => (f.assertionResults ?? []).length === 0);
+  if (silent.length > 0) {
+    process.stderr.write(
+      'these files registered no case at all — a table derived from the tree came back empty:\n',
+    );
+    for (const file of silent) process.stderr.write(`  ${file.name}\n`);
     return 1;
   }
   const dead = removedCoverage(report);

@@ -14,6 +14,12 @@ export {
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
 export {
+  type Derivation,
+  derivationFaults,
+  derivedRows,
+  rowText,
+} from './derived-rows.js';
+export {
   expectLabelledRefusal,
   type RefusalSpec,
   type UngradedKey,
