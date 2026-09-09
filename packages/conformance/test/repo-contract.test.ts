@@ -1,5 +1,6 @@
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -10,7 +11,15 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { promisify } from 'node:util';
+import {
+  derivedRows,
+  filesUnder,
+  workspaceAreas,
+  workspacePackages,
+  workspaceRoot,
+} from '@sharptrick/parley-net-util/testing';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 const packagesDir = new URL('../../', import.meta.url);
 
@@ -27,19 +36,15 @@ interface Manifest {
   peerDependencies?: Record<string, string>;
 }
 
+/**
+ * Derived through the shared walker rather than a `readdirSync` of `packages/` wrapped in a
+ * `try/catch`: that catch silently dropped any package whose manifest would not parse — the exact
+ * hole the AREAS derivation further down was written to document.
+ */
 function manifests(): { dir: string; pkg: Manifest }[] {
-  const out: { dir: string; pkg: Manifest }[] = [];
-  for (const dir of readdirSync(packagesDir).sort()) {
-    try {
-      out.push({
-        dir,
-        pkg: JSON.parse(readFileSync(new URL(`${dir}/package.json`, packagesDir), 'utf8')) as Manifest,
-      });
-    } catch {
-      continue;
-    }
-  }
-  return out;
+  return workspacePackages(workspaceRoot())
+    .filter((p) => p.relative.startsWith('packages/'))
+    .map((p) => ({ dir: p.folder, pkg: p.manifest as unknown as Manifest }));
 }
 
 const published = (): { dir: string; pkg: Manifest }[] =>
@@ -252,6 +257,50 @@ describe('the backend set is derived from the manifests, not from a directory pr
  * packages holding 23,572 lines of fixture were excused by construction, because a package that
  * simply never opted in was not a row.
  */
+/**
+ * The authoritative half of two per-package copies that spawned `tsc -b` to re-run a gate ci.yml
+ * already runs for every workspace. What the copies uniquely carried is this: `tsc --showConfig`
+ * answers with the files the project ACTUALLY includes, where the rule below emulates tsc's
+ * include/exclude with globs of its own. Two of thirteen packages paid 2.9s for it; all thirteen
+ * now get it, in one round of concurrent `--showConfig` calls.
+ */
+describe('every tsconfig.test.json really includes its package’s sources', () => {
+  const PROJECTS = derivedRows(
+    'every package declaring a test project',
+    () =>
+      workspacePackages(workspaceRoot())
+        .filter((p) => existsSync(join(p.dir, 'tsconfig.test.json')))
+        .map((p) => [p.relative, p.dir] as const),
+    { floor: 10, witness: ['packages/bridge-core', 'packages/conformance'] },
+  );
+
+  const included = new Map<string, Set<string>>();
+
+  beforeAll(async () => {
+    const shown = await Promise.all(
+      PROJECTS.map(async ([relativeDir, dir]) => {
+        const { stdout } = await promisify(execFile)(
+          'npx',
+          ['tsc', '--showConfig', '-p', join(dir, 'tsconfig.test.json')],
+          { cwd: workspaceRoot(), maxBuffer: 32 * 1024 * 1024 },
+        );
+        const { files = [] } = JSON.parse(stdout) as { files?: string[] };
+        return [relativeDir, new Set(files.map((f) => relative(dir, join(dir, f))))] as const;
+      }),
+    );
+    for (const [name, files] of shown) included.set(name, files);
+  }, 300_000);
+
+  it.each(PROJECTS)('%s leaves no .ts file outside every project', (relativeDir, dir) => {
+    const present = ['src', 'test']
+      .flatMap((area) => filesUnder(join(dir, area), ['.ts']))
+      .map((f) => relative(dir, f));
+    expect(present.length, 'no sources found to grade').toBeGreaterThan(0);
+    const checked = included.get(relativeDir) as Set<string>;
+    expect(present.filter((f) => !checked.has(f))).toEqual([]);
+  });
+});
+
 describe('every test source in the repo is inside a tsconfig some CI step compiles', () => {
   const isTestSource = (f: string): boolean =>
     f.endsWith('.test.ts') || (f.startsWith('test/') && f.endsWith('.ts'));
@@ -347,13 +396,7 @@ describe('every test source in the repo is inside a tsconfig some CI step compil
    * `include` runs `examples/**` too, and scanning only `packages/` would rebuild the same hole one
    * directory across.
    */
-  const AREAS = [
-    ...new Set(
-      (
-        JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { workspaces?: string[] }
-      ).workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [],
-    ),
-  ];
+  const AREAS = workspaceAreas(REPO);
 
   interface Row extends Tested {
     area: string;
