@@ -26,6 +26,7 @@ import {
   type ConformanceContext,
   CONTENT_SHAPES,
   DELIVERY_MS,
+  FAULT_POSITIONS_PER_SHAPE,
   isPlainAscii,
   EARLY_RETURN_FRACTION,
   IDLE_BLOCK_MS,
@@ -364,9 +365,6 @@ const SERVER_BATCH = 50;
  * ceiling with it and never needs another raise.
  */
 export const MAX_BLAST_FRACTION = 2 / 5;
-
-/** Positions in a run the shared clause drives each fault shape at (first, middle, every). */
-const FAULT_POSITIONS_PER_SHAPE = 3;
 
 /** Every shape the shared handler-fault clause drives, so a control's radius grows with the table. */
 const ALL_SHAPES = FAILURE_SHAPE_NAMES.length;

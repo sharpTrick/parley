@@ -651,6 +651,16 @@ describe('no assertion reads the machine it is being graded on', () => {
     /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\s*(?:\.(?:CI|GITHUB_ACTIONS|RUNNER_[A-Z_]+)\b|\[)/g;
 
   /**
+   * The reads that TRAVEL: what a name is bound to makes every mention of that name a host read.
+   * An env read whose KEY the literal mask has blanked is deliberately not one of them — the rule
+   * cannot see which variable it names, and a helper that resolves a path out of the environment is
+   * not an assertion graded against the box. It stays a host read where it is WRITTEN, inside an
+   * assertion.
+   */
+  const TRAVELLING_HOST_READS =
+    /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\s*\.(?:CI|GITHUB_ACTIONS|RUNNER_[A-Z_]+)\b/g;
+
+  /**
    * From `expect(` to the end of its statement, so the matcher's argument is scanned too: a bound
    * hidden in `.toBeLessThan(cpus().length)` is the same defect as one hidden in the subject.
    */
@@ -682,9 +692,9 @@ describe('no assertion reads the machine it is being graded on', () => {
     const callable = at >= 0 && /^[\s\w<>,:]*$/.test(value.slice(0, at));
     const params = callable ? extentFrom(value, at, '(', ')', false) : '';
     const body = callable ? value.slice(at + params.length) : value;
-    if ([...body.matchAll(HOST_READS)].length > 0) return 'body';
-    if ([...params.matchAll(HOST_READS)].length > 0) return 'default';
-    return path.reaches(value, HOST_READS) ? 'body' : 'none';
+    if ([...body.matchAll(TRAVELLING_HOST_READS)].length > 0) return 'body';
+    if ([...params.matchAll(TRAVELLING_HOST_READS)].length > 0) return 'default';
+    return path.reaches(value, TRAVELLING_HOST_READS) ? 'body' : 'none';
   };
 
   const hostReadsInAssertions = (
@@ -870,6 +880,55 @@ describe('a derived table names its witnesses instead of deriving them', () => {
       derivedWitnesses(readFileSync(file, 'utf8')),
       'this witness is derived from the same expression as the rows, so it narrows with them and ' +
         'proves nothing — name the members the scan must reach',
+    ).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: two absent values, one of them accepted. `??` stands in for undefined and null only, so an
+ * environment variable SET TO EMPTY passes straight through it — and `${XDG_STATE_HOME:-…}`, the
+ * shell spelling every one of these doc comments uses, means unset OR empty. Live twice: an empty
+ * XDG_STATE_HOME made core's and telegram's "default" state paths RELATIVE to the spawn directory,
+ * so a bridge relaunched from elsewhere opened a fresh file beside cursors an agent still held.
+ */
+describe('an optional environment value is not defaulted with `??`', () => {
+  const NULLISH_ENV = /process\.env(?:\.[A-Za-z_][\w]*|\[[^\]]*\])\s*\?\?/g;
+
+  const nullishEnvDefaults = (source: string): string[] =>
+    [...withoutComments(source).matchAll(NULLISH_ENV)].map((m) => m[0].replace(/\s+/g, ' '));
+
+  it.each([
+    ['a dotted read', "const base = process.env.XDG_STATE_HOME ?? home();", ['process.env.XDG_STATE_HOME ??']],
+    ['an indexed read', "const base = process.env['XDG_STATE_HOME'] ?? home();", ["process.env['XDG_STATE_HOME'] ??"]],
+    ['a read guarded by trim first', "const set = process.env['X']?.trim() ?? '';", []],
+    ['a read compared instead of defaulted', "if (process.env['X'] === undefined) return home();", []],
+    ['the same line in a comment', '// process.env.X ?? home()', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(nullishEnvDefaults(source)).toEqual(found);
+  });
+
+  const shipped = derivedRows(
+    'every shipped source module',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(join(p.dir, 'src'), ['.ts']))
+        .filter((f) => !f.endsWith('.test.ts'))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 100,
+      witness: [
+        'packages/bridge-core/src/engine/read-state.ts',
+        'packages/bridge-telegram/src/config.ts',
+      ],
+    },
+  );
+
+  it.each(shipped)('%s', (_name, file) => {
+    expect(
+      nullishEnvDefaults(readFileSync(file, 'utf8')),
+      'an environment variable set to the empty string is as absent as an unset one, and `??` ' +
+        'passes it through — a blank value then becomes a path segment under the spawn directory',
     ).toEqual([]);
   });
 });

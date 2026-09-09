@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { workspaceRoot } from '@sharptrick/parley-net-util/testing';
 import { afterAll, describe, expect, it } from 'vitest';
 import { asCursor, asTopic } from '../message.js';
-import { ReadStateStore } from './read-state.js';
+import { defaultReadStatePath, ReadStateStore } from './read-state.js';
 
 /**
  * CLASS: a documented file set that nothing drives. DESIGN §10 said core writes "four, all under
@@ -120,4 +120,46 @@ describe('the files core writes under state_path are the files DESIGN §10 lists
     expect(failure, 'a flush onto an occupied path should fail naming its temp file').not.toEqual('');
     expect(failure, `${failure} does not carry ${documented}`).toMatch(spelling);
   });
+});
+
+/**
+ * CLASS: two absent values, one of them accepted. `??` only stands in for undefined, so an env var
+ * set to the empty string (or to spaces) reached `join()` as a path segment and the "default" state
+ * file resolved RELATIVE to wherever the bridge was spawned — a fresh state file beside cursors an
+ * agent is still holding. The XDG spec reads unset and empty the same way, and requires an absolute
+ * value; the shell spelling in the doc comment, `${XDG_STATE_HOME:-…}`, already said so.
+ */
+describe('an optional env path treats every absent value the same way', () => {
+  const ABSENT: ReadonlyArray<readonly [label: string, value: string | undefined]> = [
+    ['unset', undefined],
+    ['empty', ''],
+    ['whitespace', '   '],
+    ['relative, which the XDG spec says to ignore', 'relative/state'],
+  ];
+
+  it.each(ABSENT)('reads %s as the default', (_label, value) => {
+    const before = process.env['XDG_STATE_HOME'];
+    try {
+      if (value === undefined) delete process.env['XDG_STATE_HOME'];
+      else process.env['XDG_STATE_HOME'] = value;
+      const path = defaultReadStatePath('probe');
+      expect(path, `${JSON.stringify(value)} produced a path under the working directory`).toBe(
+        defaultAway(),
+      );
+    } finally {
+      if (before === undefined) delete process.env['XDG_STATE_HOME'];
+      else process.env['XDG_STATE_HOME'] = before;
+    }
+  });
+
+  /** What the default has to be, computed the way the doc comment states it. */
+  const defaultAway = (): string => {
+    const before = process.env['XDG_STATE_HOME'];
+    delete process.env['XDG_STATE_HOME'];
+    try {
+      return defaultReadStatePath('probe');
+    } finally {
+      if (before !== undefined) process.env['XDG_STATE_HOME'] = before;
+    }
+  };
 });

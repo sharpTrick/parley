@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { asCursor, type Cursor, type Topic } from '../message.js';
 
 /**
@@ -211,7 +211,11 @@ export class ReadStateStore {
  * concurrent sessions sharing one handle MUST set distinct instance_ids (DESIGN §10).
  */
 export function defaultReadStatePath(instanceId: string): string {
-  const base = process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state');
+  // `??` accepts an env var set to EMPTY, and the XDG spec reads unset and empty the same way;
+  // a blank or relative value would otherwise resolve under the spawn directory, so a bridge
+  // relaunched from elsewhere would start a fresh state file beside cursors an agent still holds.
+  const configured = process.env['XDG_STATE_HOME']?.trim() ?? '';
+  const base = isAbsolute(configured) ? configured : join(homedir(), '.local', 'state');
   return join(base, 'parley', sanitize(instanceId), 'read-state.json');
 }
 

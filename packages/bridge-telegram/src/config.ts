@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import {
   assertKnownConfigKeys,
   type BackendConfig,
@@ -116,6 +116,10 @@ export function requireNumericKnobs(cfg: TelegramBackendConfig): void {
  * default file; give a second deployment its own `store_path`.
  */
 export function defaultStorePath(): string {
-  const base = process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state');
+  // `??` accepts an env var set to EMPTY, and the XDG spec reads unset and empty the same way;
+  // a blank or relative value would otherwise resolve under the spawn directory, so a bridge
+  // relaunched from elsewhere would start a fresh state file beside cursors an agent still holds.
+  const configured = process.env['XDG_STATE_HOME']?.trim() ?? '';
+  const base = isAbsolute(configured) ? configured : join(homedir(), '.local', 'state');
   return join(base, 'parley', 'telegram', 'observed.jsonl');
 }

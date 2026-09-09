@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { derivedRows, filesUnder } from '@sharptrick/parley-net-util/testing';
+import { derivedRows, filesUnder, withoutComments } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 // Class: a comment that restates the line beneath it. CLAUDE.md makes a comment earn its place only
@@ -30,26 +30,22 @@ interface Comment {
   text: string;
 }
 
-/**
- * Everything on a line that is not code. Escape pairs go first — `\\/` inside a regex literal is
- * what makes `.replace(/^\\/\\//, '')` look like a comment — and string literals second, so a `//`
- * inside a URL is not read as one either.
- */
-const STRINGS = /'[^']*'|"[^"]*"|`[^`]*`/g;
-const codeOf = (line: string): string =>
-  line.replace(/\\./g, '__').replace(STRINGS, (m) => m[0]!.repeat(m.length));
-
 /** Consecutive `//` lines are ONE comment: the risk is often stated in the last of them. */
 export const lineComments = (source: string, file = ''): Comment[] => {
+  // The shared stripper, not a private line-based one: a per-line matcher has to assume every
+  // literal closes on the line it opens, so a template spanning lines or a regex carrying a quote
+  // hides or invents a comment. It answers per line, in the same order, with the comment removed.
+  const code = withoutComments(source).split('\n');
   const out: Comment[] = [];
   let open: Comment | undefined;
   source.split('\n').forEach((raw, i) => {
-    const at = codeOf(raw).indexOf('//');
-    if (at === -1) {
+    const stripped = code[i] ?? raw;
+    const rest = raw.startsWith(stripped) ? raw.slice(stripped.length) : '';
+    if (!rest.startsWith('//')) {
       open = undefined;
       return;
     }
-    const text = raw.slice(at + 2).trim();
+    const text = rest.slice(2).trim();
     if (open === undefined) {
       open = { file, line: i + 1, text };
       out.push(open);
