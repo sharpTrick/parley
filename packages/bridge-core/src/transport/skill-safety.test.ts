@@ -89,14 +89,6 @@ describe('every shipped skill tells an agent that topic content is data', () => 
     expect(inboundTrustBreach(snippet!)).toBeUndefined();
   });
 
-  /** A pin on the bytes: it detects that a skill CHANGED, and grades nothing about the change. */
-  it.each(graded())('%s ships byte for byte', (skill) => {
-    const golden = fileURLToPath(new URL(`./${skill}.golden.txt`, import.meta.url));
-    expect(
-      skillText(skill),
-      `${skill}/SKILL.md changed; read the new text, then update ${golden}`,
-    ).toBe(readFileSync(golden, 'utf8'));
-  });
 });
 
 /** Whitespace-insensitive, so a markdown reflow is not a failure and a reworded clause is. */

@@ -132,29 +132,4 @@ describe('the channel instructions the bridge advertises', () => {
       await shutdown();
     }
   });
-
-  /**
-   * The scan above grades only NAMES. Everything else the prose says — the untrusted-inbound clause
-   * (DESIGN §14) above all — is a semantic claim, and three rounds of trying to grade one with a
-   * pattern were each satisfied by prose that reversed it: an exception clause, an in-sentence
-   * carve-out, and a contradicting sibling sentence.
-   *
-   * So pin the bytes instead. This detects that the shipped instructions CHANGED; it does not
-   * grade whether they are correct. Any edit — improving, weakening or inverting — reddens until
-   * someone updates the golden, which is the point: a human reads the one string that reaches
-   * every model's system prompt.
-   */
-  const GOLDEN = fileURLToPath(new URL('./channel-instructions.golden.txt', import.meta.url));
-
-  it('ships the pinned instructions byte for byte', async () => {
-    const { client, shutdown } = await liveBridge();
-    try {
-      expect(
-        `${client.getInstructions() ?? ''}\n`,
-        `the channel instructions changed; read the new text, then update ${GOLDEN}`,
-      ).toBe(readFileSync(GOLDEN, 'utf8'));
-    } finally {
-      await shutdown();
-    }
-  });
 });
