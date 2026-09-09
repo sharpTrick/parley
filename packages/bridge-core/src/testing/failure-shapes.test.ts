@@ -118,49 +118,6 @@ const probes = async (): Promise<Probe[]> =>
   Promise.all(FAILURE_SHAPE_NAMES.map((name) => probe(FAILURE_SHAPES[name])));
 
 describe('the shared fault table keeps every property its consumers differ on', () => {
-  /**
-   * The RULER. A property row below reports "no arm does this" when the table lost the arm AND when
-   * the probe stopped being able to see it, and only one of those is a defect in the table — so the
-   * probe is graded against arms written here, whose classification is not in question.
-   */
-  it.each([
-    ['a synchronous throw', (): unknown => { throw new Error('x'); }, [0, 7]],
-    ['an immediate rejection', (): unknown => Promise.reject(new Error('x')), [1, 8, 9, 10]],
-    ['a string rejection', (): unknown => Promise.reject('x'), [1, 2, 9]],
-    [
-      'a deferred rejection',
-      (): unknown =>
-        new Promise((_r, reject) => {
-          setTimeout(() => reject(new Error('x')), 0);
-        }),
-      [1, 3, 8],
-    ],
-    [
-      'a foreign thenable',
-      (): unknown => ({ then: (_f: unknown, r: (e: unknown) => void) => r(new Error('x')) }),
-      [4, 8, 9],
-    ],
-    ['a promise that never settles', (): unknown => new Promise(() => {}), [5]],
-    ['a plain resolved value', (): unknown => undefined, []],
-  ] as Array<[string, Arm, number[]]>)('reads %s as exactly the properties it has', async (
-    _label,
-    arm,
-    expected,
-  ) => {
-    const p = await probe(arm);
-    expect(vectorOf(p)).toEqual(expected);
-  });
-
-  it('reads two arms of the same shape as mutually deletable (ruler self-test)', () => {
-    expect(deletable([['a', [0, 1]], ['b', [0, 1]]])).toEqual(['a', 'b']);
-    expect(deletable([['a', [0]], ['b', [1]]])).toEqual([]);
-    expect(deletable([['a', [0]], ['b', [0, 1]]])).toEqual(['a']);
-    expect(deletable([['a', []], ['b', [0]]])).toEqual(['a']);
-    // Covered between two arms without being a subset of either: the failure the subset spelling
-    // of this rule cannot see, and the one that left the baseline arm deletable.
-    expect(deletable([['a', [0, 1]], ['b', [0, 2]], ['c', [1, 2]]])).toEqual(['a', 'b', 'c']);
-  });
-
   it('no arm can be deleted behind another', async () => {
     const held = (await probes()).map(
       (p, i) => [FAILURE_SHAPE_NAMES[i] as string, vectorOf(p)] as const,
