@@ -59,10 +59,9 @@ export const MAX_CATCHUP_PAGES = 10_000;
  */
 export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   const { plugin, topic, limit, readState, seen } = args;
-  const marker = readState.warmedThrough(topic);
-  let since = marker ?? readState.get(topic);
-  const resumedFromDisk = since !== undefined;
-  const origin = marker !== undefined ? readState.warmPath : readState.path;
+  const position = readState.get(topic);
+  let marker = readState.warmedThrough(topic);
+  let since = marker ?? position;
   let warmedTo = marker;
   let total = 0;
 
@@ -96,15 +95,34 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   };
 
   for (let page = 0; page < MAX_CATCHUP_PAGES; page++) {
+    const fromMarker = page === 0 && marker !== undefined;
     let result;
     try {
-      result = await (page === 0 && resumedFromDisk
-        ? fetchWithResumeHint(plugin, { topic, since, limit }, origin)
+      result = await (page === 0 && since !== undefined && !fromMarker
+        ? fetchWithResumeHint(plugin, { topic, since, limit }, readState.path)
         : plugin.fetchRecent({ topic, since, limit }));
     } catch (err) {
-      if (!isNoSuchTopicError(err)) throw err;
-      console.error(`[parley] topic ${JSON.stringify(topic)} does not exist on the backend yet; skipping catch-up`);
-      return finish(total, false);
+      if (isNoSuchTopicError(err)) {
+        console.error(`[parley] topic ${JSON.stringify(topic)} does not exist on the backend yet; skipping catch-up`);
+        return finish(total, false);
+      }
+      // A MARKER this backend cannot read is a cache miss, not a failure — the instance previously
+      // ran against a different backend, and that cursor was minted by the old one. Dropping it
+      // costs one re-paged boot and reaches strictly MORE. The agent's POSITION is not disposable
+      // the same way, so a rejection replaying THAT one still stops the bridge, hinted.
+      if (!fromMarker) throw err;
+      console.error(
+        `[parley] the catch-up marker for topic ${JSON.stringify(topic)} in ${readState.warmPath} ` +
+          `cannot be read by this backend (${err instanceof Error ? err.message : String(err)}). ` +
+          'If this instance previously ran against a DIFFERENT backend, that cursor was minted by ' +
+          `the old one. Discarding it and re-reading from ${readState.path}; deleting the marker ` +
+          'file is always safe.',
+      );
+      marker = undefined;
+      warmedTo = undefined;
+      since = position;
+      page -= 1;
+      continue;
     }
     const { messages, nextCursor } = result;
     // Screened exactly as `ReadStateStore.set` screens one: a plugin that hands back no usable
@@ -137,7 +155,7 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
 async function fetchWithResumeHint(
   plugin: BackendPlugin,
   req: { topic: Topic; since: Cursor | undefined; limit: number },
-  originPath: string,
+  statePath: string,
 ): Promise<Awaited<ReturnType<BackendPlugin['fetchRecent']>>> {
   try {
     return await plugin.fetchRecent(req);
@@ -152,7 +170,7 @@ async function fetchWithResumeHint(
       `catch-up failed on topic ${JSON.stringify(req.topic)} while resuming from the stored ` +
         `cursor ${JSON.stringify(String(req.since))}: ${detail}\n` +
         `If this instance previously ran against a DIFFERENT backend, that cursor was minted by ` +
-        `the old one and this backend cannot parse it. Delete ${originPath} to re-read from ` +
+        `the old one and this backend cannot parse it. Delete ${statePath} to re-read from ` +
         `scratch, or give this instance its own instance_id.`,
       { cause: err },
     );

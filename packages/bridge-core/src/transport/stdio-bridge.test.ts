@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../config.js';
 import {
   asBackendMsgId,
@@ -99,6 +99,24 @@ class RecordingPlugin implements BackendPlugin {
 
 /** What `attach` accepts — the SDK's transport interface, as the bridge declares it. */
 type AnyTransport = Parameters<Awaited<ReturnType<typeof buildBridge>>['attach']>[0];
+
+/**
+ * Every case here builds a real bridge, and a config with no `state_path` resolves to
+ * `$XDG_STATE_HOME/parley/<instance>/read-state.json` — the DEVELOPER'S OWN state directory. Redirect
+ * it for the whole file rather than adding `state_path` to each config literal, so that the next
+ * case written without one still cannot read a cursor left behind by a real session (which is how a
+ * lifecycle case here came to assert a round-trip count that depended on what was in ~/.local/state).
+ */
+const XDG = mkdtempSync(join(tmpdir(), 'parley-bridge-xdg-'));
+const REAL_XDG = process.env.XDG_STATE_HOME;
+beforeAll(() => {
+  process.env.XDG_STATE_HOME = XDG;
+});
+afterAll(() => {
+  if (REAL_XDG === undefined) delete process.env.XDG_STATE_HOME;
+  else process.env.XDG_STATE_HOME = REAL_XDG;
+  rmSync(XDG, { recursive: true, force: true });
+});
 
 /** Wall-clock ceiling a teardown must settle inside, whatever the backend does. */
 const TEARDOWN_BUDGET_MS = 3_500;
@@ -615,6 +633,225 @@ describe('a state file this process cannot write does not stop the bridge starti
     } finally {
       warnings.mockRestore();
       chmodSync(stateDir, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
+ * Round 4 shipped a SECOND state file beside the read position, and the two have OPPOSITE
+ * consequences when they are discarded: losing the agent's read position puts every topic back on
+ * the backend's recent window and makes anything older unreachable, while losing the driver's warm
+ * marker costs one re-paged boot and reaches strictly MORE. They shared one diagnostic, so an
+ * operator whose marker went bad was told their backlog was gone.
+ *
+ * The FILE is the axis that makes that visible, so it is parameterised: every content shape is
+ * driven against both files, through a real boot, and each cell asserts what the operator is told
+ * as well as what the agent can still reach.
+ */
+describe('a corrupt state file says which file, and what it actually costs', () => {
+  const T = asTopic('ctx');
+  const peer = asHandle('bob');
+  const ALL = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5'];
+  /** The read position both files start from: the agent has been handed m0 and nothing since. */
+  const HEALTHY = JSON.stringify({ ctx: '1' });
+  const FOREIGN_CURSOR = JSON.stringify({ ctx: '1785300194045-0' });
+
+  /**
+   * A backend that REFUSES a cursor it did not mint, which is what postgres, redis and matrix all
+   * do. A fake that silently answers an unparseable cursor with an empty page cannot reach the
+   * branch where a cursor read off disk takes the boot down.
+   */
+  class StrictCursorPlugin extends FakePlugin {
+    override async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+      if (args.since !== undefined && !/^\d+$/.test(String(args.since))) {
+        throw new Error(`invalid input syntax for type bigint: "${String(args.since)}"`);
+      }
+      return super.fetchRecent(args);
+    }
+  }
+
+  const FILES = ['read-state', 'warm marker'] as const;
+  type StateFile = (typeof FILES)[number];
+
+  /**
+   * `speaks` names the files this shape must produce a diagnostic ABOUT. Without it the claims below
+   * about what the operator was told are vacuous on every silent shape — and a shape that stops
+   * speaking reads as a pass.
+   */
+  const SHAPES: ReadonlyArray<
+    readonly [name: string, apply: (path: string) => void, speaks: readonly StateFile[]]
+  > = [
+    ['absent', (p) => rmSync(p, { force: true }), []],
+    ['empty', (p) => writeFileSync(p, ''), FILES],
+    ['truncated', (p) => writeFileSync(p, '{"ctx": "1'), FILES],
+    ['non-JSON', (p) => writeFileSync(p, 'not json at all'), FILES],
+    ['an array', (p) => writeFileSync(p, '[]'), FILES],
+    ['null', (p) => writeFileSync(p, 'null'), FILES],
+    ['a numeric cursor', (p) => writeFileSync(p, '{"ctx": 7}'), []],
+    ['a foreign topic key', (p) => writeFileSync(p, '{"other": "3"}'), []],
+    ['a cursor past the head', (p) => writeFileSync(p, '{"ctx": "9999"}'), []],
+    [
+      'unreadable',
+      (p) => {
+        writeFileSync(p, HEALTHY);
+        chmodSync(p, 0o000);
+      },
+      [],
+    ],
+    [
+      // Only the marker speaks here: a read-state path that is a directory fails on the tool's
+      // WRITE, which is a recoverable tool error rather than something the boot logs.
+      'a directory',
+      (p) => {
+        rmSync(p, { force: true });
+        mkdirSync(p);
+      },
+      ['warm marker'],
+    ],
+    // In the read position this one never reaches the diagnostic block: the boot dies, and the
+    // message it dies with is asserted above.
+    ["another backend's cursor", (p) => writeFileSync(p, FOREIGN_CURSOR), ['warm marker']],
+  ];
+
+  const CELLS = SHAPES.flatMap(([shape, apply, speaks]) =>
+    FILES.map((file) => [shape, file, apply, speaks.includes(file)] as const),
+  );
+
+  it.each(CELLS)('%s in the %s file', async (shape, file, apply, mustSpeak) => {
+    const dir = mkdtempSync(join(tmpdir(), 'parley-state-shape-'));
+    const statePath = join(dir, 'read-state.json');
+    const warmPath = `${statePath}.warmed`;
+    const store = new StrictCursorPlugin();
+    const said: string[] = [];
+    const stderr = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      said.push(a.map(String).join(' '));
+    });
+    try {
+      await store.connect({});
+      for (const content of ALL) await store.post(T, peer, content);
+
+      writeFileSync(statePath, HEALTHY);
+      // The marker SHADOWS the read position, so a case about the position has to be the one the
+      // driver resumes from or it grades the marker twice.
+      if (file === 'warm marker') writeFileSync(warmPath, HEALTHY);
+      apply(file === 'read-state' ? statePath : warmPath);
+
+      const cfg = parseConfig({
+        identity: { handle: 'agent' },
+        topics: ['ctx'],
+        state_path: statePath,
+        live_push: { enabled: false },
+      });
+      const started = await buildBridge(store, cfg).then(
+        (bridge) => ({ ok: true as const, bridge }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+
+      // A cursor minted by ANOTHER backend is the one shape where the two files must part company.
+      // In the read position it is the agent's own record of what it has been handed, so guessing
+      // past it loses messages and the boot stops, hinted. In the marker it is a cache miss.
+      const mustDie = shape === "another backend's cursor" && file === 'read-state';
+      if (mustDie) {
+        expect(
+          started.ok,
+          'a cursor this backend cannot parse, sitting in the AGENT’s read position, was papered ' +
+            'over — the position is the record of what the agent has been handed, and a boot that ' +
+            'guesses past it loses whatever sits between',
+        ).toBe(false);
+        const message = started.ok ? '' : String((started.error as Error).message);
+        expect(message).toContain(statePath);
+        expect(message).toContain('1785300194045-0');
+        return;
+      }
+      if (!started.ok) {
+        expect.fail(
+          `the bridge died at boot over the ${file} file, which is not a file it may die over: ` +
+            (started.error instanceof Error ? started.error.message : String(started.error)),
+        );
+      }
+
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'session', version: '0' }, { capabilities: {} });
+      await Promise.all([started.bridge.server.connect(serverT), client.connect(clientT)]);
+
+      const reachable: string[] = [];
+      let refused = false;
+      let since: string | undefined;
+      for (let page = 0; page <= ALL.length; page++) {
+        const args: Record<string, unknown> = { topic: 'ctx', limit: 2 };
+        if (since !== undefined) args.since = since;
+        const answer = (await client.callTool({ name: 'parley_fetch_recent', arguments: args })) as {
+          content: { text: string }[];
+          isError?: boolean;
+        };
+        // A read-state file the tool cannot WRITE surfaces as a recoverable tool error, which is
+        // the pre-marker behaviour and is not silent loss. It is still a refusal, so the marker
+        // rows below hold it to zero.
+        if (answer.isError === true) {
+          refused = true;
+          break;
+        }
+        const out = JSON.parse(answer.content[0]!.text) as {
+          messages: { content: string }[];
+          nextCursor?: string;
+        };
+        reachable.push(...out.messages.map((m) => m.content));
+        if (out.nextCursor === undefined || out.nextCursor === since) break;
+        since = out.nextCursor;
+      }
+
+      if (file === 'warm marker') {
+        expect(
+          refused,
+          'breaking the warm marker made a READ fail. The marker is the driver’s own record and ' +
+            'no tool call depends on it',
+        ).toBe(false);
+        expect(
+          reachable,
+          'breaking the warm marker changed what the AGENT can reach. The marker records what the ' +
+            'DRIVER has paged over and nothing else; losing it may cost round trips, never messages',
+        ).toEqual(ALL.slice(1));
+      } else {
+        expect(
+          ALL.slice(ALL.length - reachable.length),
+          'the agent was handed something other than a contiguous suffix of the topic',
+        ).toEqual(reachable);
+      }
+
+      const named = said.filter((line) => line.includes(statePath));
+      expect(
+        named.length > 0,
+        `nothing was said about the ${file} file, so every claim below about what the operator ` +
+          'was told is vacuous',
+      ).toBe(mustSpeak);
+      for (const line of named) {
+        expect(
+          line.includes(warmPath),
+          `a diagnostic raised over the ${file} file named the other one: ${line}`,
+        ).toBe(file === 'warm marker');
+        // The whole of what differs between the two files. Discarding the read position really does
+        // strand the backlog; discarding the marker reaches strictly MORE. One sentence serving both
+        // is how an operator comes to believe messages are gone, and to delete the wrong file.
+        expect(
+          line.includes('unreachable'),
+          file === 'warm marker'
+            ? `a diagnostic about the warm marker claimed messages are unreachable: ${line}`
+            : `a diagnostic about the read POSITION did not say what discarding it costs: ${line}`,
+        ).toBe(file === 'read-state');
+      }
+
+      await client.close();
+      await started.bridge.shutdown();
+    } finally {
+      stderr.mockRestore();
+      for (const p of [statePath, warmPath]) {
+        try {
+          chmodSync(p, 0o600);
+        } catch {
+          // absent, or a directory this row created — rmSync below handles both
+        }
+      }
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);

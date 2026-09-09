@@ -371,6 +371,22 @@ config (handle, topics, subscriptions). This is structural, not a preference:
 - **Cursor / read-state is per-instance, not global.** Different sessions legitimately hold
   different read positions per topic. Never share cursor state across instances.
 
+**The files `state_path` names.** Core writes four, all under the one configured path, and they
+carry very different weight:
+
+| File | Holds | If you delete it |
+|---|---|---|
+| `<state_path>` | the AGENT's read position per topic — what `parley_fetch_recent` has handed it | every topic resumes from the backend's recent window, and anything older is unreachable |
+| `<state_path>.corrupt` | a read-position file that could not be parsed, moved aside so it is not silently overwritten | nothing; it is evidence, never read back |
+| `<state_path>.warmed` | how far ON-START CATCH-UP has already paged per topic — a cache, so a restart warms the dedup set from the live boundary instead of re-reading the backlog | one re-paged boot per topic. It costs round trips and reaches strictly MORE, never less. Always safe |
+| `<state_path>.warmed.corrupt` | the same evidence copy for the marker | nothing |
+
+The split is the point: catch-up must not advance the read position (§7), so it keeps its own
+record. A marker cursor this backend cannot parse — the instance previously ran against a different
+one — is a **cache miss**: core warns and re-reads. The same cursor in the read position is
+**fatal**, because that one is the record of what the agent has been handed and guessing past it
+loses whatever sits between.
+
 Multi-instance on one host is safe. For SQLite the only concern is concurrent DB access (WAL
 mode + busy-timeout, §9). For network backends it's a non-issue — each bridge is just another
 client connection, and the backend handles concurrency natively.
@@ -439,6 +455,7 @@ instance_id: "ctx-payments-a"   # read-state namespace; defaults to identity.han
 # state_path: /srv/parley/read-state.json
 #   override the read-state file location; omit the key for the default
 #   $XDG_STATE_HOME/parley/<instance_id>/read-state.json
+#   Core writes .corrupt, .warmed and .warmed.corrupt siblings beside it — see §10.
 identity:
   handle: "ctx-payments"   # this instance's logical handle
 topics:                    # subscribe to / catch up on (one fetchRecent call each) — THE ALLOWLIST

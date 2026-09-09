@@ -20,15 +20,34 @@ import { asCursor, type Cursor, type Topic } from '../message.js';
  * so the worst case is a single topic's cursor losing a race, not a whole session's read position,
  * and never a half-written file.
  */
+/**
+ * What DISCARDING a state file costs the operator. It is the only thing that differs between the two
+ * files this class writes, and it is the whole of the quarantine diagnostic — so it is a parameter
+ * rather than a sentence baked into a shared code path. One message written about the read position
+ * and then reused for the marker tells an operator their backlog is unreachable when nothing of the
+ * kind has happened.
+ */
+const READ_POSITION_DISCARDED =
+  'every topic in it resumes from the backend’s recent window instead of where this instance ' +
+  'last read, and anything older is unreachable';
+
+const WARM_MARKER_DISCARDED =
+  'on-start catch-up re-pages each topic from the read position instead of from the marker, which ' +
+  'costs round trips and reaches strictly MORE, never less — no message and no read position is ' +
+  'in this file, and deleting it is always safe';
+
 export class ReadStateStore {
   private readonly state: Record<string, string>;
   private readonly pending = new Set<string>();
 
-  constructor(private readonly filePath: string) {
+  constructor(
+    private readonly filePath: string,
+    private readonly discarded: string = READ_POSITION_DISCARDED,
+  ) {
     if (filePath.length === 0) {
       throw new Error('read-state path must not be empty (config `state_path`)');
     }
-    this.state = ReadStateStore.load(filePath);
+    this.state = ReadStateStore.load(filePath, discarded);
   }
 
   /**
@@ -38,7 +57,7 @@ export class ReadStateStore {
    * every topic went back to the backend's recent window — the loss this whole convention exists to
    * prevent — is messages that never arrive.
    */
-  private static load(filePath: string): Record<string, string> {
+  private static load(filePath: string, discarded: string): Record<string, string> {
     // Null-prototype backing map: `constructor`/`__proto__` topic names can neither leak a
     // prototype value out of get() nor turn set() into a silent no-op.
     const out: Record<string, string> = Object.create(null);
@@ -52,12 +71,12 @@ export class ReadStateStore {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return ReadStateStore.quarantine(filePath, out);
+      return ReadStateStore.quarantine(filePath, out, discarded);
     }
     // Reject arrays (an `[]` file would otherwise swallow string-keyed writes on flush) and
     // keep only own, string-valued entries (a non-string cursor would wedge catch-up).
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return ReadStateStore.quarantine(filePath, out);
+      return ReadStateStore.quarantine(filePath, out, discarded);
     }
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
       if (typeof v === 'string') out[k] = v;
@@ -65,7 +84,11 @@ export class ReadStateStore {
     return out;
   }
 
-  private static quarantine(filePath: string, out: Record<string, string>): Record<string, string> {
+  private static quarantine(
+    filePath: string,
+    out: Record<string, string>,
+    discarded: string,
+  ): Record<string, string> {
     const kept = `${filePath}.corrupt`;
     let moved = false;
     try {
@@ -75,9 +98,8 @@ export class ReadStateStore {
       // Read-only directory, or another process moved it first — the diagnostic is what matters.
     }
     console.error(
-      `[parley] read-state at ${filePath} is not a readable JSON object; every topic in it ` +
-        'resumes from the backend’s recent window instead of where this instance last read, ' +
-        `and anything older is unreachable. ${moved ? `The unreadable file is kept at ${kept}` : 'It could not be moved aside and the next write will replace it'}.`,
+      `[parley] ${filePath} is not a readable JSON object; ${discarded}. ` +
+        `${moved ? `The unreadable file is kept at ${kept}` : 'It could not be moved aside and the next write will replace it'}.`,
     );
     return out;
   }
@@ -109,8 +131,12 @@ export class ReadStateStore {
     return `${this.filePath}.warmed`;
   }
 
+  private openWarmStore(): ReadStateStore {
+    return new ReadStateStore(this.warmPath, WARM_MARKER_DISCARDED);
+  }
+
   warmedThrough(topic: Topic): Cursor | undefined {
-    return (this.warmStore ??= new ReadStateStore(this.warmPath)).get(topic);
+    return (this.warmStore ??= this.openWarmStore()).get(topic);
   }
 
   /**
@@ -120,15 +146,13 @@ export class ReadStateStore {
    */
   markWarmed(topic: Topic, cursor: Cursor): void {
     try {
-      (this.warmStore ??= new ReadStateStore(this.warmPath)).set(topic, cursor);
+      (this.warmStore ??= this.openWarmStore()).set(topic, cursor);
     } catch (err) {
       console.error(
         `[parley] could not record catch-up progress for topic ${JSON.stringify(topic)} in ` +
-          `${this.warmPath}: ${err instanceof Error ? err.message : String(err)}. That file only ` +
-          'caches how far on-start catch-up has already paged — no read position and no message ' +
-          'is in it, and deleting it is always safe. The bridge is continuing; the cost is that ' +
-          'the next boot re-pages this topic from ' +
-          `${this.filePath} instead. Make the directory writable by this process to stop re-paging.`,
+          `${this.warmPath}: ${err instanceof Error ? err.message : String(err)}. The bridge is ` +
+          `continuing: ${WARM_MARKER_DISCARDED}. Make that directory writable by this process to ` +
+          'stop re-paging.',
       );
     }
   }
@@ -158,7 +182,7 @@ export class ReadStateStore {
     // republish every position this instance ever held, rolling another session on the same path
     // back to where THIS one last read — a persistent regression, not a lost race, and one that
     // re-drains and re-emits already-delivered messages after a restart.
-    const merged = ReadStateStore.load(this.filePath);
+    const merged = ReadStateStore.load(this.filePath, this.discarded);
     for (const topic of this.pending) merged[topic] = this.state[topic]!;
     // Keep the temp name process-unique, so that a concurrent flush cannot interleave into it and
     // leave a half-written file that load() would silently discard as corrupt.
