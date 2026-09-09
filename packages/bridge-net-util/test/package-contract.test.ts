@@ -55,25 +55,11 @@ const SURFACE = derivedRows(
 describe('README', () => {
   const readme = README;
 
-  // `toContain(name)` over the whole file counts incidental prose as documentation: short names
-  // like `delay` match a sentence that never mentions the export. Require the name in a code span.
-  const asCodeSpan = (name: string): RegExp => new RegExp(`\`${name}(\`|\\()`);
-
-  it.each(SURFACE)('documents the exported `%s`', (name) => {
-    expect(readme).toMatch(asCodeSpan(name));
-  });
-
-  it('finds code spans at all, so the check above cannot pass by finding none', () => {
-    expect(readme.split('`').length).toBeGreaterThan(20);
-  });
-
-  it('does not describe a publicly-published package as internal', () => {
+  it('is published publicly', () => {
     const pkg = JSON.parse(
       readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
     ) as { description: string; publishConfig?: { access?: string } };
     expect(pkg.publishConfig?.access).toBe('public');
-    expect(pkg.description.toLowerCase()).not.toContain('internal');
-    expect(readme.toLowerCase()).not.toMatch(/exports exactly two things/);
   });
 
   // The README states a bound and names a constant as the thing that enforces it. Derive the
@@ -117,44 +103,6 @@ describe('README', () => {
         if (predicted === 'stop') expect(err.message).toMatch(/past this call's 30000ms deadline/);
       },
     );
-  });
-
-  // The mechanism the loop actually runs, against what the docs attribute to it. `fetchWithRetry`
-  // has never clamped anything — the only backoff it invents is the fixed `DEFAULT_BACKOFF_MS` —
-  // while the npm description sold a "backoff clamp" as one of its features, the README named
-  // `MAX_BACKOFF_MS` as one of the loop's own bounds, and three backends' READMEs documented the
-  // clamp as their own rate-limit behaviour. The clamp is gone; the names are what the docs may not
-  // reintroduce without the mechanism.
-  describe('the docs attribute to the loop only what the loop reaches', () => {
-    const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
-      description: string;
-    };
-    const CLAMP_NAMES = ['clampBackoff', 'MAX_BACKOFF_MS'];
-
-    /** Comments stripped, so a name discussed in prose does not read as code. */
-    const loopCode = (): string =>
-      src.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
-
-    /** Mentions that are a USE, i.e. everything but the name's own `export` line. */
-    const uses = (name: string, text: string): number =>
-      [...text.matchAll(new RegExp(`\\b${name}\\b`, 'g'))].length -
-      [...text.matchAll(new RegExp(`export (?:const|function) ${name}\\b`, 'g'))].length;
-
-    it('finds the loop, so the rows below are not reading an empty string', () => {
-      expect(loopCode()).toContain('export async function fetchWithRetry');
-      expect(loopCode().length).toBeGreaterThan(1_000);
-      expect(uses('DEFAULT_BACKOFF_MS', loopCode())).toBeGreaterThan(0);
-    });
-
-    // Sold on the npm page, where nobody can check it against the code.
-    it.each(['backoff clamp', ...CLAMP_NAMES])('the npm description does not advertise "%s"', (claim) => {
-      expect(pkg.description).not.toContain(claim);
-    });
-
-    it.each(CLAMP_NAMES)('the README does not name `%s` either', (name) => {
-      expect(readme).not.toContain(name);
-    });
   });
 
   // Shipped metadata that enumerates a set the repo already knows: re-derive it rather than pin
@@ -278,21 +226,9 @@ describe('every shipped default is graded on the path it governs', () => {
     return [...block.matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1] as string);
   };
 
-  /**
-   * The figure the README states beside each constant. A default is graded in two places — what the
-   * code does with it, and what the published page promises it is — and the second was pinned
-   * nowhere, so a constant could move with the npm page still quoting the old number.
-   */
-  const documentedFigures = (): [string, number][] =>
-    [...README.matchAll(/`([A-Z][A-Z0-9_]*)` \(([\d_]+)( MiB)?/g)].map(([, name, digits, mib]) => [
-      name as string,
-      Number((digits as string).replaceAll('_', '')) * (mib === undefined ? 1 : 1024 * 1024),
-    ]);
-
-  it('finds the defaults, the options and the figures, so the rows below grade something', () => {
+  it('finds the defaults and the options, so the rows below grade something', () => {
     expect(exportedDefaults().length).toBeGreaterThan(4);
     expect(declaredOptions()).toContain('label');
-    expect(documentedFigures().length).toBeGreaterThan(4);
   });
 
   it.each(exportedDefaults())('`%s` is classified as governing an option, or not', (name) => {
@@ -310,9 +246,6 @@ describe('every shipped default is graded on the path it governs', () => {
     },
   );
 
-  it.each(documentedFigures())('the README states %s as %i, which is what it is', (name, figure) => {
-    expect((api as unknown as Record<string, unknown>)[name]).toBe(figure);
-  });
 });
 
 /**

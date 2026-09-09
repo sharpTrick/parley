@@ -41,7 +41,7 @@ Four bounds are worth knowing before you call it:
   a plugin's own reconnect ladder included — every plugin with one states its own bounds, and none
   of the six wanted the same pair.
 - The one exception is a figure your `retryAfterOf` read out of a **body**: past
-  `MAX_BODY_WAIT_MS` (3_600_000) it is dropped, exactly as an unreadable body is. The header is
+  `MAX_BODY_WAIT_MS` it is dropped, exactly as an unreadable body is. The header is
   RFC 9110's own field and is never bounded, but a body field and its unit are per-vendor, so an
   unbounded one lets a single JSON number state a wait past any `deadlineMs` and **refuse every
   call** the loop makes. Above the ceiling the call does what the header alone says.
@@ -189,11 +189,12 @@ is a fork whatever it is called.
 
 ## Constants
 
-`DEFAULT_BACKOFF_MS` (500), `DEFAULT_MAX_ATTEMPTS` (8),
-`DEFAULT_DEADLINE_MS` (30000), `MAX_ERROR_BODY` (2048), `MAX_RESPONSE_BYTES` (16 MiB — the default
-`maxBodyBytes`), `MAX_BODY_WAIT_MS` (3_600_000 — past which a wait read out of a 429 body is
-dropped rather than adopted), `STOP_POLL_MS` (25 — how often a backoff re-reads `isStopped()`, i.e.
-the longest a disconnect waits on one).
+Every figure below is exported, and the export is where it is written down.
+
+`DEFAULT_BACKOFF_MS`, `DEFAULT_MAX_ATTEMPTS`, `DEFAULT_DEADLINE_MS`, `MAX_ERROR_BODY`,
+`MAX_RESPONSE_BYTES` (the default `maxBodyBytes`), `MAX_BODY_WAIT_MS` (past which a wait read out
+of a 429 body is dropped rather than adopted), `STOP_POLL_MS` (how often a backoff re-reads
+`isStopped()`, i.e. the longest a disconnect waits on one).
 
 ## Why this is not `bridge-core`
 

@@ -8,7 +8,6 @@ import {
 } from '@sharptrick/parley-net-util';
 import {
   captureWaits,
-  documentedFigure,
   loop,
   OPTS,
   rejects,
@@ -61,21 +60,16 @@ describe('fetchWithRetry', () => {
 
   // The attempt cap a caller gets by NOT passing one. Every row around this states its own
   // `maxAttempts`, so the shipped default was a figure nothing here graded — and it decides how many
-  // requests every consuming backend spends against a rate limiter before giving up. The figure is
-  // read off the README rather than off the export, so that MOVING the export is what fails: a row
-  // comparing the constant with itself passes at any value, which is how the default got here.
-  const documentedAttemptCap = (): number =>
-    documentedFigure(/`DEFAULT_MAX_ATTEMPTS` \((\d+)\)/, 'the default attempt cap');
-
-  it('spends the documented default number of attempts when the caller sets no cap', async () => {
+  // requests every consuming backend spends against a rate limiter before giving up. Written as the
+  // literal, so that MOVING `DEFAULT_MAX_ATTEMPTS` is what fails: a row comparing the constant with
+  // itself passes at any value, which is how the default got here ungraded.
+  it('spends eight attempts, the default, when the caller sets no cap', async () => {
     const state = stubForever(() => res(429, '', { 'retry-after': '0.001' }));
     captureWaits();
     let clock = 0;
     const err = await rejects(fetchWithRetry('https://x/y', {}, loop({ now: () => (clock += 1) })));
-    expect(state.calls).toBe(documentedAttemptCap());
-    expect(err.message).toMatch(
-      new RegExp(`still rate limited after ${documentedAttemptCap()} attempts`),
-    );
+    expect(state.calls).toBe(8);
+    expect(err.message).toMatch(/still rate limited after 8 attempts/);
   });
 
   it('gives up on the wall-clock deadline before reaching the attempt cap', async () => {
