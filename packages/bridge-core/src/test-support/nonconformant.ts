@@ -204,3 +204,30 @@ export function memoryReadState(): {
     },
   };
 }
+
+/**
+ * Wrap a plugin so its HISTORY read is coarser than one topic: every page carries the inner
+ * plugin's own messages plus one on each of {@link FOREIGN_TOPIC_KINDS}, with the inner page's
+ * cursor left alone so paging is otherwise identical. A NATS wildcard subject, a Matrix room
+ * carrying several logical topics and Zulip's stream/topic split all read like this.
+ *
+ * Run every pager against BOTH grains: a driver that filters a page to the topic but counts the RAW
+ * page reports progress for messages it warmed nothing from — and on a quiet boot, where the only
+ * traffic is other topics', that is the whole page.
+ */
+export function coarseHistory(inner: BackendPlugin): BackendPlugin {
+  let call = 0;
+  return new Proxy(inner, {
+    get(target, prop, receiver) {
+      if (prop !== 'fetchRecent') return Reflect.get(target, prop, receiver) as unknown;
+      return async (args: FetchRecentArgs): Promise<FetchRecentResult> => {
+        const page = await target.fetchRecent(args);
+        call += 1;
+        const foreign = FOREIGN_TOPIC_KINDS.filter(([, t]) => t !== args.topic).map(([, t], i) =>
+          row(asTopic(t), call * 1_000 + i),
+        );
+        return { ...page, messages: [...page.messages, ...foreign] };
+      };
+    },
+  });
+}

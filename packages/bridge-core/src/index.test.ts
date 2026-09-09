@@ -7,7 +7,7 @@
 //
 // It is a test only — it does not re-export anything from the barrel.
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
@@ -275,15 +275,46 @@ describe('public barrel surface', () => {
 // unexported constant is caught by the same case.
 describe('shipped JSDoc never links a value the barrel withholds', () => {
   const SRC = fileURLToPath(new URL('./', import.meta.url));
+  const PKG = fileURLToPath(new URL('../', import.meta.url));
+
+  /**
+   * What the package SHIPS, taken from its own tsconfig rather than restated. `src/test-support/**`
+   * is excluded from the build and never reaches `dist`, so a fixture there is not a sanctioned
+   * anything: reading the exclusion keeps this scan and the build from disagreeing, instead of
+   * pushing a fixture into a shape chosen to satisfy a scanner.
+   */
+  const NOT_BUILT = (
+    (
+      JSON.parse(readFileSync(join(PKG, 'tsconfig.json'), 'utf8')) as { exclude?: string[] }
+    ).exclude ?? []
+  ).map(
+    (glob) =>
+      new RegExp(
+        `^${glob
+          .replace(/[.]/g, '\\.')
+          .replace(/\*\*\/\*|\*\*|\*/g, (star) => (star === '*' ? '[^/]*' : '.*'))}$`,
+      ),
+  );
 
   function sources(dir: string, out: string[] = []): string[] {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) sources(full, out);
-      else if (extname(full) === '.ts' && !full.endsWith('.test.ts')) out.push(full);
+      else if (extname(full) === '.ts' && !NOT_BUILT.some((re) => re.test(relative(PKG, full))))
+        out.push(full);
     }
     return out;
   }
+
+  it('scans exactly the files the build compiles', () => {
+    expect(NOT_BUILT.length, 'the tsconfig exclusions were not read, so this scan covers everything').toBeGreaterThan(0);
+    const scanned = sources(SRC).map((f) => relative(PKG, f));
+    expect(scanned).toContain('src/transport/tools.ts');
+    expect(
+      scanned.filter((f) => f.startsWith('src/test-support/') || f.endsWith('.test.ts')),
+      'a file the build excludes was scanned as shipped surface',
+    ).toEqual([]);
+  });
 
   const EXPORT_DECL =
     /^export\s+(?:declare\s+)?(?:abstract\s+)?(?:const|let|function|async function|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/;

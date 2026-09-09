@@ -7,6 +7,7 @@ import { NoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
 import { FakePlugin } from '../test-support/fake-plugin.js';
 import {
+  coarseHistory,
   memoryReadState,
   NONCONFORMANT_SHAPE_NAMES,
   NONCONFORMANT_SHAPES,
@@ -29,6 +30,19 @@ async function rejectionOf(p: Promise<unknown>): Promise<Error> {
 }
 const T = asTopic('ctx');
 const me = asHandle('alice');
+
+/**
+ * The two shapes a backend's HISTORY read comes in. `coarse` is not a nonconformance: a wildcard
+ * subject, a room carrying several logical topics and a stream/topic split all hand back other
+ * topics' messages, and CATCH_UP_TERMINAL_CONDITION is written about exactly those backends. Every
+ * table that drives the pager runs against both, so a rule that holds on one grain cannot be walked
+ * around on the other.
+ */
+const HISTORY_GRAINS = {
+  'exact-topic': (p: BackendPlugin) => p,
+  coarse: coarseHistory,
+};
+const HISTORY_GRAIN_NAMES = Object.keys(HISTORY_GRAINS) as Array<keyof typeof HISTORY_GRAINS>;
 
 async function seeded(n: number, prefix = 'm') {
   const p = new FakePlugin();
@@ -304,7 +318,7 @@ describe('catch-up driver', () => {
    * place the clause was visible.
    */
   describe('drained window depends on stored-cursor × page-size', () => {
-    it.each([
+    const WINDOWS = [
       // stored cursor | total | limit | drained
       [undefined, 2, 3, 2],
       [undefined, 3, 3, 3],
@@ -314,20 +328,37 @@ describe('catch-up driver', () => {
       ['0', 3, 3, 3],
       ['0', 10, 3, 10], // resumed catch-up pages to exhaustion
       ['5', 10, 3, 5],
-    ])(
-      'stored=%s total=%i limit=%i drains %i and leaves the position at stored',
-      async (stored, total, limit, drained) => {
+    ] as const;
+
+    it.each(
+      HISTORY_GRAIN_NAMES.flatMap((grain) =>
+        WINDOWS.map(([stored, total, limit, drained]) => [grain, stored, total, limit, drained] as const),
+      ),
+    )(
+      '%s history: stored=%s total=%i limit=%i drains %i and leaves the position at stored',
+      async (grain, stored, total, limit, drained) => {
         const readState = new ReadStateStore(rsPath());
         if (stored !== undefined) readState.set(T, asCursor(stored));
+        const seen = new SeenSet();
         const n = await catchUpTopic({
-          plugin: await seeded(total),
+          plugin: HISTORY_GRAINS[grain](await seeded(total)),
           topic: T,
           limit,
           readState,
-          seen: new SeenSet(),
+          seen,
         });
-        expect(n).toBe(drained);
+        expect(
+          n,
+          'the drain count counted messages on OTHER topics. It is the number this instance ' +
+            'reports as its own progress, and it is what decides whether the boundary page runs — ' +
+            'so foreign traffic in a page makes a boot that drained nothing look busy',
+        ).toBe(drained);
         expect(readState.get(T)).toBe(stored);
+        expect(
+          seen.has(T, asBackendMsgId(String(total))),
+          "the boot ended with the topic's live-boundary id missing from the dedup set, so the " +
+            'push loop it is about to start will re-emit it',
+        ).toBe(true);
       },
     );
   });
@@ -421,9 +452,11 @@ describe('catch-up driver', () => {
    */
   describe('a second boot costs round trips for what arrived, not for the backlog', () => {
     const LIMIT = 10;
-    const CELLS = (['cold', 'resumed'] as const).flatMap((start) =>
-      [0, LIMIT - 1, LIMIT, 5 * LIMIT, SEEN_MAX_PER_TOPIC + 1].map(
-        (backlog) => [start, backlog] as const,
+    const CELLS = HISTORY_GRAIN_NAMES.flatMap((grain) =>
+      (['cold', 'resumed'] as const).flatMap((start) =>
+        [0, LIMIT - 1, LIMIT, 5 * LIMIT, SEEN_MAX_PER_TOPIC + 1].map(
+          (backlog) => [grain, start, backlog] as const,
+        ),
       ),
     );
 
@@ -448,10 +481,10 @@ describe('catch-up driver', () => {
     const boot = (path: string, plugin: BackendPlugin, seen: SeenSet): Promise<number> =>
       catchUpAll({ plugin, topics: [T], limit: LIMIT, readState: new ReadStateStore(path), seen });
 
-    it.each(CELLS)('%s start over a %i message backlog', async (start, backlog) => {
+    it.each(CELLS)('%s history, %s start over a %i message backlog', async (grain, start, backlog) => {
       const path = rsPath();
       if (start === 'resumed') new ReadStateStore(path).set(T, asCursor('0'));
-      const counter = counting(await seeded(backlog));
+      const counter = counting(HISTORY_GRAINS[grain](await seeded(backlog)));
 
       await boot(path, counter.plugin, new SeenSet());
       const first = counter.calls();

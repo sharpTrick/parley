@@ -54,7 +54,8 @@ export const MAX_CATCHUP_PAGES = 10_000;
  * already paged over, so keeping the backlog reachable does not also mean re-reading it every boot.
  * Core loops this once per configured topic (§7).
  *
- * @returns the number of messages drained.
+ * @returns how many messages ON THIS TOPIC it drained. A history read coarser than one topic
+ * hands back other topics' messages, and those are not this instance's to report or to warm.
  */
 export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   const { plugin, topic, limit, readState, seen } = args;
@@ -67,8 +68,13 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
 
   // Only this topic's ids: a coarser-than-topic history read hands back foreign messages, and
   // recording their ids here would suppress a later live push on THIS topic that collides with one.
-  const warmFrom = (messages: readonly Message[]): void => {
-    for (const m of messages) if (m.topic === topic) seen.markSeen(topic, m.backendMsgId);
+  //
+  // Keep the filter and the count in this ONE place, so that a page of purely foreign messages
+  // cannot warm nothing and still report progress.
+  const warmFrom = (messages: readonly Message[]): number => {
+    const own = messages.filter((m) => m.topic === topic);
+    for (const m of own) seen.markSeen(topic, m.backendMsgId);
+    return own.length;
   };
 
   /**
@@ -104,8 +110,7 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
     // Screened exactly as `ReadStateStore.set` screens one: a plugin that hands back no usable
     // cursor must leave the marker where it was rather than take the whole catch-up down.
     if (typeof nextCursor === 'string' && nextCursor.length > 0) warmedTo = nextCursor;
-    warmFrom(messages);
-    total += messages.length;
+    total += warmFrom(messages);
 
     // Keep EMPTY — not "shorter than the requested limit" — as the exhaustion test, so that a
     // backend whose history API caps a page below `limit` (Discord's 100, Telegram, Matrix
