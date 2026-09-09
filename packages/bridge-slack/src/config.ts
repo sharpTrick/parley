@@ -4,11 +4,11 @@ import {
   type BackendConfigKeys,
   MAX_TIMER_MS,
 } from '@sharptrick/parley-core';
-
-export { MAX_TIMER_MS };
 import { describeConfigValue, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
+
+export { MAX_TIMER_MS };
 
 export const DEFAULT_API_URL = 'https://slack.com/api';
 
