@@ -52,7 +52,7 @@ export class XmppArchive extends XmppConnection {
    * has already read. Keep the strict-advance check for the reason {@link exclusiveMam} has one.
    */
   private async lastPageMam(topic: Topic, limit: number): Promise<ReadWindow> {
-    const items: wire.BodiedItem[] = [];
+    let items: wire.BodiedItem[] = [];
     let before: string | undefined;
     let tail: string | undefined;
     while (items.length < limit) {
@@ -62,7 +62,7 @@ export class XmppArchive extends XmppConnection {
         max: Math.min(this.mamPage, limit - items.length),
       });
       tail ??= page.items.at(-1)?.archId;
-      items.unshift(...page.items.filter(wire.hasBody));
+      items = page.items.filter(wire.hasBody).concat(items);
       const head = page.items[0]?.archId;
       if (page.complete || head === undefined) break;
       if (head === before) {
@@ -99,7 +99,7 @@ export class XmppArchive extends XmppConnection {
         after: cursor,
         max: Math.min(this.mamPage, limit - items.length),
       });
-      items.push(...page.items.filter(wire.hasBody));
+      for (const item of page.items) if (wire.hasBody(item)) items.push(item);
       const pageTail = page.items.at(-1)?.archId;
       if (pageTail !== undefined) tail = pageTail;
       if (page.complete || pageTail === undefined) break;
