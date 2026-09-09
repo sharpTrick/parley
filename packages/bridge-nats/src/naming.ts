@@ -2,6 +2,21 @@ import { safeName, type Topic } from '@sharptrick/parley-core';
 
 export const MAX_STREAM_NAME_BYTES = 255; // JetStream's own cap on a stream name
 
+/**
+ * nats-server's default `max_control_line`. It bounds the WHOLE protocol line — `PUB <subject>
+ * <reply> <bytes>\r\n` — not the subject alone, and a line over it is answered by closing the
+ * connection, which surfaces to a caller as a bare TIMEOUT naming neither the subject nor the
+ * prefix that composed it.
+ */
+export const MAX_CONTROL_LINE_BYTES = 4096;
+
+/**
+ * What a composed subject may weigh. Half the control line, so that the verb, a reply inbox and the
+ * payload length still fit whatever the request shape: a subject a `post` cannot spell is a
+ * connect-time configuration error, not a per-message failure.
+ */
+export const MAX_SUBJECT_BYTES = MAX_CONTROL_LINE_BYTES / 2;
+
 // Subject tokens may not contain `.`, `*`, `>`, whitespace or a control character; stream names
 // also bar `/ \`. Keep the control range folded here as well as rejected in `validatePrefix`, so
 // that a topic — which a caller names through `post_topics`, unlike a prefix an operator writes —

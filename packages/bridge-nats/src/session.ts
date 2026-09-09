@@ -12,7 +12,7 @@ import {
   validateRetentionMaxAgeNs,
 } from './config.js';
 import { DRAIN_TIMEOUT_MS, type Closeable } from './jetstream.js';
-import { MAX_STREAM_NAME_BYTES } from './naming.js';
+import { MAX_STREAM_NAME_BYTES, MAX_SUBJECT_BYTES } from './naming.js';
 
 /** The link, the addressing it was opened with, and everything `disconnect()` has to give back. */
 export abstract class NatsSession {
@@ -39,7 +39,7 @@ export abstract class NatsSession {
     }
     assertKnownBackendConfig(config);
     const cfg = config as NatsBackendConfig;
-    const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/);
+    const subjectPrefix = validatePrefix('subject_prefix', cfg.subject_prefix, 'parley.', /[*>\s]/, MAX_SUBJECT_BYTES);
     const streamPrefix = validatePrefix('stream_prefix', cfg.stream_prefix, 'PARLEY_', /[.*>/\\\s]/, MAX_STREAM_NAME_BYTES);
     const retentionMaxAgeNs = validateRetentionMaxAgeNs(cfg.retention_days);
     assertNoServerCredentials(cfg);

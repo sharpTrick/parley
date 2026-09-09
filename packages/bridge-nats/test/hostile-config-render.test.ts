@@ -1,10 +1,10 @@
 import { boxedSecret, expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
-import { MAX_STREAM_NAME_BYTES } from '../src/naming.js';
+import { MAX_STREAM_NAME_BYTES, MAX_SUBJECT_BYTES } from '../src/naming.js';
 import { DECLARED, validatePrefix, validateRetentionMaxAgeNs } from '../src/config.js';
 
 const VALIDATORS: Record<string, (value: unknown) => void> = {
   subject_prefix: (value) =>
-    void validatePrefix('subject_prefix', value as string, 'parley.', /[*>\s]/),
+    void validatePrefix('subject_prefix', value as string, 'parley.', /[*>\s]/, MAX_SUBJECT_BYTES),
   stream_prefix: (value) =>
     void validatePrefix(
       'stream_prefix',
@@ -33,11 +33,7 @@ expectLabelledRefusal('nats', {
     nkey_seed: 'spent as a credential and never rendered: nothing about it is refused on shape',
   },
   accepts: {
-    subject_prefix: [
-      'a RIGHT-TO-LEFT OVERRIDE (U+202E)',
-      '4KiB of one character',
-      '4KiB carrying a bidi override',
-    ],
+    subject_prefix: ['a RIGHT-TO-LEFT OVERRIDE (U+202E)'],
     stream_prefix: ['a RIGHT-TO-LEFT OVERRIDE (U+202E)'],
   },
   credentialKeys: { subject_prefix: boxedSecret(), stream_prefix: boxedSecret() },
