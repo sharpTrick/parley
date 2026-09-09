@@ -73,6 +73,15 @@ export const TOOL_TEXT = {
     'instance last read, so nothing you missed is skipped. "recent" asks for the backend\'s newest ' +
     'page instead, and does NOT move where this session resumes from — the backlog stays reachable ' +
     'by a later "position" read. Ignored when you pass `since`, which names its own start.',
+  /**
+   * Appended to {@link TOOL_TEXT.fetch_recent_from} by a bridge that keeps NO read position — the
+   * remote HTTP root, which is stateless by design. `fetch_recent` hedges its since-less clause for
+   * exactly this deployment; `fetch_recent_from` states the same claim unconditionally, and without
+   * this it advertises a control that half of cannot mean what it says.
+   */
+  fetch_recent_from_stateless:
+    ' THIS bridge keeps no read position, so both values read the backend’s newest page: ' +
+    'nothing here resumes from anywhere, and there is no backlog for a "position" read to return to.',
   fetch_recent_since:
     'Opaque cursor; return only messages strictly after it. Omit to resume from where this ' +
     'instance last read, or — if it keeps no read position, or has never read this topic — from ' +
@@ -138,7 +147,13 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       .nonnegative()
       .optional()
       .describe(TOOL_TEXT.fetch_recent_block_ms),
-    from: z.enum(['position', 'recent']).optional().describe(TOOL_TEXT.fetch_recent_from),
+    from: z
+      .enum(['position', 'recent'])
+      .optional()
+      .describe(
+        TOOL_TEXT.fetch_recent_from +
+          (deps.readState === undefined ? TOOL_TEXT.fetch_recent_from_stateless : ''),
+      ),
   };
 
   server.registerTool(

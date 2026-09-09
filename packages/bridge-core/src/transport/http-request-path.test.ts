@@ -91,6 +91,93 @@ describe('remote HTTP transport (reactive, unauthenticated)', () => {
     }
   });
 
+  /**
+   * A CONTROL this door advertises must mean here what its description says. `from` is the worked
+   * example: the schema accepted it, `TOOL_TEXT.fetch_recent_from` stated unconditionally that
+   * "position" resumes from where this instance last read, and on a door with no read position
+   * both values returned the same page. `TOOL_TEXT.fetch_recent` hedges that clause for exactly
+   * this deployment; the argument did not.
+   *
+   * Graded per ARGUMENT rather than for `from` alone, and by DRIVING each one: an argument whose
+   * value changes nothing here has to say so, or not be advertised. Comparing the two doors' tool
+   * lists — which is all anything did — cannot see this, because the lists are identical.
+   */
+  describe('every advertised fetch_recent argument means what it says on THIS door', () => {
+    /**
+     * Two argument sets per row that a door HONOURING the argument must answer differently — in the
+     * page it returns, or in how long it takes to return it, which is the only difference
+     * `block_ms` makes.
+     */
+    const CONTRASTS: Record<
+      string,
+      (head: string) => [Record<string, unknown>, Record<string, unknown>]
+    > = {
+      since: () => [{}, { since: '3' }],
+      limit: () => [{ limit: 2 }, { limit: 4 }],
+      from: () => [{ from: 'position' }, { from: 'recent' }],
+      block_ms: (head) => [
+        { since: head, block_ms: 0 },
+        { since: head, block_ms: 400 },
+      ],
+    };
+    const PARKED_MS = 150;
+
+    const advertised = async (): Promise<Record<string, { description?: string }>> => {
+      const { tools } = await client.listTools();
+      const fetchRecent = tools.find((t) => t.name === 'parley_fetch_recent')!;
+      const properties = (fetchRecent.inputSchema as { properties?: Record<string, { description?: string }> })
+        .properties;
+      return properties ?? {};
+    };
+
+    it('covers every optional argument the door advertises', async () => {
+      const optional = Object.keys(await advertised()).filter((name) => name !== 'topic');
+      expect(
+        optional.filter((name) => !(name in CONTRASTS)),
+        'an argument reached the advertised schema with no row here, so nothing asks whether it ' +
+          'means anything on a door that keeps no read position',
+      ).toEqual([]);
+      expect(optional.length).toBeGreaterThan(2);
+    });
+
+    it.each(Object.keys(CONTRASTS))('%s', async (name) => {
+      for (let i = 0; i < 12; i++) {
+        await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: `n${i}` } });
+      }
+      /** What the caller can observe: the page, and whether the call parked. */
+      const answer = async (extra: Record<string, unknown>): Promise<string> => {
+        const started = Date.now();
+        const out = parse(
+          await client.callTool({
+            name: 'parley_fetch_recent',
+            arguments: { topic: 'ctx', limit: 4, ...extra },
+          }),
+        ) as { messages: Array<{ content: string }>; nextCursor?: string };
+        return JSON.stringify([
+          out.messages.map((m) => m.content),
+          Date.now() - started > PARKED_MS,
+        ]);
+      };
+      const head = (
+        parse(
+          await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx', limit: 1 } }),
+        ) as { nextCursor?: string }
+      ).nextCursor!;
+
+      const [a, b] = CONTRASTS[name]!(head);
+      const honoured = (await answer(a)) !== (await answer(b));
+      if (honoured) return;
+
+      const description = (await advertised())[name]?.description ?? '';
+      expect(
+        description,
+        `${name} changes nothing on this door, and its description does not say so. A control the ` +
+          'schema ACCEPTS and the deployment IGNORES is worse than one it refuses: the model is ' +
+          'told it steered something',
+      ).toContain('THIS bridge keeps no read position');
+    });
+  });
+
   it('is reactive-only — does NOT advertise the claude/channel capability', () => {
     const caps = client.getServerCapabilities();
     expect(caps?.experimental?.['claude/channel']).toBeUndefined();
