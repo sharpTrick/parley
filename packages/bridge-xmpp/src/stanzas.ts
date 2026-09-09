@@ -96,7 +96,7 @@ export const assertXmlSafe = (value: string, what: string): void => {
   const cp = xmlIllegalCodepoint(value);
   if (cp !== undefined) {
     throw new Error(
-      `${what} contains ${codepointLabel(cp)}, which XML forbids — ` +
+      `parley-xmpp: ${what} contains ${codepointLabel(cp)}, which XML forbids — ` +
         'refusing to send it (the server would abort the stream and every MUC room this ' +
         'connection occupies with it)',
     );

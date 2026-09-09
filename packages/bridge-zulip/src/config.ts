@@ -120,25 +120,25 @@ function requireHttpUrl(raw: unknown): string {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(
-      `backend_config.site_url must be an absolute http(s) URL (got ${describeShape(raw)})`,
+      `parley-zulip: backend_config.site_url must be an absolute http(s) URL (got ${describeShape(raw)})`,
     );
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(
-      `backend_config.site_url must use http: or https: (got ${describeShape(raw)} carrying ` +
+      `parley-zulip: backend_config.site_url must use http: or https: (got ${describeShape(raw)} carrying ` +
         'some other scheme)',
     );
   }
   if (parsed.username !== '' || parsed.password !== '') {
     throw new Error(
-      'backend_config.site_url must not carry a username or password: Zulip authenticates from ' +
+      'parley-zulip: backend_config.site_url must not carry a username or password: Zulip authenticates from ' +
         'backend_config.email/api_key, and a credential in the URL is disclosed by every ' +
         'diagnostic that names the site. Remove the userinfo from site_url.',
     );
   }
   if (parsed.search !== '' || parsed.hash !== '') {
     throw new Error(
-      'backend_config.site_url must be a bare base URL: a query or fragment is appended to every ' +
+      'parley-zulip: backend_config.site_url must be a bare base URL: a query or fragment is appended to every ' +
         'request path and can hide a credential in a key hygiene treats as non-secret.',
     );
   }
@@ -158,7 +158,7 @@ function requireHttpUrl(raw: unknown): string {
 function requireNonEmpty(key: string, value: unknown, secret = false): string {
   if (typeof value !== 'string' || value.trim() === '') {
     const got = secret ? describeShape(value) : describeRejected(value, 'string');
-    throw new Error(`backend_config.${key} must be a non-empty string (got ${got})`);
+    throw new Error(`parley-zulip: backend_config.${key} must be a non-empty string (got ${got})`);
   }
   return value;
 }
@@ -194,7 +194,7 @@ function requireStreamName(value: unknown): string {
   const target = streamIndicatorTarget(stream);
   if (target !== undefined) {
     throw new Error(
-      'backend_config.stream must be a plain stream name: Zulip decodes the send target as a ' +
+      'parley-zulip: backend_config.stream must be a plain stream name: Zulip decodes the send target as a ' +
         `stream indicator, so this one would address ${target} on every write while every read ` +
         'narrows on the literal name. Rename the stream.',
     );
@@ -228,7 +228,7 @@ function requireEventsTimeout(value: unknown): number {
   if (value === undefined) return DEFAULT_EVENTS_TIMEOUT_MS;
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new Error(
-      'backend_config.events_timeout_ms must be a positive, finite number of milliseconds ' +
+      'parley-zulip: backend_config.events_timeout_ms must be a positive, finite number of milliseconds ' +
         `(got ${describeRejected(value, 'number')})`,
     );
   }

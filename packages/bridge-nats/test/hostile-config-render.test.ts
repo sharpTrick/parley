@@ -17,7 +17,7 @@ const VALIDATORS: Record<string, (value: unknown) => void> = {
 };
 
 expectLabelledRefusal('nats', {
-  label: (key) => new RegExp(`^invalid ${key} `),
+  label: (key) => new RegExp(`^parley-nats: invalid ${key} `),
   keys: Object.keys(VALIDATORS),
   declared: DECLARED.keys,
   ungraded: {

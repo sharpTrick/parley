@@ -49,7 +49,7 @@ describe.each(NAMES)('$field is bounded by what the server will name', ({ field,
   it('refuses a prefix that composes one byte over it', () => {
     expect(() => {
       check(prefixOf(ceiling + 1));
-    }).toThrow(new RegExp(`^invalid ${field} `));
+    }).toThrow(new RegExp(`^parley-nats: invalid ${field} `));
   });
 
   it('refuses it at connect, before anything is dialled', async () => {
@@ -58,6 +58,6 @@ describe.each(NAMES)('$field is bounded by what the server will name', ({ field,
         servers: 'nats://127.0.0.1:4222',
         [field]: prefixOf(ceiling + 1),
       }),
-    ).rejects.toThrow(new RegExp(`^invalid ${field} `));
+    ).rejects.toThrow(new RegExp(`^parley-nats: invalid ${field} `));
   });
 });

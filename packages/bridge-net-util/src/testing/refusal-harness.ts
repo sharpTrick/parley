@@ -123,6 +123,21 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
       ).toEqual([]);
     });
 
+    /**
+     * A refusal an operator reads out of a merged log, or a model reads out of a seam error, has to
+     * say WHICH plugin refused. This block is titled for that property and its regex was the only
+     * thing asserting it — so a spec whose pattern names no plugin (nats's `^invalid <key> ` was
+     * exactly that) turned the whole block into a check of the message's first word.
+     */
+    it('labels every refusal with the plugin it came from', () => {
+      const unlabelled = graded.filter((key) => !new RegExp(plugin, 'i').test(spec.label(key).source));
+      expect(
+        unlabelled,
+        `this label pattern would match a message that names no plugin at all, so "${plugin} ` +
+          'refuses ... under its own label" grades something else',
+      ).toEqual([]);
+    });
+
     it('states no reason for a key it does grade, or does not declare', () => {
       const stale = Object.keys(spec.ungraded ?? {}).filter(
         (k) => graded.includes(k) || (declared !== 'not backend_config' && !declared.includes(k)),

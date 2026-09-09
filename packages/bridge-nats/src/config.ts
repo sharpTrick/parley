@@ -114,24 +114,24 @@ export function validatePrefix(
 ): string {
   if (value === undefined) return fallback;
   if (typeof value !== 'string') {
-    throw new Error(`invalid ${field} ${describeConfigValue(field, value)} — expected a string`);
+    throw new Error(`parley-nats: invalid ${field} ${describeConfigValue(field, value)} — expected a string`);
   }
   const offender = (illegal.exec(value) ?? CONTROL_CHARS.exec(value))?.[0];
   if (offender !== undefined) {
     throw new Error(
-      `invalid ${field} ${describeConfigValue(field, value)} — ${describeConfigValue(field, offender)} is not allowed in a NATS name`,
+      `parley-nats: invalid ${field} ${describeConfigValue(field, value)} — ${describeConfigValue(field, offender)} is not allowed in a NATS name`,
     );
   }
   const composed = value + PROBE_TOKEN;
   if (composed.split('.').some((token) => token === '')) {
     throw new Error(
-      `invalid ${field} composes the illegal name ${describeConfigValue(field, composed)}: no dot-separated token of a NATS name may be empty`,
+      `parley-nats: invalid ${field} composes the illegal name ${describeConfigValue(field, composed)}: no dot-separated token of a NATS name may be empty`,
     );
   }
   const bytes = Buffer.byteLength(composed, 'utf8');
   if (maxComposedBytes !== undefined && bytes > maxComposedBytes) {
     throw new Error(
-      `invalid ${field} ${describeConfigValue(field, value)} — with a topic token it composes ${bytes} bytes, over the ${maxComposedBytes}-byte limit, so no topic could be named at all`,
+      `parley-nats: invalid ${field} ${describeConfigValue(field, value)} — with a topic token it composes ${bytes} bytes, over the ${maxComposedBytes}-byte limit, so no topic could be named at all`,
     );
   }
   return value;
@@ -162,7 +162,7 @@ const MAX_AGE_NS_LIMIT = 2 ** 63;
  * sides, so that neither a positive number of days too small to round to one nanosecond nor one
  * large enough to leave int64 can slip past into a stream whose retention is then locked in at
  * creation. Over int64 the two failures differ but neither is survivable: up to the double's own
- * range the server refuses the stream with `invalid json` on every post, and past it the composed
+ * range the server refuses the stream with `parley-nats: invalid json` on every post, and past it the composed
  * value is `Infinity`, which serializes to `null` and which the server stores as `max_age: 0` —
  * unlimited, silently, exactly what the low guard exists to prevent.
  */
@@ -170,18 +170,18 @@ export function validateRetentionMaxAgeNs(days: number | null | undefined): numb
   if (days === undefined || days === null) return undefined;
   if (typeof days !== 'number' || !Number.isFinite(days) || days < MIN_RETENTION_DAYS) {
     throw new Error(
-      `invalid retention_days ${describeConfigValue('retention_days', days)} — expected a number of days no smaller than ${MIN_RETENTION_DAYS} (one minute), or omit it (or set it to null) for unlimited retention`,
+      `parley-nats: invalid retention_days ${describeConfigValue('retention_days', days)} — expected a number of days no smaller than ${MIN_RETENTION_DAYS} (one minute), or omit it (or set it to null) for unlimited retention`,
     );
   }
   const maxAgeNs = Math.round(days * NS_PER_DAY);
   if (maxAgeNs < 1) {
     throw new Error(
-      `invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
+      `parley-nats: invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
     );
   }
   if (maxAgeNs >= MAX_AGE_NS_LIMIT) {
     throw new Error(
-      `invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, past the 2^63-1 nanoseconds JetStream's int64 can hold, so the stream would either be refused on every post or be created with UNLIMITED retention`,
+      `parley-nats: invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, past the 2^63-1 nanoseconds JetStream's int64 can hold, so the stream would either be refused on every post or be created with UNLIMITED retention`,
     );
   }
   return maxAgeNs;
