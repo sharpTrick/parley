@@ -54,5 +54,8 @@
   },
   "peerDependencies": {
     "vitest": "^2"
+  },
+  "devDependencies": {
+    "@sharptrick/parley-net-util": "^0.1.0"
   }
 }
