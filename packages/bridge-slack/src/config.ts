@@ -6,7 +6,7 @@ import {
 } from '@sharptrick/parley-core';
 
 export { MAX_TIMER_MS };
-import { isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -109,7 +109,7 @@ function requireUsableMap(
 ): Record<string, string> {
   if (typeof map !== 'object' || map === null || Array.isArray(map)) {
     throw new Error(
-      `Slack backend_config.${configKey} = ${JSON.stringify(map) ?? String(map)} is not accepted: ` +
+      `Slack backend_config.${configKey} = ${describeConfigValue(configKey, map)} is not accepted: ` +
         `expected an object mapping each key to ${what}`,
     );
   }
@@ -120,13 +120,13 @@ function requireUsableMap(
   for (const [key, value] of Object.entries(map)) {
     if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
-        `Slack ${configKey} maps ${JSON.stringify(key)} to ${JSON.stringify(value)}, ` +
+        `Slack ${configKey} maps ${JSON.stringify(key)} to ${describeConfigValue(configKey, value)}, ` +
           `which is not ${what}`,
       );
     }
     if (grammar !== undefined && !grammar.accepts(value)) {
       throw new Error(
-        `Slack ${configKey} maps ${JSON.stringify(key)} to ${JSON.stringify(value)}, ` +
+        `Slack ${configKey} maps ${JSON.stringify(key)} to ${describeConfigValue(configKey, value)}, ` +
           `which is not ${what}: ${grammar.requirement}`,
       );
     }
@@ -183,7 +183,7 @@ export function requireUsableSocketUrl(apiUrl: string, url: unknown): string {
  * {@link SlackBackendConfig} without being listed here is a compile error rather than a key
  * `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     bot_token: 0,
     app_token: 0,
@@ -207,8 +207,7 @@ function validateConfig(cfg: SlackBackendConfig): void {
   const reject = (key: keyof SlackBackendConfig, expected: string): never => {
     const raw = cfg[key];
     throw new Error(
-      `Slack backend_config.${key} = ` +
-        `${typeof raw === 'string' ? JSON.stringify(raw) : String(raw)} is not accepted: ` +
+      `Slack backend_config.${key} = ${describeConfigValue(key, raw)} is not accepted: ` +
         `expected ${expected}`,
     );
   };

@@ -83,4 +83,15 @@ export const WRAPPING_A_SECRET: readonly (readonly [string, unknown])[] = [
   ['an array', [PLANTED_SECRET]],
   ['a nested object', { outer: { inner: [PLANTED_SECRET] } }],
   ['a null-prototype object', Object.assign(Object.create(null) as object, { v: PLANTED_SECRET })],
+  ['a value whose toString yields it', { toString: () => PLANTED_SECRET }],
+  ['a boxed String', new String(PLANTED_SECRET)],
+  ['a value with a Symbol.toPrimitive', { [Symbol.toPrimitive]: () => PLANTED_SECRET }],
 ];
+
+/**
+ * A value whose own TEXT is {@link PLANTED_SECRET} while its type is not `string`. Every backend
+ * refuses it — each of these keys reads `expected a non-empty string` — and a renderer spelled
+ * `typeof raw === 'string' ? JSON.stringify(raw) : String(raw)` prints it in full, which is the
+ * shape three plugins shipped past a ratchet that only asked the five it had already fixed.
+ */
+export const boxedSecret = (): unknown => new String(PLANTED_SECRET);

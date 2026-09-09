@@ -5,6 +5,7 @@
  * only by whoever imports this subpath.
  */
 export {
+  boxedSecret,
   FORBIDDEN_IN_RENDER,
   NEVER_RENDERABLE,
   PLANTED_SECRET,

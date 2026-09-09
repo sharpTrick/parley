@@ -1,5 +1,10 @@
 import { assertKnownConfigKeys, type BackendConfigKeys, MAX_TIMER_MS } from '@sharptrick/parley-core';
-import { DEFAULT_DEADLINE_MS, isHttpUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import {
+  DEFAULT_DEADLINE_MS,
+  describeConfigValue,
+  isHttpUrl,
+  plaintextRemoteOrigin,
+} from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
 import { TOPIC_KEY } from './wire.js';
 
@@ -84,7 +89,7 @@ export const syncDeadlineMs = (timeoutMs: number): number => timeoutMs + DEFAULT
  * {@link MatrixBackendConfig} without being listed here is a compile error rather than a key
  * `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     homeserver_url: 0,
     user: 0,
@@ -108,8 +113,7 @@ export function validateConfig(cfg: MatrixBackendConfig): void {
   const reject = (key: keyof MatrixBackendConfig, expected: string, why = ''): never => {
     const raw = cfg[key];
     throw new Error(
-      `[parley-matrix] backend_config.${key} = ` +
-        `${typeof raw === 'string' ? JSON.stringify(raw) : String(raw)} is not accepted: ` +
+      `[parley-matrix] backend_config.${key} = ${describeConfigValue(key, raw)} is not accepted: ` +
         `expected ${expected}.${why}`,
     );
   };

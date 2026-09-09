@@ -81,7 +81,7 @@ function orDefault<T>(value: T | undefined, fallback: T): T | undefined {
  * Every key {@link ZulipBackendConfig} declares. Keep the `satisfies` on it, so that a key added to
  * the interface without being listed here is a compile error rather than a key `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     site_url: 0,
     email: 0,

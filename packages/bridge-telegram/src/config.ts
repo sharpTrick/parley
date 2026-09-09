@@ -49,7 +49,7 @@ export interface TelegramBackendConfig {
  * {@link TelegramBackendConfig} without being listed here is a compile error rather than a key
  * `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     token: 0,
     api_url: 0,

@@ -15,22 +15,67 @@ export interface RefusalSpec {
   label: (key: string) => RegExp;
   /** Every key the validator grades. */
   keys: readonly string[];
-  /** Keys whose value is, or can carry, a credential — never rendered by value, whatever its type. */
-  credentialKeys?: readonly string[];
+  /**
+   * Keys whose value is a MAP of caller-chosen entries. The hostile value is nested one level in,
+   * which is where the map's own per-entry refusal renders it — the container check never sees it.
+   */
+  mapKeys?: readonly string[];
+  /**
+   * Every key this plugin's `backend_config` declares, taken from the plugin's own
+   * `satisfies Record<keyof Required<…>>` list, so the surface graded cannot drift from the surface
+   * shipped. `'not backend_config'` for a spec grading another untrusted-value surface — a cursor,
+   * a page size — which has no such list.
+   */
+  declared: readonly string[] | 'not backend_config';
+  /** Declared keys this validator deliberately does not grade, each with the reason it does not. */
+  ungraded?: Readonly<Record<string, string>>;
+  /**
+   * Corpus rows a key legitimately ACCEPTS, by row label, because the row's shape IS that key's
+   * declared shape — matrix's `invite` is an array of MXID strings, so the array row is a valid
+   * value rather than an unrendered one. Each named row is asserted to be accepted, so an exemption
+   * that stops being true reddens instead of quietly excusing a refusal that went missing.
+   */
+  accepts?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Keys whose value is, or can carry, a credential — each with a value carrying
+   * {@link PLANTED_SECRET} that THIS backend refuses. A key the backend accepts every string for
+   * has no refusal to grade, and naming one bought nothing until the harness began requiring the
+   * refusal to have happened.
+   */
+  credentialKeys?: Readonly<Record<string, unknown>>;
   /** Keys a hostile STRING is refused under: the only path caller-authored text takes into a refusal. */
   textKeys?: readonly string[];
   /** Hand the validator one key/value pair. It is expected to throw. */
   validate: (key: string, value: unknown) => void;
 }
 
-const raisedBy = (spec: RefusalSpec, key: string, value: unknown): string => {
+type Refusal = { threw: true; message: string } | { threw: false };
+
+const refusalOf = (spec: RefusalSpec, key: string, value: unknown): Refusal => {
   try {
     spec.validate(key, value);
   } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+    return { threw: true, message: err instanceof Error ? err.message : String(err) };
   }
-  return '';
+  return { threw: false };
 };
+
+/**
+ * The message a backend refused `key = value` with. Every assertion below reads one through HERE,
+ * so that no block can grade a validator that never threw: `expect('').not.toContain(secret)` holds
+ * for every secret there is, and that is what the credential block asserted for the two backends
+ * whose validator accepts a bare credential string under the key it was handed.
+ */
+export function expectRefusalMessage(spec: RefusalSpec, key: string, value: unknown): string {
+  const refusal = refusalOf(spec, key, value);
+  expect(
+    refusal.threw,
+    `${key} was ACCEPTED — there is no refusal here, so this row grades nothing`,
+  ).toBe(true);
+  const message = refusal.threw ? refusal.message : '';
+  expect(message, `${key} was refused with an empty message, which grades nothing`).not.toBe('');
+  return message;
+}
 
 /**
  * CLASS: a `backend_config` value is refused on SHAPE, but only after the refusal has tried to
@@ -48,10 +93,57 @@ const raisedBy = (spec: RefusalSpec, key: string, value: unknown): string => {
  * about them is the same everywhere.
  */
 export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
+  const graded = [...spec.keys, ...(spec.mapKeys ?? [])];
+  const declared = spec.declared;
+  const wrap = (key: string, value: unknown): unknown =>
+    (spec.mapKeys ?? []).includes(key) ? { 'a-topic': value } : value;
+
+  describe(`${plugin} grades the backend_config surface it declares`, () => {
+    it('grades only keys its backend_config declares', () => {
+      const stray = declared === 'not backend_config' ? [] : graded.filter((k) => !declared.includes(k));
+      expect(stray, 'this spec drives keys the plugin does not declare').toEqual([]);
+    });
+
+    it('leaves no declared key ungraded without a stated reason', () => {
+      const skipped =
+        declared === 'not backend_config'
+          ? []
+          : declared.filter((k) => !graded.includes(k) && spec.ungraded?.[k] === undefined);
+      expect(
+        skipped,
+        'a declared key no corpus is crossed over is a config surface nothing has ever driven',
+      ).toEqual([]);
+    });
+
+    it('states no reason for a key it does grade, or does not declare', () => {
+      const stale = Object.keys(spec.ungraded ?? {}).filter(
+        (k) => graded.includes(k) || (declared !== 'not backend_config' && !declared.includes(k)),
+      );
+      expect(stale, 'this exemption names a key it does not exempt').toEqual([]);
+    });
+  });
+
+  const accepted = (key: string, label: string): boolean =>
+    (spec.accepts?.[key] ?? []).includes(label);
+
   describe(`${plugin} refuses an unrenderable backend_config value under its own label`, () => {
-    for (const key of spec.keys) {
-      it.each(NEVER_RENDERABLE)(`${key} = %s is a labelled refusal`, (_label, value) => {
-        const message = raisedBy(spec, key, value);
+    it('names only corpus rows that exist among the values it excuses', () => {
+      const labels = new Set(
+        [...NEVER_RENDERABLE, ...WRAPPING_A_SECRET].map(([label]) => label),
+      );
+      const unknown = Object.values(spec.accepts ?? {})
+        .flat()
+        .filter((label) => !labels.has(label));
+      expect(unknown, 'this exemption names a corpus row that is no longer there').toEqual([]);
+    });
+
+    for (const key of graded) {
+      it.each(NEVER_RENDERABLE)(`${key} = %s is a labelled refusal`, (label, value) => {
+        if (accepted(key, label)) {
+          expect(() => spec.validate(key, wrap(key, value))).not.toThrow();
+          return;
+        }
+        const message = expectRefusalMessage(spec, key, wrap(key, value));
         expect(message).toMatch(spec.label(key));
         expect(message).not.toContain(RENDER_LEAK_SENTINEL);
         expect(message).not.toMatch(/[\n\r]/);
@@ -60,23 +152,28 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
   });
 
   describe(`${plugin} discloses nothing a rejected value carries`, () => {
-    for (const key of spec.keys) {
-      it.each(WRAPPING_A_SECRET)(`${key} = %s is refused without it`, (_label, value) => {
-        const message = raisedBy(spec, key, value);
-        expect(message, 'a wrapped value must still be refused, or this row grades nothing').not.toBe(
-          '',
-        );
+    for (const key of graded) {
+      it.each(WRAPPING_A_SECRET)(`${key} = %s is refused without it`, (label, value) => {
+        if (accepted(key, label)) {
+          expect(() => spec.validate(key, wrap(key, value))).not.toThrow();
+          return;
+        }
+        const message = expectRefusalMessage(spec, key, wrap(key, value));
         expect(message).toMatch(spec.label(key));
         expect(message).not.toContain(PLANTED_SECRET);
         expect(message).not.toMatch(/[\n\r]/);
       });
     }
 
-    for (const key of spec.credentialKeys ?? []) {
-      it(`${key} = a bare secret string is never echoed back when it is refused`, () => {
-        expect(raisedBy(spec, key, `scheme://parley:${PLANTED_SECRET}@host/x y`)).not.toContain(
-          PLANTED_SECRET,
-        );
+    for (const [key, value] of Object.entries(spec.credentialKeys ?? {})) {
+      it(`${key} = a value whose own text IS the secret is refused without it`, () => {
+        expect(
+          String(value),
+          'this value does not carry the secret, so the assertion below grades nothing',
+        ).toContain(PLANTED_SECRET);
+        const message = expectRefusalMessage(spec, key, value);
+        expect(message).toMatch(spec.label(key));
+        expect(message).not.toContain(PLANTED_SECRET);
       });
     }
   });
@@ -85,10 +182,7 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
     describe(`${plugin} bounds and flattens the text a rejected value carries`, () => {
       for (const key of spec.textKeys ?? []) {
         it.each(UNSAFE_TEXT)(`${key} = %s is one bounded, harmless line`, (_label, text) => {
-          const message = raisedBy(spec, key, text);
-          expect(message, 'a text value must still be refused, or this row grades nothing').not.toBe(
-            '',
-          );
+          const message = expectRefusalMessage(spec, key, wrap(key, text));
           expect(message).not.toMatch(FORBIDDEN_IN_RENDER);
           expect(message).not.toMatch(/[\n\r]/);
           expect(message.length).toBeLessThan(MAX_ERROR_BODY + 1024);

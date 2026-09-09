@@ -45,7 +45,7 @@ const CONTROL_CHARS = new RegExp('[\\u0000-\\u001f\\u007f]');
  * check cannot see. Keep the `satisfies` on it, so that a key added to {@link NatsBackendConfig}
  * without being listed here is a compile error rather than a key `connect()` rejects.
  */
-const DECLARED: BackendConfigKeys = {
+export const DECLARED: BackendConfigKeys = {
   keys: Object.keys({
     servers: 0,
     subject_prefix: 0,

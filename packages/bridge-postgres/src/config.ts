@@ -53,7 +53,7 @@ export const MIN_RETENTION_DAYS = 1 / 1440;
  * {@link PostgresBackendConfig} without being listed here is a compile error rather than a key
  * `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     url: 0,
     table_name: 0,

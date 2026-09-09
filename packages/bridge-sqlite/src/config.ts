@@ -86,7 +86,7 @@ export const DIAG_INTERVAL_MS = 60_000;
  * {@link SqliteBackendConfig} without being listed here is a compile error rather than a key
  * `connect()` rejects.
  */
-const CONFIG_KEYS: BackendConfigKeys = {
+export const CONFIG_KEYS: BackendConfigKeys = {
   keys: Object.keys({
     db_path: 0,
     poll_interval_ms: 0,
@@ -117,10 +117,10 @@ export function validateBackendConfig(config: BackendConfig): SqliteBackendConfi
   if (typeof dbPath === 'string' && dbPath.startsWith('file:')) {
     throw bad(
       'db_path',
-      `expected a filesystem path, got the SQLite URI ${describe(dbPath)} — the two drivers read ` +
-        `it differently (node:sqlite resolves URIs; better-sqlite3 opens a file literally named ` +
-        `'${dbPath}'), so which store this names would depend on which of them is installed; ` +
-        `use the plain path, or ':memory:' for a single-process store`,
+      `expected a filesystem path, got a SQLite URI — the two drivers read one differently ` +
+        `(node:sqlite resolves URIs; better-sqlite3 opens a file named literally after it), so ` +
+        `which store this names would depend on which of them is installed; use the plain path, ` +
+        `or ':memory:' for a single-process store`,
     );
   }
 
@@ -173,8 +173,18 @@ export function retentionCutoff(retentionDays: number): string {
   return cutoff.toISOString();
 }
 
+/**
+ * What a value IS, for a diagnostic that must never carry what a value HOLDS. This plugin has no
+ * `net-util` dependency (SQLite dials nothing), so the shared renderer's rule is restated rather
+ * than imported: a figure names itself, everything else names only its type — and nothing here can
+ * throw, so a null-prototype value cannot turn a labelled refusal into a bare TypeError.
+ */
 export function describe(v: unknown): string {
-  return typeof v === 'string' ? `'${v}'` : String(v);
+  if (v === null) return 'null';
+  if (v === undefined) return 'undefined';
+  if (Array.isArray(v)) return 'an array';
+  if (typeof v === 'number') return String(v);
+  return typeof v === 'object' || typeof v === 'function' ? `an ${typeof v}` : `a ${typeof v}`;
 }
 
 export function normalizeLimit(limit: number | undefined, topic: Topic): number {

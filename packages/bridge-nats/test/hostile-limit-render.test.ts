@@ -5,6 +5,7 @@ import { normalizeLimit } from '../src/cursor.js';
 expectLabelledRefusal('nats', {
   label: () => /^invalid nats limit /,
   keys: ['limit'],
+  declared: 'not backend_config',
   textKeys: ['limit'],
   validate: (_key, value) => void normalizeLimit(value as number, asTopic('room')),
 });
