@@ -16,8 +16,13 @@ export interface Derivation {
   /** How many rows the table must hold before it can be believed at all. */
   floor: number;
   /**
-   * Members the table must contain, each matched against ONE row's own text. Typed non-empty, so
-   * that the half of this rule that works cannot be omitted.
+   * Members the table must contain, each matched against ONE CELL of one row — never against a row
+   * flattened into text, so that a witness cannot be satisfied by a phrase spanning two cells.
+   * Typed non-empty, so that the half of this rule that works cannot be omitted.
+   *
+   * A witness of three characters or fewer must match a cell EXACTLY: `'1'` was a live witness over
+   * a numeric table, and `[12, 13, 15, 16, 1234, 99]` — six impostor rows, not one of them the row
+   * the witness names — satisfied it and four others by substring.
    */
   witness: readonly [string, ...string[]];
   /**
@@ -30,19 +35,26 @@ export interface Derivation {
   size?: () => number;
 }
 
-/** A row as text, for witness matching: every scalar it holds, however deeply nested. */
-export function rowText(row: unknown, depth = 0): string {
-  if (typeof row === 'string') return row;
-  if (typeof row === 'function' || depth > 8) return '';
-  if (Array.isArray(row)) return row.map((cell) => rowText(cell, depth + 1)).join(' ');
-  if (row instanceof RegExp || row instanceof Date) return String(row);
+/** Every scalar a row holds, however deeply nested, one string each. */
+export function rowCells(row: unknown, depth = 0): string[] {
+  if (typeof row === 'string') return [row];
+  if (typeof row === 'function' || depth > 8) return [];
+  if (Array.isArray(row)) return row.flatMap((cell) => rowCells(cell, depth + 1));
+  if (row instanceof RegExp || row instanceof Date) return [String(row)];
   if (row !== null && typeof row === 'object')
     return Object.values(row as Record<string, unknown>)
-      .map((value) => rowText(value, depth + 1))
-      .filter((text) => text !== '')
-      .join(' ');
-  return String(row);
+      .flatMap((value) => rowCells(value, depth + 1))
+      .filter((text) => text !== '');
+  return [String(row)];
 }
+
+/** A row as text, for a diagnostic: every cell it holds, in order. */
+export function rowText(row: unknown, depth = 0): string {
+  return rowCells(row, depth).join(' ');
+}
+
+/** The shortest witness that may be matched as a substring rather than as a whole cell. */
+const SUBSTRING_WITNESS_MIN = 4;
 
 /** Everything wrong with a derived table, as reportable lines. Empty means the table is believable. */
 export function derivationFaults(
@@ -61,7 +73,7 @@ export function derivationFaults(
       `${label} derived ${rows.length} rows, below its floor of ${floor} — the scan that builds ` +
         'this table is reading less than it was written to read',
     );
-  const texts = rows.map((row) => rowText(row));
+  const cells = rows.map((row) => rowCells(row));
   for (const name of witness) {
     if (name.trim() === '') {
       faults.push(
@@ -70,8 +82,10 @@ export function derivationFaults(
       );
       continue;
     }
-    // Per ROW, so that a witness cannot be satisfied by text spanning two of them.
-    if (!texts.some((text) => text.includes(name)))
+    const holds = cells.some((row) =>
+      row.some((cell) => (name.length >= SUBSTRING_WITNESS_MIN ? cell.includes(name) : cell === name)),
+    );
+    if (!holds)
       faults.push(`${label} no longer holds \`${name}\`, a member it is written to cover`);
   }
   const universe = size?.();

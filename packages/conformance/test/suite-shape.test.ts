@@ -702,7 +702,16 @@ describe('the tables the suite fans out on still cover what they were written fo
   it.each(
     derivedRows('the handler faults', () => [...FAILURE_SHAPE_NAMES], {
       floor: 7,
-      witness: [...FAILURE_SHAPE_NAMES] as unknown as [string, ...string[]],
+      // Named one at a time, so the witnesses cannot narrow in lockstep with the table: spreading
+      // FAILURE_SHAPE_NAMES over its own derivation made this row satisfied by construction.
+      witness: [
+        'rejects with a non-Error',
+        'rejects a turn later',
+        'rejects as a non-native thenable',
+        'never settles',
+        'rejects synchronously',
+        'throws a non-Error synchronously',
+      ],
     }),
   )('faults a live handler by %s', (shape) => {
     expect(FAILURE_SHAPES[shape]).toBeTypeOf('function');

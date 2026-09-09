@@ -120,15 +120,18 @@ const PARENT_STARTED_AT = Date.now();
  * against every broken variant. Keep the headroom large, so that a clause added to the shared
  * suite — which is the point of the suite — cannot turn every check in this file into a SKIP.
  */
-const NESTED_RUN_BUDGET_MS = 1_800_000;
+const NESTED_RUN_BUDGET_MS = 2_400_000;
 
 /**
- * What one case of one variant's run is allowed to cost ON AVERAGE. A MEAN, not a ceiling: the
- * suite carries real waits (SINCELESS_BLOCK_MS 12s, TAIL_BLOCK_MS 5s, STABILITY_SPAN_MS 3s) and its
- * worst single case is measured at 15s, while a whole variant is 9.6s-109.9s over 57 cases. Set
- * above the measured mean so the figure below over-predicts the run rather than tracking it.
+ * What one case of one variant's run is allowed to cost ON AVERAGE, in the SLOWEST shard — the one
+ * the budget has to fit. A MEAN, not a ceiling: the suite carries real waits (SINCELESS_BLOCK_MS
+ * 12s, TAIL_BLOCK_MS 5s, STABILITY_SPAN_MS 3s) and its worst single case is measured at 15s.
+ *
+ * Set above the slowest shard's measured per-case cost, so the figure below OVER-predicts the run
+ * rather than tracking it: a row meant to redden before the table runs out of time is worth nothing
+ * if the table can double first.
  */
-const MEAN_CASE_MS = 350;
+const MEAN_CASE_MS = 500;
 
 /** What a child vitest costs before it grades anything. */
 const CHILD_STARTUP_MS = 10_000;
@@ -548,8 +551,9 @@ describe('the nested run is allowed the time the table it drives will take', () 
       expect(
         NESTED_RUN_BUDGET_MS,
         `${BROKEN_VARIANTS.length} variants x ${expectedCasesPerVariant()} cases over ${shards} ` +
-          'shards no longer fit the budget. Raise it, or cut the table — a nested run that runs ' +
-          'out of time SKIPS every check in this file and reports nothing',
+          'shards no longer fit the budget. Raise it, or cut the table — a nested run that ' +
+          'outlives this budget fails the hook that produces the report, and every check in this ' +
+          'file then fails on a report that was never written',
       ).toBeGreaterThanOrEqual(
         requiredBudgetMs(BROKEN_VARIANTS.length, expectedCasesPerVariant(), shards),
       );

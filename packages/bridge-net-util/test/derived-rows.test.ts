@@ -23,6 +23,15 @@ describe('a derived table is judged on its floor and its witnesses', () => {
     // The witness is matched against ONE row. Concatenating the rows and searching the blob let
     // `'alpha 2 beta'` — text that exists in no row — count as a member the scan still reaches.
     ['a witness that only spans two rows', ROWS, 1, ['1\nbeta'], 1],
+    // Within ONE row too: a row's cells are matched one at a time, so a phrase that exists only
+    // where two of them meet names no member.
+    ['a witness that only spans two cells of one row', ROWS, 1, ['alpha 1'], 1],
+    // A witness shorter than a symbol or a path is matched as a WHOLE cell. `['1','2','3','5','6']`
+    // was live over a numeric table, and every one of them was satisfied by substring against rows
+    // the witness does not name.
+    ['a short witness that names a row', [1, 2, 3, 5, 6], 1, ['1', '5'], 0],
+    ['a short witness matched only inside a longer row', [12, 13, 15, 16, 1234, 99], 1, ['1'], 1],
+    ['five short witnesses against six impostor rows', [12, 13, 15, 16, 1234, 99], 5, ['1', '2', '3', '5', '6'], 5],
   ])('%s reports %#', (_label, rows, floor, witness, faults) => {
     expect(
       derivationFaults('table', rows as readonly unknown[], {
