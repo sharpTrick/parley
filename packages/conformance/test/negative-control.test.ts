@@ -636,6 +636,21 @@ describe('the suite rejects a non-conformant plugin', () => {
    */
   const maxBlastRadius = (): number => Math.ceil(suiteCases() * MAX_BLAST_FRACTION);
 
+  /** How many cases of ONE variant's run the `mustFail` of a control names — the clause it is aimed at. */
+  const clauseSize = (mustFail: string): number =>
+    rowsOf(BROKEN_VARIANTS[0]!.name).filter((r) => r.fullName.includes(mustFail)).length;
+
+  /**
+   * The ceiling one control may be declared to. A fraction of the SUITE is not self-scaling for a
+   * control aimed at a whole parameterised clause: measured at head, the awaiting control fails 21
+   * of 57 against a ceiling of 23, and BOTH numerator and denominator grow by 3 per fault shape
+   * added — so (21+3n)/(57+3n) climbs toward 1 and crosses 2/5 at n=2. A control whose `mustFail`
+   * names a whole clause is bounded by THAT CLAUSE; the fraction still bounds one that names a
+   * single case, where breaking more than its share really does demonstrate nothing.
+   */
+  const ceilingFor = (mustFail: string): number =>
+    Math.max(clauseSize(mustFail), maxBlastRadius());
+
   it('every variant ran the same whole suite, so a failure count is a fraction of something known', () => {
     const collected = BROKEN_VARIANTS.map((v) => [v.name, rowsOf(v.name).length] as const);
     expect(
@@ -662,6 +677,7 @@ describe('the suite rejects a non-conformant plugin', () => {
    * than inheriting one.
    */
   const FAULT_MARK = 'survives a handler that ';
+  const HANDLER_FAULT_MARK = 'survives a handler that';
 
   const faultTitle = (row: Row): string | undefined => {
     const at = row.fullName.indexOf(FAULT_MARK);
@@ -698,18 +714,39 @@ describe('the suite rejects a non-conformant plugin', () => {
    * beside a variant is a promise that it still discriminates; past half the suite it does not,
    * whatever figure is written there — so raising one that far is refused rather than recorded.
    */
-  it.each(BROKEN_VARIANTS.map((v) => [v.name, blastRadiusOf(v)] as const))(
+  it.each(BROKEN_VARIANTS.map((v) => [v.name, v.mustFail, blastRadiusOf(v)] as const))(
     'declares a blast radius for %s that a control could have',
-    (name, radius) => {
+    (name, mustFail, radius) => {
       expect(
         radius,
         `"${name}" is declared to fail ${radius} of ${suiteCases()} cases, past the ceiling of ` +
-          `${maxBlastRadius()} — a control that breaks more than its share of the suite ` +
-          `demonstrates nothing about the one case it names. Narrow the mutation until it is ` +
-          `aimed at that case`,
-      ).toBeLessThanOrEqual(maxBlastRadius());
+          `${ceilingFor(mustFail)} — a control that breaks more than the clause it names ` +
+          `demonstrates nothing about the case it is registered for. Narrow the mutation until it ` +
+          `is aimed at that clause`,
+      ).toBeLessThanOrEqual(ceilingFor(mustFail));
     },
   );
+
+  /**
+   * The ceiling evaluated where it will be, not where it is. A rule that holds at today's table
+   * size and fails at tomorrow's is a cliff the next person walks off; this row walks off it first.
+   */
+  it('the ceiling still admits a whole-clause control two fault shapes from now', () => {
+    const clause = clauseSize(HANDLER_FAULT_MARK);
+    const perShape = clause / FAILURE_SHAPE_NAMES.length;
+    expect(perShape, 'the handler-fault clause is not a whole number of rows per shape').toBe(
+      Math.round(perShape),
+    );
+    const added = 2 * perShape;
+    expect(
+      clause + added,
+      `a control aimed at the whole handler-fault clause would fail ${clause + added} of ` +
+        `${suiteCases() + added} cases two shapes from now. Bounding it by a fraction of the ` +
+        'SUITE refuses it there — which is why the bound is the clause it names',
+    ).toBeLessThanOrEqual(
+      Math.max(clause + added, Math.ceil((suiteCases() + added) * MAX_BLAST_FRACTION)),
+    );
+  });
 
   it.each(BROKEN_VARIANTS.map((v) => [v.name, v.mustFail, blastRadiusOf(v)] as const))(
     'fails a plugin with %s',
