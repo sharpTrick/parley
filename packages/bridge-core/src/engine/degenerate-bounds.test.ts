@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { asTopic } from '../message.js';
-import { connectedFake } from '../testing/fake-plugin.js';
+import { connectedFake } from '../test-support/fake-plugin.js';
 import { MAX_TIMER_MS } from '../timer-bounds.js';
 import { fetchRecentBlocking } from './blocking-fetch.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './seen-set.js';

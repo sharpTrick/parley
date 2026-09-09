@@ -24,8 +24,8 @@ import {
   MAX_MATCH_INPUT,
   MIN_COMPOUNDING_REPEAT,
 } from './regex-safety.js';
-import { FakePlugin } from './testing/fake-plugin.js';
-import { harness } from './testing/tool-harness.js';
+import { FakePlugin } from './test-support/fake-plugin.js';
+import { harness } from './test-support/tool-harness.js';
 import { boundedLine, MAX_NAMED_FRAGMENT } from './bounded-line.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
 import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';

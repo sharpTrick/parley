@@ -7,7 +7,7 @@ import {
   exportedDoorFactories,
   internalsLeaked,
   triggerNamed,
-} from '../testing/front-doors.js';
+} from '../test-support/front-doors.js';
 
 /**
  * The audit's SUBJECTS, graded. An app-wide security control is applied per factory, so a factory

@@ -5,7 +5,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { OAuthMetadataSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig, type OidcAuthConfig, type ParleyConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { startFakeOidc, type FakeOidc, type FakeOidcClaims } from '../testing/fake-oidc.js';
 import { createOidcRemoteApp, type OidcRemoteServer } from './oidc-remote.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';

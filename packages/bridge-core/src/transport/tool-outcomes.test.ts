@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
 import { asHandle, asTopic } from '../message.js';
 import { NoSuchTopicError } from '../no-such-topic.js';
-import type { FakePlugin } from '../testing/fake-plugin.js';
-import { harness, parse, type ToolText } from '../testing/tool-harness.js';
+import type { FakePlugin } from '../test-support/fake-plugin.js';
+import { harness, parse, type ToolText } from '../test-support/tool-harness.js';
 
 /**
  * One subject: what a tool answers when it has nothing to answer with. An empty window, a topic

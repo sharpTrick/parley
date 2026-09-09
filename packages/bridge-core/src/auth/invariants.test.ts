@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { OidcAuthSchema } from '../config-auth.js';
 import { parseConfig, type ParleyConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
 import { createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';

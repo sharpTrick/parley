@@ -7,8 +7,8 @@ import {
   MCP_HEADERS,
   serveRemoteHttp,
   type ServedApp,
-} from '../testing/http-app.js';
-import { parse } from '../testing/tool-harness.js';
+} from '../test-support/http-app.js';
+import { parse } from '../test-support/tool-harness.js';
 
 /**
  * One subject: what a client gets back from the reactive /mcp endpoint, and what each POST costs.

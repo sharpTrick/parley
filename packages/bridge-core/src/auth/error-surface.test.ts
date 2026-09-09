@@ -16,7 +16,7 @@ import {
   type BootEnv,
   type FrontDoor,
   type Trigger,
-} from '../testing/front-doors.js';
+} from '../test-support/front-doors.js';
 import { errorDigest, hardenErrorSurface } from './error-surface.js';
 
 function freePort(): Promise<number> {

@@ -7,7 +7,7 @@ import {
   MAX_MATCH_INPUT,
   MIN_COMPOUNDING_REPEAT,
 } from './regex-safety.js';
-import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
+import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './test-support/regex-corpus.js';
 
 // The screen's only real contract: whatever it accepts must MATCH in bounded time, for every input
 // a caller can reach it with. Enumerating blowup shapes is not enough — the class this guards is

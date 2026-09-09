@@ -2,7 +2,7 @@ import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { parseConfig, type ParleyConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
 import { createRemoteAuthApp, type RemoteAuthServer } from './remote-auth.js';
 

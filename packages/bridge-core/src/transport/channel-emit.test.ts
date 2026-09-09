@@ -3,7 +3,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { CHANNEL_NOTIFICATION_METHOD, channelMeta } from './channel-emit.js';
 import { buildBridge } from './stdio-bridge.js';
 

@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, sta
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import ts from 'typescript';
 import { afterAll, describe, expect, it } from 'vitest';
 import { Allowlist, TopicNotAllowedError, UnsafePatternError } from '../allowlist.js';
 import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
@@ -15,9 +16,9 @@ import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
 import { ConsentError } from '../auth/oauth-provider.js';
 import type { BackendPlugin } from '../seam.js';
 import { FetchAbortedError } from '../engine/blocking-fetch.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { memoryReadState } from '../testing/nonconformant.js';
-import { toolClient } from '../testing/tool-harness.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
+import { memoryReadState } from '../test-support/nonconformant.js';
+import { toolClient } from '../test-support/tool-harness.js';
 import { startPushLoop } from './push-loop.js';
 
 /**
@@ -782,8 +783,16 @@ describe('no production site in bridge-core recognises a sentinel by class ident
 
   const DIST_FILES = filesUnder(DIST, '.js');
   const relDist = (f: string): string => f.slice(DIST.length + 1);
-  const shipped = filesUnder(SRC, '.ts')
-    .filter((f) => !f.endsWith('.d.ts'))
+  // What the BUILD emits, asked of the build's own config rather than of the directory listing: a
+  // source tree also holds fixtures the package deliberately does not ship, and a walk that reads
+  // every `.ts` as shipped reports a module the tarball has never carried.
+  const shipped = ts
+    .parseJsonConfigFileContent(
+      ts.readConfigFile(join(PKG_DIR, 'tsconfig.json'), ts.sys.readFile).config,
+      ts.sys,
+      PKG_DIR,
+    )
+    .fileNames.filter((f) => f.startsWith(SRC) && !f.endsWith('.d.ts'))
     .map((f) => emitOf(relSrc(f)));
   // `tsc -b` never deletes the output of a source that was removed, so a dist carrying a module
   // from an earlier chunk would be read here as a live recogniser. Grade only what a source still

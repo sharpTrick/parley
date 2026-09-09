@@ -5,7 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { ConsentError } from './oauth-provider.js';
 import { ownerVerifierFromPassphrase } from './owner.js';
 import {

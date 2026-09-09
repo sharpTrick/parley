@@ -23,7 +23,7 @@ import type {
   FetchRecentResult,
   MessageHandler,
 } from '../seam.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { unhandledDuring } from '../testing/failure-shapes.js';
 import { buildBridge } from './stdio-bridge.js';
 

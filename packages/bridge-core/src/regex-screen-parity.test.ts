@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Allowlist, UnsafePatternError } from './allowlist.js';
 import { parseConfig } from './config.js';
 import { isRedosSafeSource } from './regex-safety.js';
-import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './testing/regex-corpus.js';
+import { HOSTILE_PATTERNS, SAFE_PATTERNS } from './test-support/regex-corpus.js';
 
 // Three layers compile a pattern nobody in this repo authored: the screen itself, the Allowlist an
 // embedder builds by hand, and parseConfig's post_topics at load. A per-layer copy of the hostile

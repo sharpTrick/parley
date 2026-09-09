@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { isMentionableHandle, parseMentions } from './mentions.js';
 import { asHandle } from './message.js';
-import { HANDLE_CANDIDATES } from './testing/handle-corpus.js';
+import { HANDLE_CANDIDATES } from './test-support/handle-corpus.js';
 
 describe('parseMentions', () => {
   it('extracts @handles including hyphenated ones', () => {

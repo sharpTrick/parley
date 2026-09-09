@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { asCursor, asHandle, asTopic, type Cursor } from '../message.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
-import { connectedFake } from '../testing/fake-plugin.js';
+import { connectedFake } from '../test-support/fake-plugin.js';
 import {
   NONCONFORMANT_SHAPE_NAMES,
   NONCONFORMANT_SHAPES,
   pagingProbe,
-} from '../testing/nonconformant.js';
+} from '../test-support/nonconformant.js';
 import { FetchAbortedError, fetchRecentBlocking, type BlockingFetchOptions } from './blocking-fetch.js';
 
 const SENDER = asHandle('writer');

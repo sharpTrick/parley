@@ -11,7 +11,7 @@ import {
   parseConfig,
 } from './config.js';
 import { parseMentions } from './mentions.js';
-import { HANDLE_CANDIDATES } from './testing/handle-corpus.js';
+import { HANDLE_CANDIDATES } from './test-support/handle-corpus.js';
 
 describe('config loader', () => {
   it('applies defaults from a minimal config', () => {

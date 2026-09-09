@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
 import { MAX_POST_TOPICS, MAX_TOPIC_LEN, parseConfig } from './config.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
-import { FakePlugin } from './testing/fake-plugin.js';
+import { FakePlugin } from './test-support/fake-plugin.js';
 import { registerTools, toolDepsFor } from './transport/tools.js';
 
 function compiles(src: string): boolean {

@@ -155,7 +155,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         return textResult({ messages: [], nextCursor: args.since, topicAbsent: true });
       }
       // Bound the PAGE, not only the request. The seam lets a plugin hand back more than `limit`
-      // asked for (testing/nonconformant.ts ships that shape), and everything past the cap is both
+      // asked for (test-support/nonconformant.ts ships that shape), and everything past the cap is both
       // agent-facing context and one more write into a per-topic dedup window small enough that a
       // single oversized page flushes it — after which the push loop re-delivers what was just
       // pulled. Re-derive the cursor from the last message KEPT, so that the remainder is paged on

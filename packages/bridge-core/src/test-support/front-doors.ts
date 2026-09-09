@@ -3,7 +3,7 @@ import type { Express } from 'express';
 import * as core from '../index.js';
 import { parseConfig, type ParleyConfig } from '../config.js';
 import { FakePlugin } from './fake-plugin.js';
-import { startFakeOidc, type FakeOidc } from './fake-oidc.js';
+import { startFakeOidc, type FakeOidc } from '../testing/fake-oidc.js';
 
 /**
  * Every front door this package hands an operator, DERIVED from the public surface so that a

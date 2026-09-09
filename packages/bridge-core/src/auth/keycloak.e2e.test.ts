@@ -2,7 +2,7 @@ import { createServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { createOidcRemoteApp, type OidcRemoteServer } from './oidc-remote.js';
 

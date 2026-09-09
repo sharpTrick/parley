@@ -4,8 +4,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { toolClient } from '../testing/tool-harness.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
+import { toolClient } from '../test-support/tool-harness.js';
 import { buildBridge } from './stdio-bridge.js';
 
 /**

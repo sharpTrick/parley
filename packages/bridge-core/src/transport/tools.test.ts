@@ -18,13 +18,13 @@ import {
 } from '../message.js';
 import { BlockingFetchUnsupportedError } from '../blocking-unsupported.js';
 import type { BackendPlugin, FetchRecentArgs } from '../seam.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import {
   memoryReadState,
   NONCONFORMANT_SHAPES,
   NONCONFORMANT_SHAPE_NAMES,
-} from '../testing/nonconformant.js';
-import { harness, parse, type ToolText } from '../testing/tool-harness.js';
+} from '../test-support/nonconformant.js';
+import { harness, parse, type ToolText } from '../test-support/tool-harness.js';
 import { MAX_FETCH_LIMIT, TOOL_TEXT, toolDepsFor } from './tools.js';
 
 /**
@@ -257,7 +257,7 @@ describe('every numeric tool argument is bounded before it reaches the backend',
 
 /**
  * `limit` bounds what core ASKS a plugin for; it does not bound what comes back. The seam is
- * explicit that a longer page is legal — testing/nonconformant.ts ships it as a shape core must
+ * explicit that a longer page is legal — test-support/nonconformant.ts ships it as a shape core must
  * survive — and the returned page is the number that decides how much untrusted text enters the
  * agent's context and how many ids are written into a per-topic dedup window of SEEN_MAX_PER_TOPIC
  * entries. `parley_fetch_recent` forwarded whatever it was handed, so a 5000-message answer to

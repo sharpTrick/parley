@@ -8,7 +8,7 @@ import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { fetchRecentBlocking } from '../engine/blocking-fetch.js';
 import { asBackendMsgId, asHandle, asTopic, type Message } from '../message.js';
-import { coarseDelivery, FOREIGN_TOPIC_KINDS, memoryReadState } from '../testing/nonconformant.js';
+import { coarseDelivery, FOREIGN_TOPIC_KINDS, memoryReadState } from '../test-support/nonconformant.js';
 import { registerTools, type ToolDeps } from './tools.js';
 import { startPushLoop } from './push-loop.js';
 

@@ -3,8 +3,8 @@ import type { AddressInfo } from 'node:net';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { remoteHttpApp } from '../testing/http-app.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
+import { remoteHttpApp } from '../test-support/http-app.js';
 import { createRemoteHttpApp } from './http.js';
 import { buildBridge } from './stdio-bridge.js';
 

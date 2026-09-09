@@ -5,8 +5,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { RequestHandler } from 'express';
 import { describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../config.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { INITIALIZE, MCP_HEADERS, mcpPost, serveRemoteHttp } from '../testing/http-app.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
+import { INITIALIZE, MCP_HEADERS, mcpPost, serveRemoteHttp } from '../test-support/http-app.js';
 import { createRemoteHttpApp, type RemoteHttpOptions } from './http.js';
 
 /**

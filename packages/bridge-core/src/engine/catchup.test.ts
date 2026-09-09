@@ -5,13 +5,13 @@ import { describe, expect, it } from 'vitest';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
 import { NoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import {
   memoryReadState,
   NONCONFORMANT_SHAPE_NAMES,
   NONCONFORMANT_SHAPES,
   pagingProbe,
-} from '../testing/nonconformant.js';
+} from '../test-support/nonconformant.js';
 import { catchUpAll, catchUpTopic, MAX_CATCHUP_PAGES } from './catchup.js';
 import { ReadStateStore } from './read-state.js';
 import { SeenSet } from './seen-set.js';

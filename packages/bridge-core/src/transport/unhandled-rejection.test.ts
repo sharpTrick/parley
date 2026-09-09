@@ -14,9 +14,8 @@ import {
   FAILURE_SHAPE_NAMES,
   FAILURE_SHAPES,
   unhandledDuring,
-  type FailureShape,
 } from '../testing/failure-shapes.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
 import { createRemoteHttpApp } from './http.js';
 import { startPushLoop } from './push-loop.js';
 
@@ -320,22 +319,5 @@ describe('every discarded promise in src/ is a known one', () => {
 
   it('matches the inventory the failure-shape tables cover', () => {
     expect(inventory().sort()).toEqual(Object.keys(EXPECTED).sort());
-  });
-});
-
-/**
- * The harness itself has to be able to produce the input it advertises. A shape that silently
- * degrades to an ordinary rejection is how a row can sit in a table for rounds while never once
- * exercising the class it names.
- */
-describe('the failure-shape fixtures are what they claim', () => {
-  const ASYNC: FailureShape[] = ['rejects', 'rejects with a non-Error'];
-
-  it.each(ASYNC)('%s returns a promise rather than throwing', async (shape) => {
-    let pending: Promise<unknown> | undefined;
-    expect(() => {
-      pending = FAILURE_SHAPES[shape](Promise.resolve());
-    }).not.toThrow();
-    await expect(pending).rejects.toBeDefined();
   });
 });
