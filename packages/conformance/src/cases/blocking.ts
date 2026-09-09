@@ -112,6 +112,9 @@ function stabilityBudgets(): number[] {
  * budgets it hands out, the topics it names and the wall clock it covers, each of which
  * `ARM_SWITCHES` has a control sitting at the far edge of.
  */
+/** How far into a blocking fetch a racing post lands, in ms. Exported so the row count is derivable. */
+export const BLOCKING_POST_OFFSETS: readonly number[] = [0, 1, 2, 3];
+
 export function blockingCases(ctx: ConformanceContext): void {
   // Resolves only once the write has LANDED, so a case cannot conclude on a message the backend has
   // not accepted yet. Keep BOTH settle paths bound, so that a `post` rejecting mid-case — a flood
@@ -300,7 +303,7 @@ export function blockingCases(ctx: ConformanceContext): void {
   // caller's cursor — and is then invisible until something else wakes the call. Only 0-3ms
   // discriminates: by ~5ms the waiter is registered and the case degenerates into the 50ms
   // long-poll case above, which is why that one never caught this.
-  it.each([0, 1, 2, 3])('a post landing %ims into a blocking fetch is not missed', async (at) => {
+  it.each(BLOCKING_POST_OFFSETS)('a post landing %ims into a blocking fetch is not missed', async (at) => {
     const t = ctx.freshTopic();
     await ctx.plugin.post(t, SENDER, 'old');
     const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;

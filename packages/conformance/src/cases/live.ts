@@ -172,6 +172,9 @@ const FAULT_POSITIONS: Array<[where: string, faultsAt: (nth: number) => boolean]
  * the depth and the subscription count every other live case here already sits inside, which keeps
  * each `BROKEN_VARIANTS` control aimed at the one case it was calibrated against.
  */
+/** How many positions each fault shape is graded at. Exported so the row count is derivable. */
+export const FAULT_POSITIONS_PER_SHAPE = FAULT_POSITIONS.length;
+
 const FAULT_MATRIX: Array<[label: string, fault: () => unknown, faultsAt: (nth: number) => boolean]> =
   HANDLER_FAULTS.flatMap(([label, fault]) =>
     FAULT_POSITIONS.map(
