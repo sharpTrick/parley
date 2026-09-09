@@ -4,7 +4,9 @@ import {
   FORBIDDEN_IN_RENDER,
   NEVER_RENDERABLE,
   RENDER_LEAK_SENTINEL,
+  SECRET_AS_TEXT,
   UNSAFE_TEXT,
+  WRAPPING_A_SECRET,
 } from '../src/testing/index.js';
 import { describeConfigShape, describeConfigValue, RENDERED_BY_VALUE } from '../src/config-value.js';
 import { backendConfigDeclarations, keysRenderedByName } from './declared-config-keys.js';
@@ -169,6 +171,44 @@ describe('the corpus keeps the properties it was assembled for', () => {
  * sanitiser: `JSON.stringify` escapes a newline before `sanitizeBody` ever sees one, so every
  * assertion about flattening was passing on text that was never dangerous.
  */
+describe('the secret-carrying corpus reaches every type that can carry text', () => {
+  const carriers: readonly (readonly [string, unknown])[] = [...WRAPPING_A_SECRET, SECRET_AS_TEXT];
+
+  it.each(['string', 'symbol', 'object', 'function'])(
+    'a %s whose own text is the secret is in the corpus',
+    (type) => {
+      expect(
+        carriers.filter(([, value]) => typeof value === type).map(([label]) => label),
+        `no row is a ${type}, so the renderer's ${type} arm is driven by nothing`,
+      ).not.toEqual([]);
+    },
+  );
+
+  const attempt = (render: () => string | undefined): string => {
+    try {
+      return render() ?? '';
+    } catch {
+      return '';
+    }
+  };
+
+  const carries = (value: unknown, seen = new Set<unknown>()): boolean => {
+    if (attempt(() => String(value)).includes(SECRET)) return true;
+    if (attempt(() => JSON.stringify(value)).includes(SECRET)) return true;
+    if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+    seen.add(value);
+    return Reflect.ownKeys(value).some((key) =>
+      carries((value as Record<PropertyKey, unknown>)[key], seen),
+    );
+  };
+
+  it('every carrier really carries the secret, so the rows above are not vacuous', () => {
+    for (const [label, value] of carriers) {
+      expect(carries(value), `${label} does not carry the secret`).toBe(true);
+    }
+  });
+});
+
 describe('a rendered value is one bounded line of harmless text', () => {
   it.each(UNSAFE_TEXT)('%s survives neither the flattening nor the bound', (_label, text) => {
     const rendered = describeConfigValue('key_prefix', text);
@@ -231,6 +271,57 @@ describe('an unrecognised backend_config key is described, never rendered by con
         describeConfigValue(key, `scheme://parley:${SECRET}@host/db`),
         `${key} is inherited from Object.prototype, so the policy table answers for it`,
       ).not.toContain(SECRET);
+    },
+  );
+
+  /**
+   * The table is fail-closed, so every hole in it is a row ADDED — and nothing above constrains
+   * membership: each row asks only that a reason is stated, that the key is declared somewhere, and
+   * that the key does render by value. Adding `password`, `token`, `nkey_seed` and `url` with the
+   * reason 'operators need to see it' satisfied all four and was 3446 passed / 0 failed.
+   *
+   * Graded from the CREDENTIAL side instead: a key whose name says its value can BE a credential
+   * may not be in the table at all, whatever reason is written beside it.
+   */
+  const CREDENTIAL_NOUN =
+    /^(pass|passwd|password|pwd|secret|token|auth|key|keys|cred|creds|credential|credentials|seed|dsn|uri|url|cookie|session|pat|bearer|sig|signature|signing|private|pem|conn)$/;
+  const namesACredential = (key: string): boolean => key.split('_').some((s) => CREDENTIAL_NOUN.test(s));
+
+  /**
+   * The one key whose credential-shaped segment names a NAMESPACE rather than a value. Each entry
+   * is graded from both sides below, so an exemption written to smuggle a credential in has to be
+   * false about a key that is really in the table and really matches.
+   */
+  const NAMES_A_NAMESPACE: Readonly<Record<string, string>> = {
+    key_prefix: 'the prefix this backend mints its Redis keys under; it holds no key material',
+  };
+
+  it('records no key whose name says its value can be a credential', () => {
+    expect(
+      Object.keys(RENDERED_BY_VALUE).filter(
+        (key) => namesACredential(key) && NAMES_A_NAMESPACE[key] === undefined,
+      ),
+      'this key renders by value and its name says the value can be a credential',
+    ).toEqual([]);
+  });
+
+  it.each(Object.keys(NAMES_A_NAMESPACE))('%s is a live exemption, not a stale one', (key) => {
+    expect(RENDERED_BY_VALUE[key], `${key} is exempted from a table it is not in`).toBeDefined();
+    expect(namesACredential(key), `${key} needs no exemption`).toBe(true);
+    expect(NAMES_A_NAMESPACE[key], `${key} is exempted with no reason`).not.toBe('');
+  });
+
+  it.each(['password', 'token', 'nkey_seed', 'url', 'api_key', 'bot_token', 'creds_file', 'pass'])(
+    'the credential rule would catch %s',
+    (key) => {
+      expect(namesACredential(key)).toBe(true);
+    },
+  );
+
+  it.each(['block_ms', 'retention_days', 'room_preset', 'table_name', 'username', 'nick', 'domain'])(
+    'the credential rule leaves %s alone',
+    (key) => {
+      expect(namesACredential(key)).toBe(false);
     },
   );
 

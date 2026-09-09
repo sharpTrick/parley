@@ -4,9 +4,11 @@ import {
   NEVER_RENDERABLE,
   PLANTED_SECRET,
   RENDER_LEAK_SENTINEL,
+  SECRET_AS_TEXT,
   UNSAFE_TEXT,
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
+import { RENDERED_BY_VALUE } from '../config-value.js';
 import { MAX_ERROR_BODY } from '../redact.js';
 
 /** What a backend hands the harness so it can drive that backend's own validator. */
@@ -49,9 +51,15 @@ export interface RefusalSpec {
   validate: (key: string, value: unknown) => void;
 }
 
-type Refusal = { threw: true; message: string } | { threw: false };
+/**
+ * What a validator did with one value. A UNION rather than a message and a flag, so that no block
+ * can read `.message` without first narrowing on `threw`: `expect('').not.toContain(secret)` holds
+ * for every secret there is, and that is what the credential block asserted for the two backends
+ * whose validator ACCEPTS a bare credential string under the key it was handed.
+ */
+export type Refusal = { threw: true; message: string } | { threw: false };
 
-const refusalOf = (spec: RefusalSpec, key: string, value: unknown): Refusal => {
+export const refusalOf = (spec: RefusalSpec, key: string, value: unknown): Refusal => {
   try {
     spec.validate(key, value);
   } catch (err) {
@@ -162,6 +170,18 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
         expect(message).toMatch(spec.label(key));
         expect(message).not.toContain(PLANTED_SECRET);
         expect(message).not.toMatch(/[\n\r]/);
+      });
+    }
+
+    for (const key of graded) {
+      it(`${key} = ${SECRET_AS_TEXT[0]} is echoed only where the policy says it may`, () => {
+        const refusal = refusalOf(spec, key, wrap(key, SECRET_AS_TEXT[1]));
+        const echoed = refusal.threw && refusal.message.includes(PLANTED_SECRET);
+        expect(
+          echoed && !Object.hasOwn(RENDERED_BY_VALUE, key),
+          `${key} refuses a plain string by printing it, and no entry in RENDERED_BY_VALUE says ` +
+            `why printing this key's value is safe`,
+        ).toBe(false);
       });
     }
 

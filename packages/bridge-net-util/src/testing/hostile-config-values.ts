@@ -87,8 +87,17 @@ export const WRAPPING_A_SECRET: readonly (readonly [string, unknown])[] = [
   ['a boxed String', new String(PLANTED_SECRET)],
   ['a value with a Symbol.toPrimitive', { [Symbol.toPrimitive]: () => PLANTED_SECRET }],
   ['a symbol whose description is it', Symbol(PLANTED_SECRET)],
-  ['a function whose source names it', (): string => PLANTED_SECRET],
+  ['a function whose text is it', Object.assign(() => undefined, { toString: () => PLANTED_SECRET })],
 ];
+
+/**
+ * The secret as a PLAIN STRING. Every other row above is a non-string, and the shared renderer
+ * short-circuits a container to its shape — so until this existed, the only path a rendered value
+ * takes when it IS text was never driven with anything worth disclosing. Kept out of
+ * {@link WRAPPING_A_SECRET} because the assertion it needs is different: a key the policy renders
+ * by value echoes this ON PURPOSE, and a key that accepts any string never renders it at all.
+ */
+export const SECRET_AS_TEXT: readonly [string, string] = ['a plain string carrying it', PLANTED_SECRET];
 
 /**
  * A value whose own TEXT is {@link PLANTED_SECRET} while its type is not `string`. Every backend

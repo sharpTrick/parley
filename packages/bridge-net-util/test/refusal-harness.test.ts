@@ -1,8 +1,10 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { PLANTED_SECRET } from '../src/testing/hostile-config-values.js';
-import { expectRefusalMessage, type RefusalSpec } from '../src/testing/refusal-harness.js';
+import {
+  expectRefusalMessage,
+  refusalOf,
+  type RefusalSpec,
+} from '../src/testing/refusal-harness.js';
 
 const spec = (validate: RefusalSpec['validate']): RefusalSpec => ({
   label: () => /^refused/,
@@ -43,19 +45,15 @@ describe('the harness fails a validator that never refuses, instead of grading i
   });
 
   /**
-   * The guard above is only worth having if a block CANNOT be written that skips it. Every block
-   * reaches a caught message through the one chokepoint, and the catch itself has exactly one
-   * caller — so a new block reads a message the same way or does not read one at all.
+   * The guard above is only worth having if a block cannot be written that skips it. What stops one
+   * is the TYPE: an acceptance carries no `message` at all, so `.message` does not compile until
+   * `threw` has been narrowed, and there is no empty string for a block to grade by accident.
    */
-  it('leaves no second path from a caught refusal to an assertion', () => {
-    const source = readFileSync(
-      fileURLToPath(new URL('../src/testing/refusal-harness.ts', import.meta.url)),
-      'utf8',
-    );
-    expect(
-      source.split('refusalOf').length - 1,
-      'the catch has a caller other than expectRefusalMessage, which can skip the guard',
-    ).toBe(2);
-    expect(source.split('expectRefusalMessage(').length - 1).toBeGreaterThan(1);
+  it('an acceptance carries no message for a block to read', () => {
+    const accepted = refusalOf(ACCEPTS_EVERYTHING, 'url', PLANTED_SECRET);
+    expect(accepted.threw).toBe(false);
+    expect(Object.hasOwn(accepted, 'message')).toBe(false);
+    const refused = refusalOf(REFUSES, 'url', PLANTED_SECRET);
+    expect(refused).toEqual({ threw: true, message: 'refused url' });
   });
 });

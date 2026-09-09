@@ -10,6 +10,7 @@ export {
   NEVER_RENDERABLE,
   PLANTED_SECRET,
   RENDER_LEAK_SENTINEL,
+  SECRET_AS_TEXT,
   UNSAFE_TEXT,
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
