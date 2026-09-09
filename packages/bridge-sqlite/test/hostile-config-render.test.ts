@@ -1,5 +1,5 @@
 import { boxedSecret, expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
-import { CONFIG_KEYS, validateBackendConfig } from './config.js';
+import { CONFIG_KEYS, validateBackendConfig } from '../src/config.js';
 
 expectLabelledRefusal('sqlite', {
   label: (key) => new RegExp(`^parley-sqlite: invalid backend_config\\.${key} `),

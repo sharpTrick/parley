@@ -195,6 +195,51 @@ describe('every public workspace ships only what a consumer can run', () => {
     },
   );
 
+  /**
+   * The rule above reads BUILT output, so a package can import a workspace its manifest never
+   * declares as long as the importer is a test source: tsc never emits it, npm never packs it, and
+   * vitest's alias table resolves the specifier from the repo root whatever the manifest says. That
+   * is how bridge-sqlite's own hostile-config-render test imported `@sharptrick/parley-net-util`
+   * while sqlite declared it in no field at all.
+   *
+   * So grade the SOURCES too, over `src/**` and `test/**` alike rather than one directory, and let
+   * a file the build does not emit reach devDependencies — the package's own and the workspace
+   * root's, which is where a monorepo legitimately keeps `vitest`.
+   */
+  it.each(WORKSPACES.map((w) => [w.name, w] as const))(
+    '%s imports only what some manifest makes installable',
+    (_name, w) => {
+      const dir = join(REPO_ROOT, w.dir);
+      const manifest = readJson(join(dir, 'package.json'));
+      const names = (from: Record<string, unknown>, fields: string[]): string[] =>
+        fields.flatMap((f) => Object.keys((from[f] as Record<string, string> | undefined) ?? {}));
+      const shipped = new Set([
+        ...names(manifest, ['dependencies', 'peerDependencies', 'optionalDependencies']),
+        w.name,
+      ]);
+      const forTests = new Set([
+        ...shipped,
+        ...names(manifest, ['devDependencies']),
+        ...names(readJson(join(REPO_ROOT, 'package.json')), ['devDependencies']),
+      ]);
+
+      const tsconfig = readJson(join(dir, 'tsconfig.json'));
+      const sources = [
+        ...filesUnder(join(dir, 'src')).map((f) => `src/${f}`),
+        ...filesUnder(join(dir, 'test')).map((f) => `test/${f}`),
+      ].filter((f) => /\.[cm]?tsx?$/.test(f) && !f.endsWith('.d.ts'));
+      expect(sources.length, 'no sources found to grade').toBeGreaterThan(0);
+
+      const undeclared = sources.flatMap((f) => {
+        const allowed = isEmitted(tsconfig, f) && !IS_TEST_SOURCE.test(f) ? shipped : forTests;
+        return bareImports(readFileSync(join(dir, f), 'utf8'))
+          .filter((id) => !allowed.has(id))
+          .map((id) => `${f}: ${id}`);
+      });
+      expect(undeclared, 'this import resolves only through npm root hoisting').toEqual([]);
+    },
+  );
+
   it('the artifact rule can see a violation at all (positive control)', () => {
     expect(IS_TEST_ARTIFACT.test('auth/keycloak.e2e.test.js')).toBe(true);
     expect(IS_TEST_SOURCE.test('src/engine/seen-set.test.ts')).toBe(true);

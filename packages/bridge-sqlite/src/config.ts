@@ -174,9 +174,9 @@ export function retentionCutoff(retentionDays: number): string {
 }
 
 /**
- * What a value IS, for a diagnostic that must never carry what a value HOLDS. This plugin has no
- * `net-util` dependency (SQLite dials nothing), so the shared renderer's rule is restated rather
- * than imported: a figure names itself, everything else names only its type — and nothing here can
+ * What a value IS, for a diagnostic that must never carry what a value HOLDS. This plugin takes no
+ * `net-util` dependency at runtime (SQLite dials nothing), so the shared renderer's rule is
+ * restated rather than imported: a figure names itself, everything else names only its type — and nothing here can
  * throw, so a null-prototype value cannot turn a labelled refusal into a bare TypeError.
  */
 export function describe(v: unknown): string {
