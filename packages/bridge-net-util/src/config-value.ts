@@ -8,16 +8,41 @@ export function describeConfigShape(value: unknown): string {
 }
 
 /**
- * Substrings of a `backend_config` key whose value is, or can contain, a credential. Matched on the
- * KEY rather than on the value, so that such a value is described by shape whatever type it arrives
- * as: the branch that rejects one reads `not a non-empty string`, which admits every container a
- * secret can be nested inside.
+ * The `backend_config` keys a rejected value is rendered BY CONTENT for, each with why printing it
+ * is safe. Everything else is described by SHAPE.
+ *
+ * Stated as an allowlist rather than as a list of credential-ish substrings, so that a key nobody
+ * has classified is LESS INFORMATIVE rather than disclosing. The substring form defaulted an
+ * unknown key to "render it", and `nkey_seed`, `creds_file`, `ca_file`, `dsn`, `conn_str`,
+ * `bearer`, `api_key`, `signing_key`, `private_key_pem`, `webhook`, `cookie`, `session`,
+ * `credentials`, `pwd` and `pat` all fell straight through it — two of them keys this repo declares
+ * today. This value reaches an operator's log and the model context core renders a seam error into,
+ * so an unrecognised key erring toward silence is the direction that cannot cost a credential.
  */
-const CREDENTIAL_CARRIERS = ['pass', 'secret', 'token', 'auth', 'url', 'key_file', 'cert'];
-
-const carriesCredential = (key: string): boolean => {
-  const lower = key.toLowerCase();
-  return CREDENTIAL_CARRIERS.some((part) => lower.includes(part));
+export const RENDERED_BY_VALUE: Readonly<Record<string, string>> = {
+  block_ms: 'a duration in milliseconds; the refusal is about the number',
+  connect_timeout_ms: 'a duration in milliseconds; the refusal is about the number',
+  handshake_timeout_ms: 'a duration in milliseconds; the refusal is about the number',
+  rotation_grace_ms: 'a duration in milliseconds; the refusal is about the number',
+  sync_timeout_ms: 'a duration in milliseconds; the refusal is about the number',
+  poll_interval_ms: 'a duration in milliseconds; the refusal is about the number',
+  poll_timeout_s: 'a duration in seconds; the refusal is about the number',
+  retention_days: 'a window in days; the refusal is about the number',
+  pool_size: 'a connection count; the refusal is about the number',
+  mam_page: 'a page size; the refusal is about the number',
+  limit: 'a page size; the refusal is about the number',
+  observed_retention_per_chat: 'a retained-record count; the refusal is about the number',
+  observed_retention_per_topic: 'a retained-record count; the refusal is about the number',
+  observed_max_chats: 'a retained-chat count; the refusal is about the number',
+  key_prefix: 'a namespace prefix an operator has to see to correct it',
+  table_name: 'a relation name an operator has to see to correct it',
+  subject_prefix: 'a namespace prefix an operator has to see to correct it',
+  stream_prefix: 'a namespace prefix an operator has to see to correct it',
+  room_preset: 'one of a closed set of preset names',
+  domain: 'a JID part; the refusal is about which characters are in it',
+  muc_service: 'a JID part; the refusal is about which characters are in it',
+  username: 'a JID part; the refusal is about which characters are in it',
+  nick: 'a JID resource; the refusal is about which characters are in it',
 };
 
 /**
@@ -49,6 +74,6 @@ function render(value: unknown): string {
  * structure in the error core renders into model context.
  */
 export function describeConfigValue(key: string, value: unknown): string {
-  if (carriesCredential(key)) return describeConfigShape(value);
+  if (RENDERED_BY_VALUE[key] === undefined) return describeConfigShape(value);
   return sanitizeBody(render(value));
 }

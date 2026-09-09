@@ -86,3 +86,23 @@ export function testSourcesOf(pkg: string): string {
     .map((file) => readFileSync(file, 'utf8'))
     .join('\n');
 }
+
+/**
+ * Every key name a plugin hands `describeConfigValue` as a literal. Some are not `backend_config`
+ * keys at all — a page size off a caller's `fetchRecent` — so the render policy has to cover them
+ * without a hand-kept second list.
+ */
+export function keysRenderedByName(): string[] {
+  const found = new Set<string>();
+  for (const { name: pkg, dir } of entries(PACKAGES)) {
+    if (!dir) continue;
+    for (const file of filesUnder(join(PACKAGES, pkg, 'src'), isSource)) {
+      for (const [, key] of readFileSync(file, 'utf8').matchAll(
+        /describeConfigValue\(\s*'([^']+)'/g,
+      )) {
+        found.add(key as string);
+      }
+    }
+  }
+  return [...found].sort();
+}

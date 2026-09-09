@@ -6,7 +6,8 @@ import {
   RENDER_LEAK_SENTINEL,
   UNSAFE_TEXT,
 } from '../src/testing/index.js';
-import { describeConfigShape, describeConfigValue } from '../src/config-value.js';
+import { describeConfigShape, describeConfigValue, RENDERED_BY_VALUE } from '../src/config-value.js';
+import { backendConfigDeclarations, keysRenderedByName } from './declared-config-keys.js';
 
 const SECRET = 'PLANTED-SECRET-8f3a';
 
@@ -68,28 +69,11 @@ describe('a container is described, never enumerated', () => {
     ['a value whose toJSON yields the secret', { toJSON: () => ({ v: SECRET }) }],
   ];
 
-  const CREDENTIAL_KEYS = [
-    'url',
-    'password',
-    'bot_token',
-    'client_secret',
-    'key_file',
-    'cert',
-    'auth_token',
-  ];
-  const INNOCUOUS_KEYS = ['block_ms', 'table_name', 'key_prefix', 'limit'];
+  const RENDERING_KEYS = Object.keys(RENDERED_BY_VALUE);
 
-  it.each(WRAPPERS)('%s under an innocuous key still discloses nothing', (_label, value) => {
-    for (const key of INNOCUOUS_KEYS) expect(describeConfigValue(key, value)).not.toContain(SECRET);
-  });
-
-  it.each(WRAPPERS)('%s under a credential key discloses nothing', (_label, value) => {
-    for (const key of CREDENTIAL_KEYS) expect(describeConfigValue(key, value)).not.toContain(SECRET);
-  });
-
-  it.each(CREDENTIAL_KEYS)('`%s` is never rendered by value, even as a bare string', (key) => {
-    expect(describeConfigValue(key, `postgres://u:${SECRET}@db/parley`)).not.toContain(SECRET);
-    expect(describeConfigValue(key, SECRET)).not.toContain(SECRET);
+  it.each(WRAPPERS)('%s discloses nothing under any key at all', (_label, value) => {
+    for (const key of [...RENDERING_KEYS, 'url', 'password', 'bot_token', 'nkey_seed'])
+      expect(describeConfigValue(key, value)).not.toContain(SECRET);
   });
 
   it('still renders a value under an innocuous key, so the rows above are not vacuous', () => {
@@ -201,5 +185,48 @@ describe('a rendered value is one bounded line of harmless text', () => {
         `${label} is already harmless under JSON.stringify — it grades nothing`,
       ).toBe(true);
     }
+  });
+});
+
+/**
+ * CLASS: the render policy is keyed on the config key NAME, so the set it has to be right about is
+ * the set of names the backends DECLARE — not a list of credential-ish substrings kept beside the
+ * renderer. Read from each plugin's own `satisfies Record<keyof Required<…>>` block, so that a key
+ * added to any backend is graded by existing rather than by being remembered. `nkey_seed` and
+ * `creds_file` were declared keys the whole time the substring list was in force, and both rendered
+ * by value; nats escaped only by having kept a private shape-only renderer of its own.
+ */
+describe('an unrecognised backend_config key is described, never rendered by content', () => {
+  const declared = [...new Set(backendConfigDeclarations().flatMap((d) => d.keys))].sort();
+  const namedInSource = keysRenderedByName();
+  const everyKey = [...new Set([...declared, ...namedInSource])].sort();
+
+  it('reads the declarations at all, so the rows below are not vacuous', () => {
+    expect(declared.length).toBeGreaterThan(30);
+    expect(namedInSource.length).toBeGreaterThan(3);
+  });
+
+  it.each(everyKey)('%s renders by shape, or is recorded by name with a reason', (key) => {
+    const reason = RENDERED_BY_VALUE[key];
+    if (reason !== undefined) {
+      expect(reason, `${key} is rendered by value with no reason stated`).not.toBe('');
+      return;
+    }
+    expect(
+      describeConfigValue(key, `scheme://parley:${SECRET}@host/db`),
+      `${key} renders a declared config value by content and nothing says why that is safe`,
+    ).not.toContain(SECRET);
+  });
+
+  it('records no key no backend declares or renders', () => {
+    expect(
+      Object.keys(RENDERED_BY_VALUE).filter((key) => !everyKey.includes(key)),
+      'this entry excuses a key nothing in the repo uses',
+    ).toEqual([]);
+  });
+
+  it('still renders the keys it records, so the table is not a no-op', () => {
+    for (const key of Object.keys(RENDERED_BY_VALUE))
+      expect(describeConfigValue(key, 'a-visible-value')).toContain('a-visible-value');
   });
 });
