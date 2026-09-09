@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { codeOf, derivedRows } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 import {
   ASSERTED_PROPERTIES,
@@ -643,12 +644,28 @@ describe('the suite grades every backend it certifies', () => {
     expect(teardown as string).not.toMatch(/\bctx\b/);
   });
 
-  // A required context field nobody reads is a field a fixture author must supply for nothing —
-  // and, worse, looks like coverage.
-  // Matched as a property READ rather than as `ctx.<field>`: the teardown deliberately does not go
-  // through `ctx`, and pinning that one spelling would force it back onto the binding a rejected
-  // fixture leaves unassigned.
-  it.each(Object.keys(CONTEXT_FIELDS))('reads the required field `%s`', (field) => {
-    expect(source, `nothing in the suite reads \`${field}\``).toMatch(new RegExp(`\\.${field}\\b`));
+  /**
+   * A required context field nobody reads is a field a fixture author must supply for nothing —
+   * and, worse, looks like coverage.
+   *
+   * Matched as a property READ rather than as `ctx.<field>`: the teardown deliberately does not go
+   * through `ctx`, and pinning that one spelling would force it back onto the binding a rejected
+   * fixture leaves unassigned.
+   *
+   * Graded over COMMENT-STRIPPED code. `absentTopicBehaviour` has exactly one reader, and replacing
+   * it with a hardcoded branch plus a comment naming the field left this row green while the whole
+   * absent-topic capability arm went dead and every fixture author kept supplying the field.
+   */
+  const SUITE_CODE = codeOf(source);
+
+  it.each(
+    derivedRows('the required context fields', () => Object.keys(CONTEXT_FIELDS), {
+      floor: 4,
+      witness: ['absentTopicBehaviour', 'concurrentPost'],
+    }),
+  )('reads the required field `%s`', (field) => {
+    expect(SUITE_CODE, `nothing in the suite reads \`${field}\``).toMatch(
+      new RegExp(`\\.${field}\\b`),
+    );
   });
 });
