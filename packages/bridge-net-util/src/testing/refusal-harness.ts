@@ -29,8 +29,17 @@ export interface RefusalSpec {
    * a page size — which has no such list.
    */
   declared: readonly string[] | 'not backend_config';
-  /** Declared keys this validator deliberately does not grade, each with the reason it does not. */
-  ungraded?: Readonly<Record<string, string>>;
+  /**
+   * Declared keys this validator deliberately does not grade, each with a reason AND a WITNESS.
+   *
+   * A prose reason on its own is a hole with no floor: moving a key out of `keys` and into here
+   * deletes its whole block silently (measured: telegram's poll_timeout_s, 76 rows down to 58, 0
+   * failed), and nothing ever asserts that a reason STAYS true. The witness is a value the spec
+   * drives: `accepts` says this validator really does let the key through, and
+   * `refuses`+`unlabelled` says it throws in the shape the reason describes. A later fix that adds
+   * a refusal turns the exemption RED instead of quietly outliving it.
+   */
+  ungraded?: Readonly<Record<string, UngradedKey>>;
   /**
    * Corpus rows a key legitimately ACCEPTS, by row label, because the row's shape or text IS a
    * value that key takes — matrix's `invite` is an array of MXID strings, and a NATS subject prefix
@@ -63,6 +72,11 @@ export interface RefusalSpec {
  */
 export type Refusal = { threw: true; message: string } | { threw: false };
 
+/** An exemption's WITNESS: what this validator must still do with the key it does not grade. */
+export type UngradedKey =
+  | { readonly reason: string; readonly accepts: unknown }
+  | { readonly reason: string; readonly refuses: unknown; readonly unlabelled: RegExp };
+
 export const refusalOf = (spec: RefusalSpec, key: string, value: unknown): Refusal => {
   try {
     spec.validate(key, value);
@@ -87,6 +101,33 @@ export function expectRefusalMessage(spec: RefusalSpec, key: string, value: unkn
   const message = refusal.threw ? refusal.message : '';
   expect(message, `${key} was refused with an empty message, which grades nothing`).not.toBe('');
   return message;
+}
+
+/**
+ * Why an `ungraded` exemption no longer holds, or `undefined` while it does. Exported so the
+ * harness's own self-test can drive it against a validator that DOES refuse the witness — the
+ * failure mode the exemption exists to make impossible.
+ */
+export function ungradedWitnessFailure(
+  spec: RefusalSpec,
+  key: string,
+  entry: UngradedKey,
+): string | undefined {
+  if (entry.reason === '') return `${key} is exempted with no reason`;
+  if ('accepts' in entry) {
+    const refusal = refusalOf(spec, key, entry.accepts);
+    return refusal.threw
+      ? `${key} is exempted as ungraded, but this validator refuses its witness: ${refusal.message}`
+      : undefined;
+  }
+  const refusal = refusalOf(spec, key, entry.refuses);
+  if (!refusal.threw) {
+    return `${key} is exempted as producing an unlabelled refusal, but its witness was ACCEPTED`;
+  }
+  return entry.unlabelled.test(refusal.message)
+    ? undefined
+    : `${key} was refused with ${JSON.stringify(refusal.message)}, which is not the shape the ` +
+      `exemption states (${String(entry.unlabelled)})`;
 }
 
 /**
@@ -141,6 +182,13 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
           'refuses ... under its own label" grades something else',
       ).toEqual([]);
     });
+
+    it.each(Object.entries(spec.ungraded ?? {}))(
+      '%s is exempted by a witness that still holds',
+      (key, entry) => {
+        expect(ungradedWitnessFailure(spec, key, entry)).toBeUndefined();
+      },
+    );
 
     it('states no reason for a key it does grade, or does not declare', () => {
       const stale = Object.keys(spec.ungraded ?? {}).filter(

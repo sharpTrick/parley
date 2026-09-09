@@ -14,4 +14,8 @@ export {
   UNSAFE_TEXT,
   WRAPPING_A_SECRET,
 } from './hostile-config-values.js';
-export { expectLabelledRefusal, type RefusalSpec } from './refusal-harness.js';
+export {
+  expectLabelledRefusal,
+  type RefusalSpec,
+  type UngradedKey,
+} from './refusal-harness.js';

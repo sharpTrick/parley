@@ -1,5 +1,10 @@
 import { expectLabelledRefusal } from '@sharptrick/parley-net-util/testing';
-import { CONFIG_KEYS, requireNumericKnobs, type TelegramBackendConfig } from '../src/config.js';
+import {
+  assertKnownBackendConfig,
+  CONFIG_KEYS,
+  requireNumericKnobs,
+  type TelegramBackendConfig,
+} from '../src/config.js';
 
 const KNOBS = [
   'poll_timeout_s',
@@ -13,13 +18,31 @@ expectLabelledRefusal('telegram', {
   keys: KNOBS,
   declared: CONFIG_KEYS.keys,
   ungraded: {
-    token: 'refused by shape nowhere: a non-string token reaches the Bot API as one',
-    api_url: 'produces a bare unlabelled TypeError; carried as pre-existing debt, not this chunk',
-    store_path: 'produces a bare unlabelled TypeError; carried as pre-existing debt, not this chunk',
-    chat_map:
-      'a wrong-typed map is ACCEPTED and every topic is then used as a literal chat id; carried ' +
-      'as pre-existing debt, not this chunk',
+    token: {
+      reason: 'refused by shape nowhere: a non-string token reaches the Bot API as one',
+      accepts: 42,
+    },
+    api_url: {
+      reason:
+        'refused by shape nowhere in the config path; a non-string fails later at connect with a ' +
+        'bare unlabelled TypeError. Pre-existing debt, carried, not this chunk',
+      accepts: 42,
+    },
+    store_path: {
+      reason:
+        'refused by shape nowhere in the config path; a non-string fails later at first write ' +
+        'with a bare unlabelled TypeError. Pre-existing debt, carried, not this chunk',
+      accepts: 42,
+    },
+    chat_map: {
+      reason:
+        'a wrong-typed map is ACCEPTED and every topic is then used as a literal chat id; carried ' +
+        'as pre-existing debt, not this chunk',
+      accepts: 42,
+    },
   },
-  validate: (key, value) =>
-    void requireNumericKnobs({ [key]: value } as unknown as TelegramBackendConfig),
+  validate: (key, value) => {
+    assertKnownBackendConfig({ [key]: value });
+    requireNumericKnobs({ [key]: value } as unknown as TelegramBackendConfig);
+  },
 });

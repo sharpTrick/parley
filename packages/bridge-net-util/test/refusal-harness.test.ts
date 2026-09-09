@@ -4,6 +4,7 @@ import {
   expectRefusalMessage,
   refusalOf,
   type RefusalSpec,
+  ungradedWitnessFailure,
 } from '../src/testing/refusal-harness.js';
 
 const spec = (validate: RefusalSpec['validate']): RefusalSpec => ({
@@ -55,5 +56,50 @@ describe('the harness fails a validator that never refuses, instead of grading i
     expect(Object.hasOwn(accepted, 'message')).toBe(false);
     const refused = refusalOf(REFUSES, 'url', PLANTED_SECRET);
     expect(refused).toEqual({ threw: true, message: 'refused url' });
+  });
+});
+
+/**
+ * CLASS: an exemption that outlives its reason. `ungraded` deletes a key's WHOLE block — measured,
+ * moving telegram's `poll_timeout_s` out of its graded set and into `ungraded` with the reason
+ * 'nothing to see here' took that file from 76 passed to 58 passed, 0 failed, and no row could fire
+ * because the completeness check only asks about keys NOT graded. Prose cannot fail. The witness
+ * can, and this is the harness's own proof that it does.
+ */
+describe('an ungraded exemption is only as good as its witness', () => {
+  it('holds while the validator really accepts the witness', () => {
+    expect(
+      ungradedWitnessFailure(ACCEPTS_EVERYTHING, 'url', { reason: 'nothing grades it', accepts: 42 }),
+    ).toBeUndefined();
+  });
+
+  it('fails once the validator starts refusing the witness', () => {
+    expect(
+      ungradedWitnessFailure(REFUSES, 'url', { reason: 'nothing grades it', accepts: 42 }),
+    ).toMatch(/exempted as ungraded, but this validator refuses its witness/);
+  });
+
+  it('fails on an exemption with no reason', () => {
+    expect(ungradedWitnessFailure(ACCEPTS_EVERYTHING, 'url', { reason: '', accepts: 42 })).toMatch(
+      /exempted with no reason/,
+    );
+  });
+
+  it('holds for an unlabelled refusal whose shape is stated, and fails when the shape changes', () => {
+    const entry = { reason: 'a bare TypeError', refuses: 42, unlabelled: /^refused url$/ };
+    expect(ungradedWitnessFailure(REFUSES, 'url', entry)).toBeUndefined();
+    expect(
+      ungradedWitnessFailure(REFUSES, 'url', { ...entry, unlabelled: /^something else$/ }),
+    ).toMatch(/is not the shape the exemption states/);
+  });
+
+  it('fails when a refusal the exemption promised stops happening', () => {
+    expect(
+      ungradedWitnessFailure(ACCEPTS_EVERYTHING, 'url', {
+        reason: 'a bare TypeError',
+        refuses: 42,
+        unlabelled: /^refused url$/,
+      }),
+    ).toMatch(/its witness was ACCEPTED/);
   });
 });
