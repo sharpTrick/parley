@@ -714,3 +714,80 @@ describe('the suite runs against a sandboxed state directory, not the developer�
     expect(path.startsWith(join(homedir(), '.local'))).toBe(false);
   });
 });
+
+/**
+ * CLASS: a table that registers NOTHING, in the one place nothing reports it. `it.each([])` runs no
+ * case and the file passes; scripts/assert-no-skipped-tests.mjs cannot see it either — that gate
+ * scores the groups it finds in the run's assertion results, and a group that produced no row has no
+ * key there. Its file-level check catches a file with no cases at all, not a group inside one:
+ * WATCHED at head, planting `it.each([] as string[])(...)` at the end of a 42-case file and feeding
+ * the JSON report to the gate printed `ok: 42 cases across 1 test files, none skipped away`, exit 0.
+ *
+ * The report loses the group. The SOURCE does not, which is why this is a lint.
+ */
+describe('no it.each table can register nothing', () => {
+  /**
+   * The second rule is narrowed to tables ROOTED IN A FILESYSTEM READ. "Any `.each(identifier)` not
+   * produced by derivedRows" was the wider instruction, and it names 193 sites — almost all of them
+   * a `flatMap` over a literal declared beside it, which cannot narrow past what is written there. A
+   * register of 193 would be a rubber stamp; a walk that comes back short is the real exposure.
+   */
+  const FILESYSTEM_READ = /\b(?:readdirSync|filesUnder|workspacePackages|backendPackages|globSync)\s*\(/;
+
+  const bindingOf = (code: string, name: string): string | undefined =>
+    new RegExp(`(?:const|let|var)\\s+${name}\\b[^=\\n]*=\\s*([\\s\\S]*?);\\n`).exec(code)?.[1];
+
+  const ungradedTables = (source: string): string[] => {
+    const code = codeOf(source);
+    const out: string[] = [];
+    if (/\.each\(\s*(?:\[\s*\]|\[\s*\]\s+as\b)/.test(code)) out.push('.each([])');
+    for (const use of code.matchAll(/\.each\(\s*([A-Za-z_$][\w$]*)\s*\)/g)) {
+      const name = use[1]!;
+      const rhs = bindingOf(code, name);
+      if (rhs !== undefined && FILESYSTEM_READ.test(rhs) && !/\bderivedRows\s*\(/.test(rhs))
+        out.push(`.each(${name})`);
+    }
+    return out;
+  };
+
+  it.each([
+    ['an empty table', 'it.each([])(\'%s\', () => {});', ['.each([])']],
+    ['an empty table with a type assertion', "it.each([] as string[])('%s', () => {});", ['.each([])']],
+    ['a spaced empty table', 'it.each([ ])(\'%s\', () => {});', ['.each([])']],
+    ['a tree walk that is not graded', "const f = readdirSync(D).sort();\nit.each(f)('%s', () => {});", ['.each(f)']],
+    ['the same walk through derivedRows', "const f = derivedRows('f', () => readdirSync(D), { floor: 1, witness: ['x'] });\nit.each(f)('%s', () => {});", []],
+    ['a literal table', "const f = [['a'], ['b']];\nit.each(f)('%s', () => {});", []],
+    ['a walk narrated in a comment', '// it.each([]) would be a hole\nit.each([1])(\'%s\', () => {});', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(ungradedTables(source)).toEqual(found);
+  });
+
+  /** Sites allowed to register a filesystem-rooted table by hand. Empty is the intended state. */
+  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [];
+
+  const tabled = derivedRows(
+    'every source and test file in the repo',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(p.dir, ['.ts']))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 200,
+      witness: [
+        'packages/bridge-core/src/source-hygiene.test.ts',
+        'packages/bridge-redis/test/test-hygiene.test.ts',
+        'packages/bridge-telegram/test/docs.test.ts',
+      ],
+    },
+  );
+
+  it.each(tabled)('%s', (name, file) => {
+    const found = KEEPS.some(([f]) => f === name) ? [] : ungradedTables(readFileSync(file, 'utf8'));
+    expect(
+      found,
+      'this table can come back empty or short with the file reporting success — build it with ' +
+        '`derivedRows`, which registers a case of its own for the floor and the witnesses',
+    ).toEqual([]);
+  });
+});

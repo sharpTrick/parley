@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { derivedRows } from '@sharptrick/parley-net-util/testing';
 
 // Rules about this package's own test files, guarded by construction rather than per row, so a future
 // case cannot re-introduce either defect by being new.
@@ -9,9 +10,11 @@ const HERE = new URL('.', import.meta.url);
 /** `support.ts` owns every endpoint this package's tests connect to; every other file goes through it. */
 const OWNS_ENDPOINTS = 'support.ts';
 
-const files = readdirSync(HERE)
-  .filter((f) => /\.ts$/.test(f) && f !== OWNS_ENDPOINTS)
-  .sort();
+const files = derivedRows(
+  'every test module in this package',
+  () => readdirSync(HERE).filter((f) => /\.ts$/.test(f) && f !== OWNS_ENDPOINTS).sort(),
+  { floor: 5, witness: ['failure-modes.test.ts', 'live-stream.test.ts'] },
+);
 
 const sourceOf = (file: string): string => readFileSync(new URL(file, HERE), 'utf8');
 

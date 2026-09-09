@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as eviction from './eviction.js';
 import { escapeHtml } from './html.js';
 import { ConsentError, ParleyOAuthProvider, type ParleyOAuthProviderOptions } from './oauth-provider.js';
+import { derivedRows } from '@sharptrick/parley-net-util/testing';
 
 const RESOURCE = new URL('https://bridge.example/mcp');
 const REDIRECT = 'https://app.example/cb';
@@ -1384,13 +1385,19 @@ describe('the auth layer escapes at every interpolation of every page it renders
       .filter(([expr, bound]) => !escapes(expr, bound))
       .map(([expr]) => expr);
 
-  const pages = readdirSync(DIR)
-    .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
-    .flatMap((file) =>
-      interpolationsInMarkup(readFileSync(`${DIR}${file}`, 'utf8')).map(
-        ([expr, bound]): [string, string, Map<string, string>] => [file, expr, bound],
-      ),
-    );
+  const pages = derivedRows(
+    'every interpolation in a served page',
+    () =>
+      readdirSync(DIR)
+        .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+        .sort()
+        .flatMap((file) =>
+          interpolationsInMarkup(readFileSync(`${DIR}${file}`, 'utf8')).map(
+            ([expr, bound]): [string, string, Map<string, string>] => [file, expr, bound],
+          ),
+        ),
+    { floor: 1, witness: ['consent-page.ts'] },
+  );
 
   it('finds the interpolations to check', () => {
     expect(new Set(pages.map(([file]) => file)).size).toBeGreaterThan(0);

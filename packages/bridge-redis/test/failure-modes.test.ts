@@ -22,6 +22,7 @@ import {
   SECRET,
   withArgs,
 } from './resp-server.js';
+import { derivedRows } from '@sharptrick/parley-net-util/testing';
 import {
   activeHandles,
   endpointOf,
@@ -174,7 +175,11 @@ describe('redis failure modes — backend_config validation', () => {
 // ---------------------------------------------------------------------------------------------
 
 const EXAMPLES = new URL('../../../examples/multi-session/redis/', import.meta.url);
-const exampleFiles = readdirSync(EXAMPLES).filter((f) => /\.ya?ml$/.test(f));
+const exampleFiles = derivedRows(
+  'the shipped redis example configs',
+  () => readdirSync(EXAMPLES).filter((f) => /\.ya?ml$/.test(f)).sort(),
+  { floor: 1, witness: ['.yaml'] },
+);
 
 /** Every validator message that means "this file cannot load", as opposed to "the server is away". */
 const REJECTED_BY_VALIDATION = new RegExp(

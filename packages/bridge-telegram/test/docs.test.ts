@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
 import { SERVED_ID_MEMORY } from '../src/store.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
+import { derivedRows } from '@sharptrick/parley-net-util/testing';
 import {
   captureStderr,
   coldRestart,
@@ -307,7 +308,11 @@ describe('telegram chat-cap claims are executed, not just written', () => {
  * `src/`, so a new module is covered the moment it lands.
  */
 describe('telegram source imports are all used', () => {
-  const modules = readdirSync(join(here, '..', 'src')).filter((f) => f.endsWith('.ts'));
+  const modules = derivedRows(
+    'every telegram source module',
+    () => readdirSync(join(here, '..', 'src')).filter((f) => f.endsWith('.ts')).sort(),
+    { floor: 3, witness: ['config.ts'] },
+  );
   const specifiersOf = (text: string): string[] => {
     const imported: string[] = [];
     for (const statement of text.matchAll(/^import\s+([\s\S]*?)\s+from\s+'[^']+';$/gm)) {
