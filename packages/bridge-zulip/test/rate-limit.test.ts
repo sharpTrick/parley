@@ -6,7 +6,7 @@
  * default instead) and an unbounded one (waiting an hour) both fail here.
  */
 import { asTopic } from '@sharptrick/parley-core';
-import { DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS } from '@sharptrick/parley-net-util';
+import { DEFAULT_BACKOFF_MS } from '@sharptrick/parley-net-util';
 import { describe, expect, it } from 'vitest';
 import { rand, SENDER, useZulip } from './harness.js';
 
@@ -38,12 +38,12 @@ const RETRY_ROWS: RetryRow[] = [
     window: [200, 600],
   },
   { name: 'neither, falling back to the shared default', window: [DEFAULT_BACKOFF_MS - 50, 1500] },
-  // Above the clamp on a self-chosen backoff, inside the call deadline: honoured in full, because
-  // retrying sooner than the server asked is what escalates a rate limit.
+  // An order of magnitude above the hintless default, inside the call deadline: honoured in full,
+  // because retrying sooner than the server asked is what escalates a rate limit.
   {
-    name: 'a hint above the self-imposed clamp',
-    bodySeconds: (MAX_BACKOFF_MS + 2_000) / 1000,
-    window: [MAX_BACKOFF_MS + 1_800, MAX_BACKOFF_MS + 4_000],
+    name: 'a hint an order of magnitude above the hintless default',
+    bodySeconds: 7,
+    window: [6_800, 9_000],
   },
 ];
 

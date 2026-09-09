@@ -81,8 +81,8 @@ export type SlackApiCall = <T extends { ok: boolean }>(
  * Single Web API entry point: `POST <api_url>/<method>`, `Authorization: Bearer <token>`, body
  * `application/x-www-form-urlencoded`. Keep every method form-encoded, so that read methods
  * receive their args at all — slack.com silently ignores a JSON body for those. `ok:false` is
- * interpreted here rather than in the shared HTTP helper, which owns the 429 retry loop, the
- * `Retry-After` header and the backoff clamp.
+ * interpreted here rather than in the shared HTTP helper, which owns the 429 retry loop and the
+ * `Retry-After` header.
  */
 export function slackApiCall(host: {
   settings: () => SlackSettings;

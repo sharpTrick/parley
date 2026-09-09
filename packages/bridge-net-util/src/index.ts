@@ -33,8 +33,6 @@ export const DEFAULT_BACKOFF_MS = 500;
  * `Retry-After` header is not bounded by it and still governs alone.
  */
 export const MAX_BODY_WAIT_MS = 3_600_000;
-/** Ceiling on a backoff we invented ourselves. A server-stated hint is honoured past it. */
-export const MAX_BACKOFF_MS = 5_000;
 /** Attempts a single call will make before giving up. */
 export const DEFAULT_MAX_ATTEMPTS = 8;
 /** Wall-clock ceiling on a single call, kept under `catchup.block_max_ms` (DESIGN §11). */
@@ -44,20 +42,6 @@ export const DEFAULT_DEADLINE_MS = 30_000;
  * caller never sees is bounded far tighter than this — see {@link fetchWithRetry}.
  */
 export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
-
-/**
- * Normalize a backoff a PLUGIN chose itself (a reconnect ladder, a poll interval) into
- * `[DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS]`. `Number(null)` and `Number('')` are both `0`, so an
- * unchecked parse reads as "retry now"; the floor turns that — and every other figure under it —
- * into a wait, so a ladder built on a misparsed hint cannot hot-spin.
- *
- * It does NOT bound a wait the server asked for, and {@link fetchWithRetry} deliberately does not
- * put it on a stated hint: see there.
- */
-export function clampBackoff(ms: number | undefined): number {
-  if (ms === undefined || !Number.isFinite(ms)) return DEFAULT_BACKOFF_MS;
-  return Math.min(Math.max(ms, DEFAULT_BACKOFF_MS), MAX_BACKOFF_MS);
-}
 
 export interface FetchWithRetryOptions {
   /** Error-message prefix, e.g. `Slack chat.postMessage` or `Matrix GET /sync`. */

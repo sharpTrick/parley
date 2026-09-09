@@ -10,7 +10,6 @@
 import {
   DEFAULT_BACKOFF_MS,
   DEFAULT_DEADLINE_MS,
-  MAX_BACKOFF_MS,
 } from '@sharptrick/parley-net-util';
 import { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS } from '../src/index.js';
 import { readFileSync } from 'node:fs';
@@ -33,7 +32,6 @@ describe('slack rate-limit docs track the shared helper', () => {
   it('names every net-util constant it depends on, by value', () => {
     const text = paragraph();
     for (const [name, ms] of [
-      ['MAX_BACKOFF_MS', MAX_BACKOFF_MS],
       ['DEFAULT_DEADLINE_MS', DEFAULT_DEADLINE_MS],
     ] as const) {
       expect(text, `${name} value missing`).toContain(seconds(ms));

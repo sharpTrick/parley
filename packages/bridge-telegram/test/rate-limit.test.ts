@@ -30,7 +30,7 @@ describe('telegram 429 backoff', () => {
     { name: 'body 0 falls through to the default', retryAfterBody: 0, expected: 500 },
     { name: 'negative body falls through to the default', retryAfterBody: -3, expected: 500 },
     { name: 'no hint at all', expected: 500 },
-    { name: 'a stated wait past the invented-backoff clamp', retryAfterBody: 6, expected: 6000 },
+    { name: 'a stated wait well past the hintless default', retryAfterBody: 6, expected: 6000 },
     { name: 'a flood wait in the body', retryAfterBody: 30, expected: 'ends the call' as const },
     { name: 'a flood wait in the header', retryAfterHeader: 45, expected: 'ends the call' as const },
     { name: 'an absurd flood wait', retryAfterBody: 600, expected: 'ends the call' as const },

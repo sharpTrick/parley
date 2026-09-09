@@ -56,6 +56,22 @@ export function packageSources(
   return out;
 }
 
+/** Every package's README, as a source file, so a claim in prose is scanned with the code. */
+export function packageDocs(root: URL = PACKAGES, selfDir: string = SELF_DIR): SourceFile[] {
+  const out: SourceFile[] = [];
+  for (const pkg of readdirSync(root)) {
+    if (pkg === selfDir) continue;
+    const path = `${pkg}/README.md`;
+    try {
+      const text = readFileSync(new URL(path, root), 'utf8');
+      out.push({ pkg, path, text, code: text });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
 /**
  * Whether a file loads this package as a MODULE — `from '…'`, `import('…')`, `vi.mock('…')` — rather
  * than merely spelling its name. Keep the module position required, so that a package listing this

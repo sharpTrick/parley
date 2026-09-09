@@ -106,8 +106,8 @@ export function pageAnchor(id: unknown, from: string, backwards: boolean): strin
 
 /**
  * Zulip 429s carry `Retry-After` (header) and `retry-after` (JSON body), both in SECONDS. Returns
- * undefined when neither is usable, so the shared default and the shared ceiling stay in
- * `clampBackoff` rather than being re-implemented — and re-tuned — per backend.
+ * undefined when neither is usable, so the shared default applies rather than a wait re-tuned
+ * here.
  */
 export const readRetryAfter = bodyRetryAfter<{ 'retry-after'?: number }>(
   (b) => b['retry-after'],
