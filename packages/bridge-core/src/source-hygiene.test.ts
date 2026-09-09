@@ -240,6 +240,21 @@ describe('source hygiene', () => {
   const MEASUREMENT = /\b(?:was measured at|benchmarked at|measured \d+\s*m?s\b)/i;
 
   /**
+   * The three rules four per-package comment lints enforced over four private walkers, covering
+   * four of twelve packages. Widening them is the point of the consolidation, and the price of
+   * widening is that two clauses had to go: `only ever` matched 65 sites and `used to be` 33, nearly
+   * all of them describing what the code does rather than narrating a revision, so keeping them
+   * would have meant either a rule the repository cannot satisfy or a per-package allowlist.
+   */
+  const REJECTED_ALTERNATIVE = /\bwe chose\b|\brather than doing\b/i;
+  const REVIEWER_NOTE =
+    /\bas (?:discussed|requested)\b|\bper review\b|\bthe reviewer (?:asked|wanted|suggested|requested|filed)\b/i;
+  const EARLIER_REVISION =
+    /\bfor historical reasons\b|\bbefore this change\b|\bas before\b|\bwe now\b|\bpreviously we\b/i;
+  const SAFETY_CLAIM =
+    /\b(?:stays safe|is safe because|is mutable because|no risk|perfectly (?:safe|fine))\b/i;
+
+  /**
    * The prime directive as a prose rule. `bridge-core` must never depend on a backend plugin, and a
    * comment that explains core's behaviour by pointing AT one is that dependency in the only form
    * the import graph cannot catch. It also rots invisibly: the instance that prompted this rule said
@@ -394,6 +409,71 @@ describe('source hygiene', () => {
       ],
     },
     {
+      label: 'argues that the code is safe instead of warning about a risk',
+      pattern: SAFETY_CLAIM,
+      files: codeFiles,
+      advice: 'a comment warns a future developer off a risky action; it does not reassure one',
+      fires: [
+        'the cast stays safe here',
+        'this is safe because the caller holds the lock',
+        'the array is mutable because nothing else reads it',
+        'there is no risk of a torn write',
+        'reusing the buffer is perfectly safe',
+        'dropping the row is perfectly fine',
+      ],
+      passes: [
+        'keep the lock held, so a torn write cannot happen',
+        'a safe default, so an unconfigured deployment refuses rather than guesses',
+        'the risk is a lost wakeup',
+      ],
+    },
+    {
+      label: 'records a rejected alternative',
+      pattern: REJECTED_ALTERNATIVE,
+      files: codeFiles,
+      advice: 'why one approach beat another belongs in the commit message',
+      fires: ['we chose a Set here', 'rather than doing it per message'],
+      passes: [
+        'the caller chose the topic; the plugin resolves the channel',
+        'choose the stricter arm, so a backend cannot weaken its own grade',
+      ],
+    },
+    {
+      label: 'addresses a reviewer',
+      pattern: REVIEWER_NOTE,
+      files: codeFiles,
+      advice: 'a comment is read by whoever changes the code next, not by whoever reviewed it',
+      fires: [
+        'as discussed, this stays',
+        'left as requested',
+        'kept per review',
+        'the reviewer asked for this clamp',
+      ],
+      passes: [
+        'Review the page order before trusting the cursor it yields',
+        'as documented upstream, the page cap is 100',
+        'a frozen record of what a reviewer said',
+      ],
+    },
+    {
+      label: 'compares the code to an earlier revision',
+      pattern: EARLIER_REVISION,
+      files: codeFiles,
+      advice: 'describe what the code does; what it did belongs in the commit message',
+      fires: [
+        'kept for historical reasons',
+        'before this change the socket stayed open',
+        'as before, the cursor stays opaque to core',
+        'we now clamp the page to 100',
+        'previously we packed the sequence by hand',
+      ],
+      passes: [
+        'the instance id used to namespace per-instance read state',
+        'the cursor used to page the channel is opaque to core',
+        'now that the lock is held, the read is stable',
+      ],
+    },
+    {
       label: 'dates itself',
       pattern: TEMPORAL,
       files: codeFiles,
@@ -423,6 +503,10 @@ describe('source hygiene', () => {
       'in bridge-core, names a backend plugin package',
       'cites an issue tracker',
       'quotes a measurement',
+      'argues that the code is safe instead of warning about a risk',
+      'records a rejected alternative',
+      'addresses a reviewer',
+      'compares the code to an earlier revision',
       'dates itself',
     ]);
     for (const lint of LINTS) {

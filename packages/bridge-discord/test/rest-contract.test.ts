@@ -1108,8 +1108,8 @@ describe('Discord REST contract', () => {
         },
       },
       {
-        // A CONTROL: a transient failure of the check itself must not cost the other topics either,
-        // and must not drop a subscription whose channel may be perfectly fine.
+        // A CONTROL: keep the other topics subscribed, so that a transient failure of the check
+        // itself cannot cost a channel that is still reachable.
         label: 'a transient 500 on the channel check',
         arrange: (id) => {
           fake.createChannel(id);

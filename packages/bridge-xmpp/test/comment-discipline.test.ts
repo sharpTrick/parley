@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { derivedRows, filesUnder } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 // Class: a comment that restates the line beneath it. CLAUDE.md makes a comment earn its place only
@@ -29,15 +29,6 @@ interface Comment {
   line: number;
   text: string;
 }
-
-const tsFiles = (dir: string): string[] =>
-  readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory()
-      ? tsFiles(join(dir, e.name))
-      : e.name.endsWith('.ts')
-        ? [join(dir, e.name)]
-        : [],
-  );
 
 /**
  * Everything on a line that is not code. Escape pairs go first — `\\/` inside a regex literal is
@@ -70,10 +61,9 @@ export const lineComments = (source: string, file = ''): Comment[] => {
 };
 
 describe('every line comment in bridge-xmpp/src states a risk', () => {
-  const files = tsFiles(SRC);
-
-  it('finds sources to check (guards against a broken walk)', () => {
-    expect(files.length).toBeGreaterThan(1);
+  const files = derivedRows('every xmpp source module', () => filesUnder(SRC), {
+    floor: 5,
+    witness: ['index.ts', 'archive.ts'],
   });
 
   it('no comment restates the code instead of warning about it', () => {

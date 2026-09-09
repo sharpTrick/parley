@@ -1,38 +1,17 @@
-/**
- * CLAUDE.md puts review history and alternatives-considered prose in the COMMIT message: a comment
- * that argues with a reviewer rots against the code and cannot be read where a reader looks for
- * history. A comment earns its place only by warning about a risk.
- *
- * Only what is STRICTER than the repo-wide lint is here. Tracker and issue tags are graded for
- * every package by `bridge-core/src/source-hygiene.test.ts`; what remains is prose that ARGUES a
- * choice is safe rather than warning about a risk, and prose DUPLICATED from the README, where the
- * copy rots independently of the original.
- */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { commentaryLines, derivedRows, filesUnder } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
-/** Every `.ts` under `dir` at ANY depth, so a new subdirectory is a linted row the day it appears. */
-const sourcesUnder = (dir: string): string[] =>
-  readdirSync(dir, { recursive: true })
-    .map(String)
-    .map((f) => f.split(sep).join('/'))
-    .filter((f) => f.endsWith('.ts'));
-
+/**
+ * One rule about this package's source that the repo-wide lints do not carry. The banned PHRASINGS
+ * this file used to hold — a rejected alternative, a note addressed to a reviewer, an argument that
+ * the code is safe — are graded for every package by `bridge-core/src/source-hygiene.test.ts`; a
+ * copy here would be a second implementation of one rule, with its own universe to fall behind in.
+ */
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
-const README = fileURLToPath(new URL('../README.md', import.meta.url));
-
-/** Each pattern is a shape of comment that belongs in a commit message instead. */
-const BANNED = [
-  { name: 'a rejected alternative', re: /\b(instead would|would have been|we chose|rather than doing)\b/i },
-  { name: 'a note addressed to a reviewer', re: /\b(reviewer|as (?:discussed|requested)|per review)\b/i },
-  {
-    name: 'an argument that the code is safe rather than a warning about a risk',
-    re: /\b(stays safe|is safe because|only ever|is mutable because|no risk|perfectly (?:safe|fine))\b/i,
-  },
-];
+const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 
 /**
  * A duplicated stretch this long is prose that was moved, not a phrase two authors landed on: the
@@ -54,70 +33,32 @@ const runs = (words: string[], n: number): Set<string> => {
   return out;
 };
 
-function commentLines(source: string): Array<{ line: number; text: string }> {
-  const out: Array<{ line: number; text: string }> = [];
-  let inBlock = false;
-  source.split('\n').forEach((raw, i) => {
-    const text = raw.trim();
-    if (inBlock) {
-      out.push({ line: i + 1, text });
-      if (text.includes('*/')) inBlock = false;
-      return;
-    }
-    if (text.startsWith('/*')) {
-      out.push({ line: i + 1, text });
-      if (!text.includes('*/')) inBlock = true;
-      return;
-    }
-    if (text.startsWith('//')) out.push({ line: i + 1, text });
-  });
-  return out;
-}
+const sharedWithReadme = (source: string, readme: string): string[] => {
+  const inReadme = runs(normalize(readme), MAX_SHARED_RUN);
+  return [...runs(normalize(commentaryLines(source).join(' ')), MAX_SHARED_RUN)].filter((r) =>
+    inReadme.has(r),
+  );
+};
 
-describe('zulip source comments carry risks, not history', () => {
-  const files = sourcesUnder(SRC);
+describe('no comment restates the README', () => {
+  const TWELVE = 'the cursor is opaque to core and is never ordered or deduped on a timestamp';
 
-  it('finds the package source to lint', () => {
-    expect(files.length).toBeGreaterThan(0);
+  it('reads a moved paragraph, and leaves an incidental overlap alone', () => {
+    expect(sharedWithReadme(`// ${TWELVE}\n`, `prose ${TWELVE} prose`)).not.toEqual([]);
+    expect(sharedWithReadme('// the cursor is opaque to core\n', `prose ${TWELVE} prose`)).toEqual([]);
+    expect(sharedWithReadme(`const s = '${TWELVE}';\n`, `prose ${TWELVE} prose`)).toEqual([]);
   });
 
-  for (const file of files) {
-    for (const banned of BANNED) {
-      it(`${file} has no comment carrying ${banned.name}`, () => {
-        const offenders = commentLines(readFileSync(`${SRC}${file}`, 'utf8'))
-          .filter((c) => banned.re.test(c.text))
-          .map((c) => `${file}:${c.line}: ${c.text}`);
-        expect(offenders).toEqual([]);
-      });
-    }
+  const files = derivedRows(
+    'every zulip source module',
+    () => filesUnder(SRC).map((f) => [relative(SRC, f), f] as const),
+    { floor: 5, witness: ['index.ts', 'http.ts'] },
+  );
 
-    it(`${file} has no comment prose duplicated from the README`, () => {
-      const comments = normalize(
-        commentLines(readFileSync(`${SRC}${file}`, 'utf8'))
-          .map((c) => c.text)
-          .join(' '),
-      );
-      const readme = runs(normalize(readFileSync(README, 'utf8')), MAX_SHARED_RUN);
-      const shared = [...runs(comments, MAX_SHARED_RUN)].filter((r) => readme.has(r));
-      expect(shared).toEqual([]);
-    });
-  }
-});
-
-/**
- * The walk against a tree built to defeat a flat one — run through the SAME function the lint runs
- * through, never a second listing typed out here. A `readdirSync(SRC)` that does not recurse keeps
- * passing the day this package grows an `src/` subdirectory, and a `files.length > 0` guard cannot
- * tell that from a full scan.
- */
-describe('the lint sees every source file, at every depth', () => {
-  it('descends into subdirectories', () => {
-    const root = mkdtempSync(join(tmpdir(), 'zulip-lint-'));
-    mkdirSync(join(root, 'a', 'b'), { recursive: true });
-    writeFileSync(join(root, 'a', 'b', 'deep.ts'), 'export const x = 1;\n');
-    writeFileSync(join(root, 'shallow.ts'), 'export const y = 1;\n');
-    writeFileSync(join(root, 'notes.md'), 'not a source\n');
-    expect(sourcesUnder(root).sort()).toEqual(['a/b/deep.ts', 'shallow.ts']);
-    rmSync(root, { recursive: true, force: true });
+  it.each(files)('%s carries no prose lifted from the README', (_name, file) => {
+    expect(
+      sharedWithReadme(readFileSync(file, 'utf8'), README),
+      'this paragraph lives in the README; a second copy in a comment drifts against it',
+    ).toEqual([]);
   });
 });

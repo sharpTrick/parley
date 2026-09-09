@@ -225,8 +225,8 @@ describe('the start-up window is dark on push and reconciled by the next catch-u
  * The overlap the reconciliation is allowed to have. `catchUpTopic` and `parley_fetch_recent` both
  * persist through `ReadStateStore`, so an agent that reads and then reads again sees the window
  * once — but a caller is free to pass a cursor of its own, and one BEHIND the position it holds
- * re-serves rows it already had. That is safe because core's dedup absorbs the repeat, and this is
- * where that is executed rather than asserted in prose.
+ * re-serves rows it already had. Core's dedup is what absorbs the repeat, and this is where that is
+ * executed rather than asserted in prose.
  */
 describe('a read from a stale cursor of the caller’s own re-serves, and dedup absorbs it', () => {
   it('re-reading from a stale cursor re-serves the window, and the seen-set absorbs it', async () => {

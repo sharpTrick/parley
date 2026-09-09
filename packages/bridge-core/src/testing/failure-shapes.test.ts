@@ -103,10 +103,9 @@ const vectorOf = (p: Probe): number[] =>
 /**
  * The arms that could be DELETED with every row below still green: an arm holding no property that
  * some OTHER arm does not also hold. The per-property floor cannot see one — it asks whether SOME
- * arm still has each property, which the survivors answer. Measured at head before this existed: deleting `rejects` AND
- * `rejects synchronously` left 16 passed, the same count as before — every consumer is an
- * `it.each(FAILURE_SHAPE_NAMES)`, so they all shrink with the table, and `rejects` is the canonical
- * baseline arm whose deletion is invisible repo-wide.
+ * arm still has each property, which the survivors answer. Every consumer is an
+ * `it.each(FAILURE_SHAPE_NAMES)`, so the whole suite shrinks with the table and a deleted arm costs
+ * no row anywhere.
  */
 const deletable = (vectors: ReadonlyArray<readonly [string, readonly number[]]>): string[] =>
   vectors
