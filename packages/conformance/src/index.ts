@@ -70,6 +70,11 @@ export {
   CONTEXT_FIELDS,
   openContext,
 } from './factory.js';
+export {
+  expectPoisonCostsOneMessage,
+  POISON_RECORD_CLAUSE,
+  type PoisonedBatch,
+} from './poison-record.js';
 
 /**
  * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend conforms
