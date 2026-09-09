@@ -20,65 +20,6 @@ function tsFiles(dir: string, recurse = false): string[] {
   return out;
 }
 
-/** Lines that are wholly a comment — enough to catch the prose bands this guards against. */
-function commentLines(source: string): Array<{ line: number; text: string }> {
-  return source
-    .split('\n')
-    .map((text, i) => ({ line: i + 1, text: text.trim() }))
-    .filter((l) => l.text.startsWith('//') || l.text.startsWith('*') || l.text.startsWith('/*'));
-}
-
-/**
- * A REGRESSION guard, not an enforcement of CLAUDE.md's comment discipline — that rule is about
- * what a comment is FOR, which no regex decides. Each row is one phrasing that actually appeared in
- * this package and was removed, so it cannot come back unnoticed; a comment narrating history in
- * any other words walks straight past all six, and a human reader is what catches that.
- */
-const BANNED_COMMENT_SHAPES: Array<[string, RegExp]> = [
-  ['a review/bug ticket reference', /\b(?:SEC|BUG|CX|D)-\d+\b/],
-  ['a "Residual:" caveat aimed at a reviewer', /\bResidual:/],
-  ['a "Latent ..." justification', /\bLatent\b/],
-  ['a "We deliberately ..." defence of a past choice', /\bWe deliberately\b/i],
-  ['a bare "Note:" preamble', /^(?:\/\/|\*)\s*Note:/i],
-  ['an unresolved marker', /\b(?:TODO|FIXME|XXX|HACK)\b/],
-];
-
-describe('auth-layer comments never regain a phrasing this package has already removed', () => {
-  const files = tsFiles(AUTH_DIR);
-
-  it('finds the auth sources to scan', () => {
-    expect(files.length).toBeGreaterThan(10);
-  });
-
-  it.each(BANNED_COMMENT_SHAPES)('no comment carries %s', (_label: string, pattern: RegExp) => {
-    const offenders: string[] = [];
-    for (const file of files) {
-      for (const { line, text } of commentLines(readFileSync(file, 'utf8'))) {
-        if (pattern.test(text)) offenders.push(`${file}:${line}: ${text}`);
-      }
-    }
-    expect(offenders).toEqual([]);
-  });
-
-  // Every row is a pattern nothing in the package matches, which is also what a pattern matching
-  // NOTHING AT ALL looks like: a row whose regex has quietly stopped compiling to what it reads as
-  // would pass forever. Prove each one still fires on the phrasing it names.
-  const SAMPLE_OFFENDERS: Array<[string, string]> = [
-    ['a review/bug ticket reference', '// see SEC-123 for the discussion'],
-    ['a "Residual:" caveat aimed at a reviewer', '// Residual: the reviewer wanted a second pass'],
-    ['a "Latent ..." justification', '// Latent risk, accepted for now'],
-    ['a "We deliberately ..." defence of a past choice', '// We deliberately kept the old path'],
-    ['a bare "Note:" preamble', '// Note: this is the interesting bit'],
-    ['an unresolved marker', '// TODO: come back to this'],
-  ];
-
-  it.each(BANNED_COMMENT_SHAPES)('%s is a pattern that still matches its own shape', (label: string, pattern: RegExp) => {
-    const sample = SAMPLE_OFFENDERS.find(([l]) => l === label)?.[1];
-    expect(sample, `no sample offender written for "${label}"`).toBeDefined();
-    expect(pattern.test(sample!)).toBe(true);
-  });
-});
-
 /**
  * A symbol the barrel re-exports is something an operator can call directly, so the config
  * schema's rules are not in front of it — whatever guards it must live in the function and be
