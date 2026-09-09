@@ -14,7 +14,7 @@ import {
 } from '../test-support/nonconformant.js';
 import { catchUpAll, catchUpTopic, MAX_CATCHUP_PAGES } from './catchup.js';
 import { ReadStateStore } from './read-state.js';
-import { SeenSet } from './seen-set.js';
+import { SEEN_MAX_PER_TOPIC, SeenSet } from './seen-set.js';
 
 const rsPath = () => join(mkdtempSync(join(tmpdir(), 'parley-cu-')), 'read-state.json');
 
@@ -90,12 +90,12 @@ describe('catch-up driver', () => {
     const seen = new SeenSet();
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(3);
     for (let i = 0; i < 2; i++) await p.post(T, me, `b${i}`);
-    // The agent read the first three through the tool, which is what moves the position.
-    readState.set(T, asCursor('3'));
+    // NO hand-advancement between the calls. Writing the agent's position here is what let this
+    // case stay green while the driver re-read the whole backlog on every boot: the driver's own
+    // marker is what has to make the next start incremental, and the agent's position must not move.
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(2);
-    readState.set(T, asCursor('5'));
-    // caught up → no further messages
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(0);
+    expect(readState.get(T)).toBeUndefined();
   });
 
   // Keep cold-start out of any case named for pagination, so that a since-less drain is never
@@ -405,6 +405,79 @@ describe('catch-up driver', () => {
       expect(
         await pagesUntilStop('a full page whose cursor names one position but is spelled differently each call'),
       ).toBe(MAX_CATCHUP_PAGES);
+    });
+  });
+
+  /**
+   * The class: a start-up driver whose work is not bounded by what changed since the last start.
+   * Measured before the marker existed: boots 1, 2 and 3 each drained 500 messages in 6
+   * `fetchRecent` calls with the stored position unchanged, because the ONLY thing that made a
+   * catch-up incremental was the agent having advanced its read position through the tool — and the
+   * case above hand-wrote that advancement, so it stayed green through the whole defect.
+   *
+   * Two boots, no hand-advancement, a counter on the PLUGIN so the assertion is round trips rather
+   * than messages. Cross how the instance starts with how deep the backlog is, including one past
+   * the dedup window, where the oldest ids a boot reads are evicted before it finishes reading them.
+   */
+  describe('a second boot costs round trips for what arrived, not for the backlog', () => {
+    const LIMIT = 10;
+    const CELLS = (['cold', 'resumed'] as const).flatMap((start) =>
+      [0, LIMIT - 1, LIMIT, 5 * LIMIT, SEEN_MAX_PER_TOPIC + 1].map(
+        (backlog) => [start, backlog] as const,
+      ),
+    );
+
+    /** Counts what reaches the backend, so the bound below is round trips and not page size. */
+    const counting = (inner: BackendPlugin) => {
+      let calls = 0;
+      return {
+        plugin: {
+          fetchRecent: (a: FetchRecentArgs) => {
+            calls += 1;
+            return inner.fetchRecent(a);
+          },
+        } as unknown as BackendPlugin,
+        calls: () => calls,
+        reset: () => {
+          calls = 0;
+        },
+      };
+    };
+
+    /** One process start: the marker comes off disk, the dedup window does not. */
+    const boot = (path: string, plugin: BackendPlugin, seen: SeenSet): Promise<number> =>
+      catchUpAll({ plugin, topics: [T], limit: LIMIT, readState: new ReadStateStore(path), seen });
+
+    it.each(CELLS)('%s start over a %i message backlog', async (start, backlog) => {
+      const path = rsPath();
+      if (start === 'resumed') new ReadStateStore(path).set(T, asCursor('0'));
+      const counter = counting(await seeded(backlog));
+
+      await boot(path, counter.plugin, new SeenSet());
+      const first = counter.calls();
+      counter.reset();
+
+      const seen = new SeenSet();
+      await boot(path, counter.plugin, seen);
+
+      expect(
+        counter.calls(),
+        'the second boot re-read a backlog nothing had added to. On matrix/discord/telegram that ' +
+          'is thousands of rate-limited round trips at every session start, and the ceiling is ' +
+          'MAX_CATCHUP_PAGES x catchup.limit messages read and discarded',
+      ).toBeLessThanOrEqual(2);
+
+      if (backlog > 0) {
+        expect(
+          seen.has(T, asBackendMsgId(String(backlog))),
+          'the second boot left the dedup set without the ids at the topic\'s live boundary, so ' +
+            'the push loop it is about to start can re-emit them',
+        ).toBe(true);
+      }
+      // Whatever the driver did, the AGENT is still owed everything it has not been handed.
+      expect(new ReadStateStore(path).get(T)).toBe(start === 'resumed' ? '0' : undefined);
+      // …and the bound above is not vacuous: this backlog really did cost the first boot pages.
+      if (start === 'resumed' && backlog > LIMIT) expect(first).toBeGreaterThan(2);
     });
   });
 

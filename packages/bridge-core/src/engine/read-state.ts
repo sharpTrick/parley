@@ -93,6 +93,30 @@ export class ReadStateStore {
     return value === undefined ? undefined : asCursor(value);
   }
 
+  /**
+   * How far on-start catch-up has warmed the dedup set, per topic. DISTINCT from the read position
+   * above: that one is the AGENT's, and only `parley_fetch_recent` may advance it, out of a page it
+   * actually handed the agent. This one records what the driver has already paged over, so a
+   * restart warms from the live boundary instead of re-reading the whole unread backlog every boot.
+   *
+   * Kept in a sibling file rather than a reserved key in this one, so that a topic named like the
+   * key cannot reach it: topic strings are unvalidated and arrive from config.
+   */
+  private warmStore: ReadStateStore | undefined;
+
+  /** Where the warm marker lives (named in the resume hint when a marker is what failed). */
+  get warmPath(): string {
+    return `${this.filePath}.warmed`;
+  }
+
+  warmedThrough(topic: Topic): Cursor | undefined {
+    return (this.warmStore ??= new ReadStateStore(this.warmPath)).get(topic);
+  }
+
+  markWarmed(topic: Topic, cursor: Cursor): void {
+    (this.warmStore ??= new ReadStateStore(this.warmPath)).set(topic, cursor);
+  }
+
   /** Persist a new read position for a topic (atomic). */
   set(topic: Topic, cursor: Cursor): void {
     // Screen with the same predicate load() applies. A plugin that hands back no `nextCursor` (or a
