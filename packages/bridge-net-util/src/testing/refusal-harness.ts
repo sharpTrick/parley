@@ -30,10 +30,10 @@ export interface RefusalSpec {
   /** Declared keys this validator deliberately does not grade, each with the reason it does not. */
   ungraded?: Readonly<Record<string, string>>;
   /**
-   * Corpus rows a key legitimately ACCEPTS, by row label, because the row's shape IS that key's
-   * declared shape — matrix's `invite` is an array of MXID strings, so the array row is a valid
-   * value rather than an unrendered one. Each named row is asserted to be accepted, so an exemption
-   * that stops being true reddens instead of quietly excusing a refusal that went missing.
+   * Corpus rows a key legitimately ACCEPTS, by row label, because the row's shape or text IS a
+   * value that key takes — matrix's `invite` is an array of MXID strings, and a NATS subject prefix
+   * may hold a bidi override. Each named row is asserted to be ACCEPTED, so an exemption that stops
+   * being true reddens instead of quietly excusing a refusal that went missing.
    */
   accepts?: Readonly<Record<string, readonly string[]>>;
   /**
@@ -129,7 +129,7 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
   describe(`${plugin} refuses an unrenderable backend_config value under its own label`, () => {
     it('names only corpus rows that exist among the values it excuses', () => {
       const labels = new Set(
-        [...NEVER_RENDERABLE, ...WRAPPING_A_SECRET].map(([label]) => label),
+        [...NEVER_RENDERABLE, ...WRAPPING_A_SECRET, ...UNSAFE_TEXT].map(([label]) => label),
       );
       const unknown = Object.values(spec.accepts ?? {})
         .flat()
@@ -181,7 +181,11 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
   if ((spec.textKeys ?? []).length > 0) {
     describe(`${plugin} bounds and flattens the text a rejected value carries`, () => {
       for (const key of spec.textKeys ?? []) {
-        it.each(UNSAFE_TEXT)(`${key} = %s is one bounded, harmless line`, (_label, text) => {
+        it.each(UNSAFE_TEXT)(`${key} = %s is one bounded, harmless line`, (label, text) => {
+          if (accepted(key, label)) {
+            expect(() => spec.validate(key, wrap(key, text))).not.toThrow();
+            return;
+          }
           const message = expectRefusalMessage(spec, key, wrap(key, text));
           expect(message).not.toMatch(FORBIDDEN_IN_RENDER);
           expect(message).not.toMatch(/[\n\r]/);

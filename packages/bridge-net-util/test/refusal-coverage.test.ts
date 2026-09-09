@@ -24,4 +24,18 @@ describe('every backend that declares a backend_config is crossed over the hosti
       `${pkg} declares a backend_config but no test of its own calls expectLabelledRefusal`,
     ).toBeGreaterThan(0);
   });
+
+  /**
+   * A spec may grade a surface that is not a `backend_config` — a cursor, a page size — by saying
+   * so. A package whose specs ALL say so has a declared config surface nobody drives, which is how
+   * nats shipped two config validators no corpus had ever been near while its package read as
+   * covered: its one spec graded `normalizeLimit`, a cursor helper.
+   */
+  it.each(declared.map((d) => [d.pkg] as const))('%s crosses it over its CONFIG surface', (pkg) => {
+    const text = testSourcesOf(pkg);
+    expect(
+      count(text, 'expectLabelledRefusal(') - count(text, "declared: 'not backend_config'"),
+      `${pkg}'s refusal specs all disclaim the backend_config surface it declares`,
+    ).toBeGreaterThan(0);
+  });
 });

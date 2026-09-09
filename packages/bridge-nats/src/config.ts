@@ -4,7 +4,7 @@ import {
   type BackendConfigKeys,
   isPlainObject,
 } from '@sharptrick/parley-core';
-import { isLoopbackHost } from '@sharptrick/parley-net-util';
+import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { credsAuthenticator, nkeyAuthenticator, type ConnectionOptions } from 'nats';
 
@@ -114,24 +114,24 @@ export function validatePrefix(
 ): string {
   if (value === undefined) return fallback;
   if (typeof value !== 'string') {
-    throw new Error(`invalid ${field} ${JSON.stringify(value)} — expected a string`);
+    throw new Error(`invalid ${field} ${describeConfigValue(field, value)} — expected a string`);
   }
   const offender = (illegal.exec(value) ?? CONTROL_CHARS.exec(value))?.[0];
   if (offender !== undefined) {
     throw new Error(
-      `invalid ${field} ${JSON.stringify(value)} — ${JSON.stringify(offender)} is not allowed in a NATS name`,
+      `invalid ${field} ${describeConfigValue(field, value)} — ${describeConfigValue(field, offender)} is not allowed in a NATS name`,
     );
   }
   const composed = value + PROBE_TOKEN;
   if (composed.split('.').some((token) => token === '')) {
     throw new Error(
-      `invalid ${field} ${JSON.stringify(value)} — it composes the illegal name ${JSON.stringify(composed)}: no dot-separated token of a NATS name may be empty`,
+      `invalid ${field} composes the illegal name ${describeConfigValue(field, composed)}: no dot-separated token of a NATS name may be empty`,
     );
   }
   const bytes = Buffer.byteLength(composed, 'utf8');
   if (maxComposedBytes !== undefined && bytes > maxComposedBytes) {
     throw new Error(
-      `invalid ${field} ${JSON.stringify(value)} — it composes ${JSON.stringify(composed)} at ${bytes} bytes, over the ${maxComposedBytes}-byte limit, so no topic could be named at all`,
+      `invalid ${field} ${describeConfigValue(field, value)} — with a topic token it composes ${bytes} bytes, over the ${maxComposedBytes}-byte limit, so no topic could be named at all`,
     );
   }
   return value;
@@ -170,18 +170,18 @@ export function validateRetentionMaxAgeNs(days: number | null | undefined): numb
   if (days === undefined || days === null) return undefined;
   if (typeof days !== 'number' || !Number.isFinite(days) || days < MIN_RETENTION_DAYS) {
     throw new Error(
-      `invalid retention_days ${JSON.stringify(days)} — expected a number of days no smaller than ${MIN_RETENTION_DAYS} (one minute), or omit it (or set it to null) for unlimited retention`,
+      `invalid retention_days ${describeConfigValue('retention_days', days)} — expected a number of days no smaller than ${MIN_RETENTION_DAYS} (one minute), or omit it (or set it to null) for unlimited retention`,
     );
   }
   const maxAgeNs = Math.round(days * NS_PER_DAY);
   if (maxAgeNs < 1) {
     throw new Error(
-      `invalid retention_days ${JSON.stringify(days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
+      `invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, which JetStream reads as UNLIMITED retention, the opposite of a retention window`,
     );
   }
   if (maxAgeNs >= MAX_AGE_NS_LIMIT) {
     throw new Error(
-      `invalid retention_days ${JSON.stringify(days)} — it composes a max_age of ${maxAgeNs}ns, past the 2^63-1 nanoseconds JetStream's int64 can hold, so the stream would either be refused on every post or be created with UNLIMITED retention`,
+      `invalid retention_days ${describeConfigValue('retention_days', days)} — it composes a max_age of ${maxAgeNs}ns, past the 2^63-1 nanoseconds JetStream's int64 can hold, so the stream would either be refused on every post or be created with UNLIMITED retention`,
     );
   }
   return maxAgeNs;
