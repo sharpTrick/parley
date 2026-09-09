@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import * as api from '@sharptrick/parley-net-util';
 import { DEFAULT_DEADLINE_MS, fetchWithRetry } from '@sharptrick/parley-net-util';
+import { derivedRows, exportedNames } from '@sharptrick/parley-net-util/testing';
 import {
   importedNames,
   importingFiles,
@@ -24,6 +25,20 @@ import {
 } from './fixtures.js';
 
 resetGlobalsAfterEach();
+
+/**
+ * The PUBLISHED surface, runtime bindings unioned with the barrel's own type-only exports.
+ * `Object.keys(api)` cannot see an `export interface` — a `.d.ts` name is a semver commitment with
+ * no runtime key to enumerate — so a table built from it alone declared a type-only export
+ * unpublished, and `export interface NobodyImportsThis` left the file at "118 tests" green.
+ */
+const BARREL = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+
+const SURFACE = derivedRows(
+  'the published surface',
+  () => [...new Set([...Object.keys(api), ...exportedNames(BARREL)])].sort(),
+  { floor: 12, witness: ['fetchWithRetry', 'FetchWithRetryOptions'] },
+);
 // The README is the only description an npm consumer reads, and every exported name is a semver
 // commitment. Generated from the entry point, so a new export fails until it is documented.
 describe('README', () => {
@@ -33,7 +48,7 @@ describe('README', () => {
   // like `delay` match a sentence that never mentions the export. Require the name in a code span.
   const asCodeSpan = (name: string): RegExp => new RegExp(`\`${name}(\`|\\()`);
 
-  it.each(Object.keys(api).sort())('documents the exported `%s`', (name) => {
+  it.each(SURFACE)('documents the exported `%s`', (name) => {
     expect(readme).toMatch(asCodeSpan(name));
   });
 
@@ -299,6 +314,9 @@ describe('every shipped default is graded on the path it governs', () => {
 describe('every export earns its place', () => {
   const INTENTIONALLY_UNCONSUMED: Record<string, string> = {
     DEFAULT_MAX_ATTEMPTS: 'the documented default of FetchWithRetryOptions.maxAttempts',
+    FetchWithRetryOptions:
+      'the options type of this package\'s one exported call — a consumer that names the type of ' +
+      'the object it builds needs it, and a backend that spreads a literal at the call site does not',
     MAX_BODY_WAIT_MS:
       'the ceiling this loop applies to a body-stated wait before adopting it — a figure a ' +
       'consumer diagnosing an ignored hint has to be able to name, not override',
@@ -486,7 +504,7 @@ describe('every export earns its place', () => {
     },
   );
 
-  it.each(Object.keys(api).sort())('`%s` is imported somewhere, or kept on purpose', (name) => {
+  it.each(SURFACE)('`%s` is imported somewhere, or kept on purpose', (name) => {
     const importers = consumers(name);
     if (importers.length > 0) {
       expect(
