@@ -10,6 +10,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # The suite runs for ~7 minutes plus service bring-up; GitHub's default is 6 HOURS, and a job
+    # wedged on a service that never becomes ready would hold a runner for all of it.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +72,7 @@ jobs:
   # registry on the next release. This gate fails the PR instead. Read-only against the registry.
   publish-preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

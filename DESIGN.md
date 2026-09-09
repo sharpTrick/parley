@@ -371,8 +371,8 @@ config (handle, topics, subscriptions). This is structural, not a preference:
 - **Cursor / read-state is per-instance, not global.** Different sessions legitimately hold
   different read positions per topic. Never share cursor state across instances.
 
-**The files `state_path` names.** Core writes four, all under the one configured path, and they
-carry very different weight:
+**The files `state_path` names.** Core writes five names under the one configured path — four that
+persist and one transient — and they carry very different weight:
 
 | File | Holds | If you delete it |
 |---|---|---|
@@ -380,6 +380,7 @@ carry very different weight:
 | `<state_path>.corrupt` | a read-position file that could not be parsed, moved aside so it is not silently overwritten | nothing; it is evidence, never read back |
 | `<state_path>.warmed` | how far ON-START CATCH-UP has already paged per topic — a cache, so a restart warms the dedup set from the live boundary instead of re-reading the backlog | one re-paged boot per topic. It costs round trips and reaches strictly MORE, never less. Always safe |
 | `<state_path>.warmed.corrupt` | the same evidence copy for the marker | nothing |
+| `<state_path>.<pid>.<uuid>.tmp` | a write in progress: every update is written here and renamed into place, so a reader never sees a half-written file. Process-unique, so two flushes cannot interleave | nothing — but nothing cleans it up either. A process killed between the write and the rename leaves one behind permanently, and the next flush writes a differently-named one |
 
 The split is the point: catch-up must not advance the read position (§7), so it keeps its own
 record. A marker cursor this backend cannot parse — the instance previously ran against a different
