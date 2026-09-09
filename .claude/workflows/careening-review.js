@@ -72,7 +72,7 @@ const PACKAGE_DEPS = {
   'bridge-postgres': ['bridge-core', 'bridge-net-util', 'conformance'],
   'bridge-redis': ['bridge-core', 'bridge-net-util', 'conformance'],
   'bridge-slack': ['bridge-core', 'bridge-net-util', 'conformance'],
-  'bridge-sqlite': ['bridge-core', 'conformance'],
+  'bridge-sqlite': ['bridge-core', 'bridge-net-util', 'conformance'],
   'bridge-telegram': ['bridge-core', 'bridge-net-util', 'conformance'],
   'bridge-xmpp': ['bridge-core', 'bridge-net-util', 'conformance'],
   'bridge-zulip': ['bridge-core', 'bridge-net-util', 'conformance'],
