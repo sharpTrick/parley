@@ -645,9 +645,7 @@ describe('no assertion reads the machine it is being graded on', () => {
     ['a memory read inside the data', 'expect([totalmem()]).toEqual(x);', ['totalmem(']],
     ['a CI flag branching the expectation', 'expect(n).toBe(process.env.CI ? 1 : 2);', ['process.env.CI']],
     ['a platform read in a plain argument', 'expect(a).toBe(process.platform);', ['process.platform']],
-    // Placeholders go with the literal that carries them, so a read reachable only from inside one
-    // is out of this rule's sight — the documented answer, not an oversight to be discovered.
-    ['a platform read only inside a template placeholder', 'expect(a, `on ${process.platform}`).toBe(b);', []],
+    ['a platform read inside a template placeholder', 'expect(a, `on ${process.platform}`).toBe(b);', ['process.platform']],
     ['the same read outside any assertion', 'const shards = availableParallelism();\nexpect(1).toBe(1);', []],
     ['a narrated one', '// expect(n).toBe(cpus().length)\nexpect(1).toBe(1);', []],
   ])('reads %s', (_label, source, found) => {
