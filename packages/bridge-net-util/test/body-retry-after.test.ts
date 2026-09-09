@@ -27,41 +27,16 @@ describe('bodyRetryAfter', () => {
   });
 
   /**
-   * Both orderings, for all three vendor shapes. The row this replaced picked header 9s against
-   * body 1s — the ONE ordering where "the header wins" and "the header is a floor" agree, so it
-   * could not tell them apart, and the code was returning the header as the ANSWER. A CDN stamping
-   * `Retry-After: 1` in front of a vendor asking 60s is the case that matters, and it is the one
-   * that ordering never asked.
+   * The header is not this function's business. It reads the BODY, and `fetchWithRetry` takes the
+   * longer of the two — so a header here is neither read nor allowed to change the answer, and the
+   * floor is graded where a caller can observe it (below).
    */
-  const HINT_PAIRS: Array<[header: number | undefined, body: number | undefined, wait: number]> = [
-    [9000, 1000, 9000],
-    [1000, 1500, 1500],
-    [undefined, 1500, 1500],
-    [9000, undefined, 9000],
-  ];
-
-  const headers = (header: number | undefined): Record<string, string> =>
-    header === undefined ? {} : { 'retry-after': String(header / 1000) };
-
-  it.each(HINT_PAIRS)(
-    'header %s + body %s waits the longer of the two: %ims',
-    async (header, body, wait) => {
-      await expect(
-        seconds(answer(body === undefined ? {} : { retry_after: body / 1000 }, headers(header))),
-      ).resolves.toBe(wait);
-      await expect(
-        millis(answer(body === undefined ? {} : { retry_after_ms: body }, headers(header))),
-      ).resolves.toBe(wait);
-      await expect(
-        nested(
-          answer(
-            body === undefined ? {} : { parameters: { retry_after: body / 1000 } },
-            headers(header),
-          ),
-        ),
-      ).resolves.toBe(wait);
-    },
-  );
+  it('reports the body figure whatever the header says', async () => {
+    const withHeader = { 'retry-after': '9' };
+    await expect(seconds(answer({ retry_after: 1.5 }, withHeader))).resolves.toBe(1500);
+    await expect(millis(answer({ retry_after_ms: 1500 }, withHeader))).resolves.toBe(1500);
+    await expect(seconds(answer({}, withHeader))).resolves.toBeUndefined();
+  });
 
   it('reads a field the vendor did not put where this parser looks as no hint', async () => {
     await expect(seconds(answer({ retry_after_ms: 5000 }))).resolves.toBeUndefined();
@@ -158,6 +133,10 @@ const ADOPTION: Array<[label: string, header: number | undefined, body: number, 
   ['no header + a 1h body refuses, and says to raise the deadline', undefined, HOUR_MS, REFUSED],
   ['no header + a 10y body cannot end the call', undefined, TEN_YEARS_MS, RETRIED(500)],
   ['a 1s header + a 1s body waits 1s', SECOND_MS, SECOND_MS, RETRIED(SECOND_MS)],
+  // The discriminating pair for the FLOOR: "the header wins" and "the header is a floor" agree on
+  // the first of these and disagree on the second.
+  ['a 2s header + a 1s body waits the header', 2 * SECOND_MS, SECOND_MS, RETRIED(2 * SECOND_MS)],
+  ['a 1s header + a 2s body waits the body', SECOND_MS, 2 * SECOND_MS, RETRIED(2 * SECOND_MS)],
   ['a 1s header + a 1h body adopts the body', SECOND_MS, HOUR_MS, REFUSED],
   ['a 1s header + a 10y body waits the header', SECOND_MS, TEN_YEARS_MS, RETRIED(SECOND_MS)],
   ['a 1h header refuses whatever the body says', HOUR_MS, SECOND_MS, REFUSED],

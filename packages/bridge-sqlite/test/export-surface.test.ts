@@ -73,14 +73,32 @@ describe('the sqlite package publishes exactly what it says it does', () => {
    * position, so dropping one from the entry fails the package's `typecheck:test` script. A runtime
    * key check cannot reach these at all — they are erased before the module exists.
    */
+  const health = (): SubscriptionHealth => ({
+    topic: asTopic('t'),
+    state: 'live',
+    consecutiveFailures: 0,
+  });
+
   it('publishes every type an external consumer annotates against', () => {
-    const health: SubscriptionHealth = {
-      topic: asTopic('t'),
-      state: 'healthy' as SubscriptionState,
-      consecutiveFailures: 0,
-    };
     const cls: DbErrorClass = entry.classifyDbError(new Error('x'));
     const cfg: SqliteBackendConfig = { db_path: ':memory:' };
-    expect([health.state, cls, cfg.db_path].every((v) => v !== undefined)).toBe(true);
+    expect([health().state, cls, cfg.db_path].every((v) => v !== undefined)).toBe(true);
+  });
+
+  /**
+   * The MEMBERS of the published union, not just its name. A cast — `'healthy' as
+   * SubscriptionState` — annotates the field with a value the type does not admit, so the pin
+   * above went through with a state the poll loop can never report and would have gone through
+   * with any other. The `Record` is the compile-time half: a member added or removed fails
+   * `typecheck:test`, which is where an external consumer's `switch` would break.
+   */
+  it('publishes every state the poll loop can report, and only those', () => {
+    const STATES: Record<SubscriptionState, true> = { live: true, degraded: true, stopped: true };
+    expect(Object.keys(STATES).sort()).toEqual(['degraded', 'live', 'stopped']);
+    expect(
+      Object.keys(STATES),
+      'the row above annotates a state the poll loop cannot report — a cast satisfies the ' +
+        'annotation and pins nothing about the value',
+    ).toContain(health().state);
   });
 });

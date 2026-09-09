@@ -65,9 +65,7 @@ const ERROR_SPECS: ErrorSpec[] = [
  * The two shapes a driver error actually reaches these loops in. better-sqlite3 puts the condition
  * in `code`; node:sqlite — which this package ships and falls back to whenever there is no prebuilt
  * native module — stamps `ERR_SQLITE_ERROR` on every class alike and leaves the message as the only
- * signal. Built in the first shape only, every row hands the classifier the code its own arm
- * matches, so the message arms it depends on for the whole fallback driver decide nothing here and
- * could be deleted without turning this matrix red.
+ * signal, so only the second shape exercises the classifier's message arms at all.
  */
 const ERROR_SHAPES: Record<string, (s: ErrorSpec) => Error> = {
   'better-sqlite3': (s) =>
@@ -128,8 +126,18 @@ function breakSelect(p: SqlitePlugin, failures: number, e: Error): () => number 
 // past escalation" behaviour — not just "tolerates a few misses" — is what is being measured.
 const BURST = 13;
 
+/**
+ * A burst that ends is a different question from a failure that does not, and only the second
+ * depends on the error's CLASS. Driven over one representative spec per outcome rather than over
+ * all seven: with escalation disabled every healable row of the full cross still passed, so the
+ * other twelve measured the classifier a second time and the recovery itself is pinned on fake
+ * timers in subscription-health.test.ts. The two DRIVER SHAPES stay on both axes — that is the one
+ * thing a row here can see that the classifier's own tests cannot.
+ */
+const BURST_REPRESENTATIVES = ['SQLITE_BUSY', 'SQLITE_CORRUPT'];
+
 describe('poll loop error-class matrix', () => {
-  for (const c of ERROR_CASES) {
+  for (const c of ERROR_CASES.filter((e) => BURST_REPRESENTATIVES.some((n) => e.name.startsWith(`${n} `)))) {
     it(`${c.name}: a burst of ${BURST} then recovery ${c.healable ? 'still delivers' : 'stops the loop'}`, async () => {
       const p = await plugin();
       const got: string[] = [];
@@ -164,7 +172,9 @@ describe('poll loop error-class matrix', () => {
         spy.mockRestore();
       }
     });
+  }
 
+  for (const c of ERROR_CASES) {
     it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr and ${c.healable ? 'degraded' : 'stopped'} in health`, async () => {
       const p = await plugin();
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);

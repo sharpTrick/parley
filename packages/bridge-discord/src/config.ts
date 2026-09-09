@@ -6,8 +6,6 @@ import {
   MAX_TIMER_MS,
   type Topic,
 } from '@sharptrick/parley-core';
-
-export { MAX_TIMER_MS };
 import { RECONNECT_CAP_MS } from './ladder.js';
 
 /** Plugin-specific backend_config. */

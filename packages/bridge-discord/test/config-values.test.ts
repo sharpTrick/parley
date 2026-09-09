@@ -1,7 +1,7 @@
-import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { asHandle, asTopic, MAX_TIMER_MS, type Topic } from '@sharptrick/parley-core';
 import { readFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CONFIG_SHAPES, MAX_DIALERS, MAX_TIMER_MS, type ConfigShape } from '../src/config.js';
+import { CONFIG_SHAPES, MAX_DIALERS, type ConfigShape } from '../src/config.js';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 import { probe, settleOf } from './harness.js';
