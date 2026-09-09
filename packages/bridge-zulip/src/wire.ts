@@ -73,8 +73,25 @@ export function asArray<T>(value: T[] | undefined): T[] {
  */
 export function zulipToMessage(topic: Topic, m: ZulipMessage | undefined | null): Message | undefined {
   if (m === undefined || m === null) return undefined;
+  const id = zulipMessageId(m);
+  return id === undefined ? undefined : buildZulipMessage(topic, m, id);
+}
+
+/**
+ * The dedup key AND the cursor a record carries, or `undefined` when it is not a usable Zulip
+ * message id. Separated from the conversion so the live path can decide whether a record is one it
+ * still owes the handler WITHOUT converting it — the conversion belongs inside the delivery
+ * containment, which is the only thing standing between a record it chokes on and the rest of the
+ * batch behind it.
+ */
+export function zulipMessageId(m: ZulipMessage | undefined | null): number | undefined {
+  if (m === undefined || m === null) return undefined;
   const { id } = m;
   if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return undefined;
+  return id;
+}
+
+export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number): Message {
   return buildMessage({
     topic,
     sender: typeof m.sender_email === 'string' ? m.sender_email : '',

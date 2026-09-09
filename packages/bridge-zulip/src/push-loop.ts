@@ -1,7 +1,7 @@
 import { type Message, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import type { QueueState, ZulipConnection } from './connection.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
-import { asArray, type EventsResponse, zulipToMessage } from './wire.js';
+import { asArray, buildZulipMessage, type EventsResponse, zulipMessageId } from './wire.js';
 
 /**
  * The live path (DESIGN §9 — genuine events, not a poll timer). The queue is awaited before this
@@ -62,9 +62,9 @@ export async function startPushLoop(
    * is the only thing that tells them apart.
    */
   let parking = true;
-  const deliver = (m: Message): void => {
+  const deliver = (build: () => Message): void => {
     if (!alive()) return;
-    safeDeliver(handler, () => m);
+    safeDeliver(handler, build);
   };
   const backoff = async (reason: string): Promise<void> => {
     consecutiveFailures++;
@@ -144,12 +144,12 @@ export async function startPushLoop(
         acked = true;
       }
       if (ev?.type !== 'message') continue;
-      const m = zulipToMessage(topic, ev.message);
-      if (m === undefined) continue;
-      const id = Number(m.backendMsgId);
+      const record = ev.message;
+      const id = zulipMessageId(record);
+      if (record === undefined || id === undefined) continue;
       if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue;
       lastDeliveredId = id;
-      deliver(m);
+      deliver(() => buildZulipMessage(topic, record, id));
     }
     // Grade the answer on whether it MOVED the queue, not on whether it carried bytes: a parked
     // poll the ack cannot advance past is re-issued unchanged forever. Keep it paced, so that a
