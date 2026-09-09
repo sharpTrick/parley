@@ -17,6 +17,7 @@ type Arm = (real: Promise<unknown>) => unknown;
 
 interface Probe {
   threw: boolean;
+  thrown?: unknown;
   returned: unknown;
   settled?: 'fulfilled' | 'rejected';
   reason?: unknown;
@@ -30,8 +31,8 @@ async function probe(arm: Arm): Promise<Probe> {
   let returned: unknown;
   try {
     returned = arm(Promise.resolve());
-  } catch {
-    return { threw: true, returned: undefined, settledInMicrotasks: false };
+  } catch (err) {
+    return { threw: true, thrown: err, returned: undefined, settledInMicrotasks: false };
   }
   const out: Probe = { threw: false, returned, settledInMicrotasks: false };
   void Promise.resolve(returned).then(
@@ -71,7 +72,48 @@ const PROPERTIES: Array<[what: string, holds: (p: Probe) => boolean]> = [
     (p) => !p.threw && isThenable(p.returned) && !(p.returned instanceof Promise),
   ],
   ['returns something that never settles at all', (p) => !p.threw && p.settled === undefined],
+  ['throws something that is not an Error', (p) => p.threw && !(p.thrown instanceof Error)],
+  ['throws an Error', (p) => p.threw && p.thrown instanceof Error],
+  [
+    'rejects with an Error',
+    (p) => p.settled === 'rejected' && p.reason instanceof Error,
+  ],
+  [
+    'rejects before the microtask queue has drained',
+    (p) => p.settled === 'rejected' && p.settledInMicrotasks,
+  ],
+  [
+    // The ORDINARY case, named as a property of its own because every exotic arm here is a
+    // variation on it: a site that absorbs the variations and drops the plain one has a hole no
+    // other row can see, and without this the baseline arm is the one arm free to be deleted.
+    'rejects the ordinary way — a native promise, an Error, inside the microtask queue',
+    (p) =>
+      !p.threw &&
+      p.returned instanceof Promise &&
+      p.settled === 'rejected' &&
+      p.reason instanceof Error &&
+      p.settledInMicrotasks,
+  ],
 ];
+
+/** Which properties an arm holds, as indices into {@link PROPERTIES}. */
+const vectorOf = (p: Probe): number[] =>
+  PROPERTIES.flatMap(([, holds], i) => (holds(p) ? [i] : []));
+
+/**
+ * The arms that could be DELETED with every row below still green: an arm holding no property that
+ * some OTHER arm does not also hold. The per-property floor cannot see one — it asks whether SOME
+ * arm still has each property, which the survivors answer. Measured at head before this existed: deleting `rejects` AND
+ * `rejects synchronously` left 16 passed, the same count as before — every consumer is an
+ * `it.each(FAILURE_SHAPE_NAMES)`, so they all shrink with the table, and `rejects` is the canonical
+ * baseline arm whose deletion is invisible repo-wide.
+ */
+const deletable = (vectors: ReadonlyArray<readonly [string, readonly number[]]>): string[] =>
+  vectors
+    .filter(([name, held]) =>
+      held.every((i) => vectors.some(([other, w]) => other !== name && w.includes(i))),
+    )
+    .map(([name]) => name);
 
 const probes = async (): Promise<Probe[]> =>
   Promise.all(FAILURE_SHAPE_NAMES.map((name) => probe(FAILURE_SHAPES[name])));
@@ -83,21 +125,21 @@ describe('the shared fault table keeps every property its consumers differ on', 
    * probe is graded against arms written here, whose classification is not in question.
    */
   it.each([
-    ['a synchronous throw', (): unknown => { throw new Error('x'); }, [0]],
-    ['an immediate rejection', (): unknown => Promise.reject(new Error('x')), [1]],
-    ['a string rejection', (): unknown => Promise.reject('x'), [1, 2]],
+    ['a synchronous throw', (): unknown => { throw new Error('x'); }, [0, 7]],
+    ['an immediate rejection', (): unknown => Promise.reject(new Error('x')), [1, 8, 9, 10]],
+    ['a string rejection', (): unknown => Promise.reject('x'), [1, 2, 9]],
     [
       'a deferred rejection',
       (): unknown =>
         new Promise((_r, reject) => {
           setTimeout(() => reject(new Error('x')), 0);
         }),
-      [1, 3],
+      [1, 3, 8],
     ],
     [
       'a foreign thenable',
       (): unknown => ({ then: (_f: unknown, r: (e: unknown) => void) => r(new Error('x')) }),
-      [4],
+      [4, 8, 9],
     ],
     ['a promise that never settles', (): unknown => new Promise(() => {}), [5]],
     ['a plain resolved value', (): unknown => undefined, []],
@@ -107,7 +149,28 @@ describe('the shared fault table keeps every property its consumers differ on', 
     expected,
   ) => {
     const p = await probe(arm);
-    expect(PROPERTIES.flatMap(([, holds], i) => (holds(p) ? [i] : []))).toEqual(expected);
+    expect(vectorOf(p)).toEqual(expected);
+  });
+
+  it('reads two arms of the same shape as mutually deletable (ruler self-test)', () => {
+    expect(deletable([['a', [0, 1]], ['b', [0, 1]]])).toEqual(['a', 'b']);
+    expect(deletable([['a', [0]], ['b', [1]]])).toEqual([]);
+    expect(deletable([['a', [0]], ['b', [0, 1]]])).toEqual(['a']);
+    expect(deletable([['a', []], ['b', [0]]])).toEqual(['a']);
+    // Covered between two arms without being a subset of either: the failure the subset spelling
+    // of this rule cannot see, and the one that left the baseline arm deletable.
+    expect(deletable([['a', [0, 1]], ['b', [0, 2]], ['c', [1, 2]]])).toEqual(['a', 'b', 'c']);
+  });
+
+  it('no arm can be deleted behind another', async () => {
+    const held = (await probes()).map(
+      (p, i) => [FAILURE_SHAPE_NAMES[i] as string, vectorOf(p)] as const,
+    );
+    expect(
+      deletable(held),
+      'this arm holds no property another arm does not also hold, so deleting it shrinks ten ' +
+        'fault matrices at once with every row of this file still green',
+    ).toEqual([]);
   });
 
   it.each(PROPERTIES.map(([what], i) => [what, i] as const))(
