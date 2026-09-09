@@ -36,9 +36,23 @@ const typeName = (value: unknown): string =>
         ? 'an object'
         : `a ${typeof value}`;
 
+/** A key name is caller-authored, and this message is core's to render. Longest name worth naming. */
+const MAX_KEY_IN_REFUSAL = 128;
+
+/**
+ * The offending key as ONE bounded line. The name comes from the caller's YAML, and this refusal
+ * reaches an operator's log and the model context core renders a seam error into — so it may not
+ * forge line structure, carry a bidi override, or run unbounded. Kept core-local: the seam may not
+ * depend on a backend-support package, and net-util's `sanitizeBody` lives in one.
+ */
+const boundedKey = (path: string): string => {
+  const flat = path.replaceAll(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '\uFFFD');
+  return flat.length <= MAX_KEY_IN_REFUSAL ? flat : `${flat.slice(0, MAX_KEY_IN_REFUSAL)}[truncated]`;
+};
+
 function refuse(plugin: string, path: string, allowed: readonly string[], prefix: string): never {
   throw new Error(
-    `parley-${plugin}: unknown backend_config key '${path}' — expected one of ` +
+    `parley-${plugin}: unknown backend_config key '${boundedKey(path)}' — expected one of ` +
       allowed.map((known) => `${prefix}${known}`).join(', '),
   );
 }

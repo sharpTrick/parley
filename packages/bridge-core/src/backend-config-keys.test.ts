@@ -59,3 +59,51 @@ describe('a nested config group is an object literal or it is refused', () => {
     );
   });
 });
+
+/**
+ * CLASS: the offending key is CALLER-AUTHORED text, and this refusal is rendered into an operator's
+ * log and into the model context core renders a seam error into. Round 2 hardened the VALUE side by
+ * lifting a renderer into a backend-support package; the KEY side is equally caller-authored and
+ * equally destined for that context, and core cannot reach that renderer — the seam may not depend
+ * on a plugin's support package. So the bound lives here.
+ */
+describe('an undeclared key is named as one bounded, harmless line', () => {
+  const FORBIDDEN = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+  const HOSTILE: [string, string][] = [
+    ['a newline', 'evil\nkey'],
+    ['a carriage return', 'evil\rkey'],
+    ['a LINE SEPARATOR', 'evil\u2028key'],
+    ['a PARAGRAPH SEPARATOR', 'evil\u2029key'],
+    ['a bidi override', 'evil\u202Ekey'],
+    ['3KiB of one character', 'k'.repeat(3000)],
+    ['all of it at once', `evil\u202E\n${'k'.repeat(3000)}`],
+  ];
+
+  const messageFor = (key: string, config: object): string => {
+    try {
+      assertKnownConfigKeys('probe', config, DECLARED);
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error(`${key} was accepted, so this row grades nothing`);
+  };
+
+  it.each(HOSTILE)('%s at the top level', (_label, key) => {
+    const message = messageFor(key, { [key]: 1 });
+    expect(message).not.toMatch(FORBIDDEN);
+    expect(message).not.toMatch(/[\n\r]/);
+    expect(message.length).toBeLessThan(512);
+  });
+
+  it.each(HOSTILE)('%s nested in a group', (_label, key) => {
+    const message = messageFor(key, { tls: { [key]: 1 } });
+    expect(message).not.toMatch(FORBIDDEN);
+    expect(message).not.toMatch(/[\n\r]/);
+    expect(message.length).toBeLessThan(512);
+  });
+
+  it('still names a key an operator can act on, so the rows above are not vacuous', () => {
+    expect(messageFor('ca_flie', { tls: { ca_flie: 'x' } })).toContain("'tls.ca_flie'");
+  });
+});
