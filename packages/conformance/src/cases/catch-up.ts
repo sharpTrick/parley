@@ -79,7 +79,7 @@ export function catchUpCases(ctx: ConformanceContext): void {
       expect(res.messages.length).toBeLessThanOrEqual(limit);
       if (res.messages.length > 0) {
         expect(res.nextCursor).toBe(res.messages.at(-1)!.cursor);
-        seen.push(...res.messages.map((m) => m.content));
+        for (const m of res.messages) seen.push(m.content);
       }
       if (res.messages.length === 0 || res.nextCursor === since) break;
       since = res.nextCursor;
