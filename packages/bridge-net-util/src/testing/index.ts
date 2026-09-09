@@ -38,6 +38,7 @@ export {
   filesUnder,
   type Manifest,
   SUITE,
+  type WorkspacePackage,
   workspaceAreas,
   workspacePackages,
   workspaceRoot,
