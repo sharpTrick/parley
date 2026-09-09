@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -487,6 +487,134 @@ describe('a session that was down catches up through the documented procedure', 
       expect(await catchUp(third.client)).toEqual([]);
       await third.shutdown();
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
+ * On-start catch-up became a WRITER when it grew a warm marker, and a write on the boot path is a
+ * new way for a deployment to fail to start. Driven against the real `parley-sqlite` bin with the
+ * state directory at 0500: the process died with a bare EACCES naming a process-unique temp path
+ * that no longer existed, and never answered `initialize` — where the same deployment before the
+ * marker booted and served every tool call, surfacing the write failure as ONE recoverable
+ * `isError` when the tool tried to advance the read position.
+ *
+ * The marker is a CACHE: derivable, disposable, holding no read position and no message. So the
+ * invariant is boot survival, graded through `buildBridge` — `read-state.test.ts` grades the store
+ * in isolation and cannot see a boot at all, which is why this shipped.
+ */
+describe('a state file this process cannot write does not stop the bridge starting', () => {
+  const T = asTopic('ctx');
+  const peer = asHandle('bob');
+  const WARNING = 'could not record catch-up progress';
+
+  /**
+   * Each row breaks the state files a different way and declares whether the breakage reaches the
+   * MARKER write. Declaring it is what keeps a row from going hollow: a permission row run as a
+   * user who can write anyway blocks nothing, and would otherwise pass while grading nothing.
+   */
+  const BREAKAGES: ReadonlyArray<
+    readonly [name: string, apply: (statePath: string) => void, blocksTheMarker: boolean]
+  > = [
+    ['the state directory is read-only', (p) => chmodSync(join(p, '..'), 0o500), true],
+    ['the warm marker path is a directory', (p) => mkdirSync(`${p}.warmed`), true],
+    [
+      'the state file is read-only',
+      (p) => {
+        writeFileSync(p, '{}\n');
+        chmodSync(p, 0o400);
+      },
+      false,
+    ],
+    [
+      'the warm marker is unreadable',
+      (p) => {
+        writeFileSync(`${p}.warmed`, '{}\n');
+        chmodSync(`${p}.warmed`, 0o000);
+      },
+      false,
+    ],
+  ];
+
+  const ROWS = BREAKAGES.flatMap(([name, apply, blocksTheMarker]) =>
+    [true, false].map(
+      (onStart) => [`${name}, catchup.on_start=${onStart}`, apply, blocksTheMarker, onStart] as const,
+    ),
+  );
+
+  it.each(ROWS)('reaches initialize and serves: %s', async (_name, apply, blocksTheMarker, onStart) => {
+    const dir = mkdtempSync(join(tmpdir(), 'parley-boot-state-'));
+    const stateDir = join(dir, 'state');
+    mkdirSync(stateDir);
+    const statePath = join(stateDir, 'read-state.json');
+    const store = new FakePlugin();
+    const warnings = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await store.connect({});
+      await store.post(T, peer, 'already-here');
+      apply(statePath);
+
+      const cfg = parseConfig({
+        identity: { handle: 'agent' },
+        topics: ['ctx'],
+        state_path: statePath,
+        catchup: { on_start: onStart, limit: 100 },
+        live_push: { enabled: false },
+      });
+      // Settled rather than awaited, so a boot that DIES is graded by an assertion here instead of
+      // escaping this case as the raw errno the deployment saw.
+      const started = await buildBridge(store, cfg).then(
+        (bridge) => ({ ok: true as const, bridge }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      if (!started.ok) {
+        expect.fail(
+          'the bridge died before it could answer initialize. A state file it cannot write is an ' +
+            'operator problem the deployment booted through until catch-up started writing, ' +
+            'surfacing as ONE recoverable tool error; the warm marker is a cache, and a cache ' +
+            'write must not be able to abort startup: ' +
+            (started.error instanceof Error ? started.error.message : String(started.error)),
+        );
+      }
+      const { bridge } = started;
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: 'session', version: '0' }, { capabilities: {} });
+      await Promise.all([bridge.server.connect(serverT), client.connect(clientT)]);
+
+      expect((await client.listTools()).tools.map((t) => t.name).sort()).toEqual([
+        'parley_fetch_recent',
+        'parley_post',
+        'parley_reply',
+      ]);
+
+      const answer = (await client.callTool({
+        name: 'parley_fetch_recent',
+        arguments: { topic: 'ctx', limit: 10, from: 'recent' },
+      })) as { content: { text: string }[]; isError?: boolean };
+      expect(answer.isError ?? false, answer.content[0]!.text).toBe(false);
+      expect(
+        (JSON.parse(answer.content[0]!.text) as { messages: { content: string }[] }).messages.map(
+          (m) => m.content,
+        ),
+        'the bridge started but could not answer a read — it is up without being usable',
+      ).toEqual(['already-here']);
+
+      const warned = warnings.mock.calls.some((c) => String(c[0]).includes(WARNING));
+      expect(
+        warned,
+        blocksTheMarker && onStart
+          ? 'the marker write was blocked and nothing said so: an operator gets a silently ' +
+            're-paging boot with no way to find out why'
+          : 'a marker write that was never blocked reported a failure, so the rows that ARE ' +
+            'blocked cannot be told apart from the ones that are not',
+      ).toBe(blocksTheMarker && onStart);
+
+      await client.close();
+      await bridge.shutdown();
+    } finally {
+      warnings.mockRestore();
+      chmodSync(stateDir, 0o700);
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);

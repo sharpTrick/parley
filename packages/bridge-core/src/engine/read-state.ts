@@ -113,8 +113,24 @@ export class ReadStateStore {
     return (this.warmStore ??= new ReadStateStore(this.warmPath)).get(topic);
   }
 
+  /**
+   * Record catch-up progress. Never throws: this file is a CACHE of ground the driver has already
+   * paged over, and a boot runs it before the bridge answers `initialize` — so a marker this
+   * process cannot write must cost a re-page on the next boot, not the whole deployment.
+   */
   markWarmed(topic: Topic, cursor: Cursor): void {
-    (this.warmStore ??= new ReadStateStore(this.warmPath)).set(topic, cursor);
+    try {
+      (this.warmStore ??= new ReadStateStore(this.warmPath)).set(topic, cursor);
+    } catch (err) {
+      console.error(
+        `[parley] could not record catch-up progress for topic ${JSON.stringify(topic)} in ` +
+          `${this.warmPath}: ${err instanceof Error ? err.message : String(err)}. That file only ` +
+          'caches how far on-start catch-up has already paged — no read position and no message ' +
+          'is in it, and deleting it is always safe. The bridge is continuing; the cost is that ' +
+          'the next boot re-pages this topic from ' +
+          `${this.filePath} instead. Make the directory writable by this process to stop re-paging.`,
+      );
+    }
   }
 
   /** Persist a new read position for a topic (atomic). */
