@@ -88,11 +88,11 @@ the other topic's name.
 
 **Rate-limit behaviour.** A 429 is retried with the server's `Retry-After` honoured **in full**,
 however long — nothing clamps a stated wait. A stated hint that would not fit the call's
-`DEFAULT_DEADLINE_MS` = 30 s budget ends the call naming the figure rather than retrying sooner
-than Slack asked; a 429 with no usable hint waits `DEFAULT_BACKOFF_MS` = 500 ms. Both constants
+`DEFAULT_DEADLINE_MS` budget ends the call naming the figure rather than retrying sooner
+than Slack asked; a 429 with no usable hint waits `DEFAULT_BACKOFF_MS`. Both constants
 live in `@sharptrick/parley-net-util`.
-`apps.connections.open` is dialled on a capped ladder that starts at `DIAL_BACKOFF_MS` = 500 ms and
-doubles to `MAX_DIAL_BACKOFF_MS` = 5 s, so an unavailable Socket Mode cannot be redialled at its own
+`apps.connections.open` is dialled on a capped ladder that starts at `DIAL_BACKOFF_MS` and
+doubles to `MAX_DIAL_BACKOFF_MS`, so an unavailable Socket Mode cannot be redialled at its own
 round-trip rate against Slack's tightest-limit endpoint.
 Only the loss of an **established** connection starts a reconnect loop, and
 only one such loop runs at a time; a handshake that never completed belongs to the caller that asked
