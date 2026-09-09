@@ -1,13 +1,16 @@
 import { readFileSync } from 'node:fs';
 import { codeOf, derivedRows } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
+import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from '@sharptrick/parley-core/testing';
 import {
   ASSERTED_PROPERTIES,
+  BLOCKING_POST_OFFSETS,
   CALLER_BLOCK_RETURN_MS,
   CLAUSES,
   CONTENT_SHAPES,
   CONTEXT_FIELDS,
   EARLY_RETURN_FRACTION,
+  FAULT_POSITIONS_PER_SHAPE,
   IDLE_BLOCK_CEILING_MS,
   IDLE_BLOCK_FLOOR_MS,
   IDLE_BLOCK_MS,
@@ -667,5 +670,63 @@ describe('the suite grades every backend it certifies', () => {
     expect(SUITE_CODE, `nothing in the suite reads \`${field}\``).toMatch(
       new RegExp(`\\.${field}\\b`),
     );
+  });
+});
+
+/**
+ * The tables the shared suite fans an `it.each` out over, held to the members they exist to cover.
+ *
+ * Every other count in this package is derived FROM these tables, so a table that loses rows at its
+ * source shrinks the observed suite and the predicted suite by the same amount and nothing reddens.
+ * Deleting two rows from CONTENT_SHAPES took the negative control's graded universe from 4,560 rows
+ * to 4,400 and its real failures from 281 to 276 with this package green. A member named here
+ * cannot go that way.
+ */
+describe('the tables the suite fans out on still cover what they were written for', () => {
+  it.each(
+    derivedRows('the content shapes', () => CONTENT_SHAPES.map(([label]) => label), {
+      floor: 6,
+      witness: [
+        'a newline',
+        'leading and trailing spaces',
+        'an astral emoji',
+        'a combining sequence',
+        'a tab',
+        'a sentence longer than any token this suite draws',
+      ],
+    }),
+  )('sends %s', (label) => {
+    expect(CONTENT_SHAPES.filter(([name]) => name === label)).toHaveLength(1);
+  });
+
+  it.each(
+    derivedRows('the handler faults', () => [...FAILURE_SHAPE_NAMES], {
+      floor: 7,
+      witness: [...FAILURE_SHAPE_NAMES] as unknown as [string, ...string[]],
+    }),
+  )('faults a live handler by %s', (shape) => {
+    expect(FAILURE_SHAPES[shape]).toBeTypeOf('function');
+  });
+
+  it('grades every fault shape at every position in a run', () => {
+    expect(FAULT_POSITIONS_PER_SHAPE).toBeGreaterThanOrEqual(3);
+  });
+
+  it.each(
+    derivedRows('the page limits', () => pageLimitsFor(PAGING_VOLUME.length - 1), {
+      floor: 5,
+      witness: ['1', '2', '3', '5', '6'],
+    }),
+  )('pages the backlog %i at a time', (limit) => {
+    expect(limit).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each(
+    derivedRows('the blocking post offsets', () => [...BLOCKING_POST_OFFSETS], {
+      floor: 4,
+      witness: ['0', '1', '2', '3'],
+    }),
+  )('races a post landing %ims in', (offset) => {
+    expect(offset).toBeLessThan(5);
   });
 });

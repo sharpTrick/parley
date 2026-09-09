@@ -1,4 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { derivedRows, filesUnder, withoutComments } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 import {
   type BackendFactory,
@@ -210,5 +212,34 @@ describe('README', () => {
     ])('does not restate the decayed absolute "%s"', (_label, shape) => {
       expect(readme.replaceAll(/\s+/g, ' ')).not.toMatch(shape);
     });
+  });
+});
+
+/**
+ * A knob a test reads is a knob a maintainer has to know about. `PARLEY_CONFORMANCE_BROKEN_SHARD`
+ * decides which variants a child registers — an unset or malformed value changes what the negative
+ * control grades — and it existed in two test files and nowhere a reader would look.
+ */
+describe('every PARLEY_* knob this package reads is documented', () => {
+  const HERE = fileURLToPath(new URL('.', import.meta.url));
+
+  it.each(
+    derivedRows(
+      'the PARLEY_* variables this package reads',
+      () => [
+        ...new Set(
+          filesUnder(HERE, ['.ts']).flatMap((f) =>
+            [...withoutComments(readFileSync(f, 'utf8')).matchAll(/\bPARLEY_[A-Z0-9_]+/g)].map(
+              (m) => m[0],
+            ),
+          ),
+        ),
+      ].sort(),
+      { floor: 2, witness: ['PARLEY_CONFORMANCE_BROKEN'] },
+    ).map((name) => [name] as const),
+  )('%s appears in the README', (name) => {
+    expect(readme, `${name} steers this package's tests and nothing tells a reader it exists`).toContain(
+      name,
+    );
   });
 });

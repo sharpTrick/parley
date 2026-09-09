@@ -1,15 +1,18 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   backendPackages,
+  codeOf,
+  commentaryLines,
   derivedRows,
   filesUnder,
   withoutComments,
   workspacePackages,
 } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
+import { defaultReadStatePath } from './engine/read-state.js';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 const SOURCE = ['.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.yaml', '.yml'];
@@ -103,109 +106,6 @@ describe('source hygiene', () => {
       'pkg/src/a/b/deep.ts',
       'pkg/src/shallow.ts',
     ]);
-  });
-
-  /**
-   * These rules are about COMMENTS and test NAMES, so scan only those. A sibling comment lint has to
-   * quote the shapes it bans — `example: '// as discussed with the reviewer, this stays.'` is a
-   * negative control proving its matcher fires — and a line-wide grep reads that fixture as an
-   * offence. Exempting the FILE would have excused `connection-hygiene`, `publish-hygiene` and
-   * `secret-hygiene` too, which are not comment lints at all; matching the stated scope is narrower
-   * and needs no allowlist.
-   */
-  const STRINGS = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
-  const TITLE = /^\s*(?:it|test|describe)(?:\.\w+)*(?:\.each\([^)]*\))?\s*\(\s*(['"`])((?:[^\\]|\\.)*?)\1/;
-
-  /**
-   * The text these rules govern, and nothing else. Blanking string literals BEFORE looking for `//`
-   * is what separates a comment from a fixture that quotes one, and it keeps a TRAILING comment in
-   * scope — matching on line shape instead would let `const x = 1; // as of now` through, trading a
-   * false positive for a false negative.
-   *
-   * Block state carries ACROSS lines, so that a `/* … *\/` whose continuations do not start with
-   * `*` is still commentary — the prime-directive rule below is the one form of backend dependency
-   * the import graph can never catch, and half the comment grammar was invisible to it. Clearing
-   * the state on `*\/` is as load-bearing as setting it: a flag never cleared reports the whole
-   * rest of a file as commentary, which is worse than the hole.
-   */
-  const commentaryOf = (line: string, inBlock = false): { text: string; inBlock: boolean } => {
-    const title = TITLE.exec(line)?.[2] ?? '';
-    const code = line.replace(STRINGS, (m) => m[0]!.repeat(m.length));
-    const said = (text: string, open: boolean): { text: string; inBlock: boolean } => ({
-      text: `${title} ${text}`,
-      inBlock: open,
-    });
-    if (inBlock) {
-      const end = code.indexOf('*/');
-      if (end < 0) return said(line, true);
-      const after = code.slice(end + 2).indexOf('//');
-      return said(line.slice(0, end + 2) + (after >= 0 ? line.slice(end + 2 + after) : ''), false);
-    }
-    const at = Math.min(
-      ...[code.indexOf('//'), code.indexOf('/*')].filter((i) => i >= 0).concat(Number.MAX_SAFE_INTEGER),
-    );
-    const trimmed = line.trim();
-    if (at === Number.MAX_SAFE_INTEGER) return said(trimmed.startsWith('*') ? trimmed : '', false);
-    return said(line.slice(at), code.indexOf('/*') === at && code.indexOf('*/', at + 2) < 0);
-  };
-
-  /** Every line's commentary, with the block state threaded through the file as the lints see it. */
-  const commentaryLines = (source: string): string[] => {
-    let inBlock = false;
-    return source.split('\n').map((line) => {
-      const seen = commentaryOf(line, inBlock);
-      inBlock = seen.inBlock;
-      return seen.text;
-    });
-  };
-
-  const PROBE = /the reviewer|as of (?:today|now)|for the time being/i;
-
-  /**
-   * Parameterised by the SHAPE a comment is written in rather than by the words in it. Every row
-   * appears twice — once carrying the banned phrase, once with the same shape carrying it inside a
-   * string literal, which is code and must stay out of scope. Rows that are all shapes the scanner
-   * already sees cannot tell a working scanner from one blind to half the grammar.
-   */
-  const SHAPES: readonly (readonly [label: string, flagged: string, ignored: string])[] = [
-    [
-      'a whole-line comment',
-      '// as discussed with the reviewer, this stays.',
-      "  example: '// as discussed with the reviewer, x.',",
-    ],
-    ['a trailing comment', 'const x = 1; // as of now this is fine', "const u = 'https://x/as-of-today';"],
-    ['a JSDoc continuation', '/**\n * kept as of today\n */', 'const TEMPORAL = /the reviewer/i;'],
-    ['a one-line block comment', '/* kept as of today */', "const s = '/* kept as of today */';"],
-    [
-      'a block comment continued without a leading star',
-      '/*\n   kept as of today,\n   and tomorrow\n*/',
-      "const s = ['/*', 'kept as of today', '*/'].join('');",
-    ],
-    [
-      'a block continuation carrying a quote character',
-      "/*\n   the reviewer's note\n*/",
-      'const s = "/* the reviewer\'s note */";',
-    ],
-    [
-      'a test name',
-      "  it('as of today it holds', () => {})",
-      "  it('holds', () => { const s = 'as of today'; })",
-    ],
-  ];
-
-  it.each(SHAPES)('scans %s', (_label, flagged, ignored) => {
-    expect(commentaryLines(flagged).some((text) => PROBE.test(text))).toBe(true);
-    expect(commentaryLines(ignored).some((text) => PROBE.test(text))).toBe(false);
-  });
-
-  /**
-   * The clear half graded on its own: everything after a closed block is code again. A scanner that
-   * sets the flag and never clears it satisfies every row above and then flags the whole repository.
-   */
-  it('stops treating a file as commentary once the block closes', () => {
-    const lines = commentaryLines('/*\n   a note\n*/\nconst asOfToday = 1;\nconst reviewer = 2;\n');
-    expect(lines[1]).toContain('a note');
-    expect(lines.slice(3).join('\n')).not.toMatch(/asOfToday|reviewer/);
   });
 
   /**
@@ -598,6 +498,192 @@ describe('no file in this repo names the machine it was written on', () => {
     expect(
       named(readFileSync(file, 'utf8'), HASH_SYNTAX.some((ext) => file.endsWith(ext))),
       'this path is correct on one machine — derive it from the repository root instead',
+    ).toEqual([]);
+  });
+});
+
+/**
+ * CLASS: an assertion whose expected value is read off the grading machine. The negative control
+ * divided its budget by `availableParallelism()`, so the same commit was RED on one vCPU and GREEN
+ * on eight and a developer could add work until CI reddened for a reason their box could not
+ * reproduce. It is the same shape as a timing bound calibrated on the developer's laptop, so it is
+ * graded as a class rather than at the one site that had it.
+ */
+describe('no assertion reads the machine it is being graded on', () => {
+  const HOST_READS = /\b(?:availableParallelism|cpus|totalmem|freemem|loadavg)\s*\(|\bprocess\.(?:platform|arch)\b|\bprocess\.env\.CI\b/g;
+
+  /**
+   * From `expect(` to the end of its statement, so the matcher's argument is scanned too: a bound
+   * hidden in `.toBeLessThan(cpus().length)` is the same defect as one hidden in the subject.
+   */
+  const assertionRegions = (code: string): string[] => {
+    const out: string[] = [];
+    for (const open of code.matchAll(/\bexpect(?:\.\w+)?\s*\(/g)) {
+      let depth = 0;
+      let at = open.index + open[0].length - 1;
+      for (; at < code.length; at++) {
+        const ch = code[at];
+        if (ch === '(') depth++;
+        else if (ch === ')' && --depth < 0) break;
+        else if (ch === ';' && depth === 0) break;
+      }
+      out.push(code.slice(open.index, at));
+    }
+    return out;
+  };
+
+  const hostReadsInAssertions = (source: string): string[] =>
+    assertionRegions(codeOf(source))
+      .flatMap((region) => [...region.matchAll(HOST_READS)])
+      .map((m) => m[0]);
+
+  it.each([
+    ['a core count as the expected value', 'expect(shards).toBe(availableParallelism());', ['availableParallelism(']],
+    ['a core count as the subject', 'expect(cpus().length).toBeGreaterThan(0);', ['cpus(']],
+    ['a memory read inside the data', 'expect([totalmem()]).toEqual(x);', ['totalmem(']],
+    ['a CI flag branching the expectation', 'expect(n).toBe(process.env.CI ? 1 : 2);', ['process.env.CI']],
+    ['a platform read in a plain argument', 'expect(a).toBe(process.platform);', ['process.platform']],
+    ['a platform read inside a template placeholder', 'expect(a, `on ${process.platform}`).toBe(b);', ['process.platform']],
+    ['the same read outside any assertion', 'const shards = availableParallelism();\nexpect(1).toBe(1);', []],
+    ['a narrated one', '// expect(n).toBe(cpus().length)\nexpect(1).toBe(1);', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(hostReadsInAssertions(source)).toEqual(found);
+  });
+
+  /**
+   * Sites allowed to grade a host read, each with the property that makes it safe. Empty is the
+   * intended state; an entry is a debt, not a permission slip.
+   */
+  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [];
+
+  const scanned = derivedRows(
+    'every test file in the repo',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(p.dir, ['.ts']))
+        .filter((f) => f.endsWith('.test.ts'))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 50,
+      witness: [
+        'packages/bridge-core/src/source-hygiene.test.ts',
+        'packages/conformance/test/negative-control.test.ts',
+      ],
+    },
+  );
+
+  it.each(scanned)('%s', (name, file) => {
+    const kept = KEEPS.find(([f]) => f === name);
+    const found = hostReadsInAssertions(readFileSync(file, 'utf8'));
+    expect(
+      kept ? [] : found,
+      'this assertion is graded against the machine running it, so the same commit passes on one ' +
+        'host and fails on another — compare against a declared constant instead',
+    ).toEqual([]);
+    if (kept) expect(found, `${name} is registered as a keep but no longer reads the host`).not.toEqual([]);
+  });
+});
+
+/**
+ * CLASS: a test that reaches a real user directory. `state_path` is optional and falls back to
+ * `${XDG_STATE_HOME:-~/.local/state}/parley/<instance>/read-state.json`, so a test that omits it
+ * opens the file a person's own bridge writes — reading a stale position, and advancing it. Twelve
+ * test files across two packages built a config naming neither; three remembered to redirect.
+ *
+ * Graded here rather than in the twelve, because the defect IS that a file has to remember.
+ */
+describe('the suite runs against a sandboxed state directory, not the developer’s', () => {
+  const sandbox = process.env.XDG_STATE_HOME ?? '';
+
+  it('has XDG_STATE_HOME redirected under the temp directory', () => {
+    expect(
+      sandbox,
+      'XDG_STATE_HOME is not a temp path — vitest.setup.ts is what puts it there, and without it ' +
+        'every config that omits `state_path` opens the real ~/.local/state/parley file',
+    ).toMatch(new RegExp(`^${tmpdir().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
+  it('resolves a default read-state path inside that sandbox and nowhere near the real home', () => {
+    const path = defaultReadStatePath('probe-instance');
+    expect(path.startsWith(sandbox), `${path} is outside ${sandbox}`).toBe(true);
+    expect(path.startsWith(join(homedir(), '.local'))).toBe(false);
+  });
+});
+
+/**
+ * CLASS: a table that registers NOTHING, in the one place nothing reports it. `it.each([])` runs no
+ * case and the file passes; scripts/assert-no-skipped-tests.mjs cannot see it either — that gate
+ * scores the groups it finds in the run's assertion results, and a group that produced no row has no
+ * key there. Its file-level check catches a file with no cases at all, not a group inside one:
+ * WATCHED at head, planting `it.each([] as string[])(...)` at the end of a 42-case file and feeding
+ * the JSON report to the gate printed `ok: 42 cases across 1 test files, none skipped away`, exit 0.
+ *
+ * The report loses the group. The SOURCE does not, which is why this is a lint.
+ */
+describe('no it.each table can register nothing', () => {
+  /**
+   * The second rule is narrowed to tables ROOTED IN A FILESYSTEM READ. "Any `.each(identifier)` not
+   * produced by derivedRows" was the wider instruction, and it names 193 sites — almost all of them
+   * a `flatMap` over a literal declared beside it, which cannot narrow past what is written there. A
+   * register of 193 would be a rubber stamp; a walk that comes back short is the real exposure.
+   */
+  const FILESYSTEM_READ = /\b(?:readdirSync|filesUnder|workspacePackages|backendPackages|globSync)\s*\(/;
+
+  const bindingOf = (code: string, name: string): string | undefined =>
+    new RegExp(`(?:const|let|var)\\s+${name}\\b[^=\\n]*=\\s*([\\s\\S]*?);\\n`).exec(code)?.[1];
+
+  const ungradedTables = (source: string): string[] => {
+    const code = codeOf(source);
+    const out: string[] = [];
+    if (/\.each\(\s*(?:\[\s*\]|\[\s*\]\s+as\b)/.test(code)) out.push('.each([])');
+    for (const use of code.matchAll(/\.each\(\s*([A-Za-z_$][\w$]*)\s*\)/g)) {
+      const name = use[1]!;
+      const rhs = bindingOf(code, name);
+      if (rhs !== undefined && FILESYSTEM_READ.test(rhs) && !/\bderivedRows\s*\(/.test(rhs))
+        out.push(`.each(${name})`);
+    }
+    return out;
+  };
+
+  it.each([
+    ['an empty table', 'it.each([])(\'%s\', () => {});', ['.each([])']],
+    ['an empty table with a type assertion', "it.each([] as string[])('%s', () => {});", ['.each([])']],
+    ['a spaced empty table', 'it.each([ ])(\'%s\', () => {});', ['.each([])']],
+    ['a tree walk that is not graded', "const f = readdirSync(D).sort();\nit.each(f)('%s', () => {});", ['.each(f)']],
+    ['the same walk through derivedRows', "const f = derivedRows('f', () => readdirSync(D), { floor: 1, witness: ['x'] });\nit.each(f)('%s', () => {});", []],
+    ['a literal table', "const f = [['a'], ['b']];\nit.each(f)('%s', () => {});", []],
+    ['a walk narrated in a comment', '// it.each([]) would be a hole\nit.each([1])(\'%s\', () => {});', []],
+  ])('reads %s', (_label, source, found) => {
+    expect(ungradedTables(source)).toEqual(found);
+  });
+
+  /** Sites allowed to register a filesystem-rooted table by hand. Empty is the intended state. */
+  const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [];
+
+  const tabled = derivedRows(
+    'every source and test file in the repo',
+    () =>
+      workspacePackages(REPO)
+        .flatMap((p) => filesUnder(p.dir, ['.ts']))
+        .sort()
+        .map((f) => [f.slice(REPO.length), f] as const),
+    {
+      floor: 200,
+      witness: [
+        'packages/bridge-core/src/source-hygiene.test.ts',
+        'packages/bridge-redis/test/test-hygiene.test.ts',
+        'packages/bridge-telegram/test/docs.test.ts',
+      ],
+    },
+  );
+
+  it.each(tabled)('%s', (name, file) => {
+    const found = KEEPS.some(([f]) => f === name) ? [] : ungradedTables(readFileSync(file, 'utf8'));
+    expect(
+      found,
+      'this table can come back empty or short with the file reporting success — build it with ' +
+        '`derivedRows`, which registers a case of its own for the floor and the witnesses',
     ).toEqual([]);
   });
 });

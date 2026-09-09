@@ -123,8 +123,61 @@ describe('the code and commentary split', () => {
 
   it('blanks the literals a rule must not read through', () => {
     expect(codeOf("const bad = 'out.push(...page)'; // note")).not.toContain('out.push');
-    // An unpaired quote in a regex must match nothing rather than swallow the next line.
-    expect(codeOf("const re = /'/g;\nout.push(spread);\nconst row = 'later';")).toContain('out.push');
+  });
+
+  /**
+   * CLASS: a construct whose literal does not close on the line it opens. The per-line matcher this
+   * replaces required one, so a multi-line template holding a block-comment opener swallowed THE
+   * REST OF THE FILE as commentary, a regex holding `//` truncated its line, and a regex holding a
+   * PAIR of quotes had everything between them destroyed — live on 14 lines across 12 files, the
+   * worst being the argument-literal extractor the repo's own package-boundary rule is built on.
+   *
+   * The row this replaces graded only the LINE-CROSSING form with a single unpaired quote, which
+   * can never run away under a matcher that requires a literal to close on its own line: it could
+   * not fail.
+   *
+   * Each row asserts that a named identifier AFTER the construct on the SAME line survives, and
+   * that the NEXT line survives. Both, because the two failures are different: a bad mask eats the
+   * rest of one line, a bad block state eats the rest of the file.
+   */
+  it.each([
+    ['a regex holding single quotes', "const re = /'([^'\\n]*)'/g; const after = 1;"],
+    ['a regex holding double quotes', 'const re = /"([^"\\n]*)"/g; const after = 1;'],
+    ['a regex holding a backtick', 'const re = /`([^`]*)`/g; const after = 1;'],
+    ['a regex character class holding a line-comment marker', 'const re = /[//]/g; const after = 1;'],
+    ['a regex holding a block-comment opener', 'const re = /[/][*]/g; const after = 1;'],
+    ['a regex with an unpaired quote', "const re = /'/g; const after = 1;"],
+    ['a nested template', 'const t = `a ${`b ${x}`} c`; const after = 1;'],
+    ['a division, which is not a regex', 'const n = (a) / 2; const after = 1;'],
+  ])('reads %s without eating the code around it', (_label, source) => {
+    const text = `${source}\nconst next = 2;`;
+    expect(withoutComments(text)).toContain('after');
+    expect(withoutComments(text)).toContain('next');
+    expect(codeOf(text)).toContain('after');
+    expect(codeOf(text)).toContain('next');
+  });
+
+  it.each([
+    ['a block-comment opener', '/*'],
+    ['a line-comment marker', '//'],
+    ['an apostrophe', "the vendor's"],
+    ['a block-comment closer', '*/'],
+  ])('survives a multi-line template carrying %s', (_label, payload) => {
+    const text = `const t = \`\n  ${payload}\n\`;\nconst after = 1;\nconst next = 2;\n`;
+    expect(withoutComments(text)).toContain('after');
+    expect(withoutComments(text)).toContain('next');
+    expect(codeOf(text)).toContain('after');
+  });
+
+  it('reads a template placeholder as the code it is', () => {
+    expect(codeOf('const t = `a ${sentinel} b`;')).toContain('sentinel');
+    expect(withoutComments('const t = `a ${/* note */ b} c`;')).not.toContain('note');
+  });
+
+  it('masks the argument-literal extractor the package-boundary rule is built on', () => {
+    const source = "const found = [...args.matchAll(/'([^'\\n]*)'|\"([^\"\\n]*)\"/g)].map(pick);";
+    expect(codeOf(source)).toContain('args.matchAll');
+    expect(codeOf(source)).toContain('.map(pick)');
   });
 });
 

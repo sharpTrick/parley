@@ -41,6 +41,7 @@ export {
   STABILITY_TOPICS,
   TAIL_BLOCK_MS,
 } from './budgets.js';
+export { BLOCKING_POST_OFFSETS } from './cases/blocking.js';
 export { pageLimitsFor, PAGING_VOLUME } from './cases/catch-up.js';
 export {
   carriesControlCharacter,
@@ -52,6 +53,7 @@ export {
   BURST_POSTS_MAX,
   BURST_POSTS_MIN,
   DELIVERY_MS,
+  FAULT_POSITIONS_PER_SHAPE,
   livePayload,
   LIVE_SUBSCRIPTIONS,
   liveWriter,

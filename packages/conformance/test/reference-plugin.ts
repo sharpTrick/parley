@@ -1994,6 +1994,13 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
 ];
 
 /**
+ * Keep a hard ceiling on the children, so that a many-core runner cannot spawn one full vitest per
+ * core: past ten shards the makespan is a single variant and the only thing that grows is memory,
+ * and an OOM-killed child leaves no report for `beforeAll` to read — a red row on a green tree.
+ */
+export const MAX_BROKEN_SHARDS = 8;
+
+/**
  * How many child runs the negative control splits {@link BROKEN_VARIANTS} across, and which slice a
  * given child registers.
  *
@@ -2002,11 +2009,30 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
  * `npm test`. The work and every assertion over it are unchanged; only the scheduling is. Keep the
  * slice an env var rather than one file per variant, so adding a variant costs no file.
  */
-export const brokenShards = (): number =>
-  Math.max(1, Math.min(BROKEN_VARIANTS.length, availableParallelism()));
+export const brokenShards = (cores: number = availableParallelism()): number =>
+  Math.max(1, Math.min(BROKEN_VARIANTS.length, MAX_BROKEN_SHARDS, cores));
 
-/** The variants a child identified as `i/N` registers. An unset value takes them all. */
+/**
+ * The variants a child identified as `i/N` registers. An unset value takes them all.
+ *
+ * REFUSE a malformed spec rather than answering one: `''` used to yield index 0 of count 1 — EVERY
+ * variant, in every shard — and `'abc'` yielded NaN, which no variant's index is congruent to, so
+ * the child registered NOTHING and the parent read an empty slice as a run that found no failures.
+ */
 export const brokenShardOf = (spec: string | undefined): BrokenVariant[] => {
-  const [index = 0, count = 1] = (spec ?? '0/1').split('/').map(Number);
-  return BROKEN_VARIANTS.filter((_, at) => at % count === index);
+  if (spec === undefined) return [...BROKEN_VARIANTS];
+  const parts = spec.split('/').map(Number);
+  const [index, count] = parts;
+  if (
+    parts.length !== 2 ||
+    !Number.isInteger(index) ||
+    !Number.isInteger(count) ||
+    (count as number) < 1 ||
+    (index as number) < 0 ||
+    (index as number) >= (count as number)
+  )
+    throw new Error(
+      `PARLEY_CONFORMANCE_BROKEN_SHARD must be \`i/N\` with 0 <= i < N, got "${spec}"`,
+    );
+  return BROKEN_VARIANTS.filter((_, at) => at % (count as number) === index);
 };

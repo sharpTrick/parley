@@ -49,6 +49,8 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
+    // Every worker, before every file: the XDG state sandbox. See vitest.setup.ts.
+    setupFiles: [fromHere('./vitest.setup.ts')],
     include: ['packages/**/*.test.ts', 'examples/**/*.test.ts'],
     // `zz-` is the reserved prefix for a throwaway probe written inside a package while
     // investigating it by hand. Keep it excluded, so that a scratch file cannot silently join the

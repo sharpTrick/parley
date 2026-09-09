@@ -19,6 +19,7 @@ import { MAX_BLOCK_MS } from '@sharptrick/parley-core';
 import { FAILURE_SHAPE_NAMES } from '@sharptrick/parley-core/testing';
 import {
   ASSERTED_PROPERTIES,
+  BLOCKING_POST_OFFSETS,
   BURST_POSTS_MAX,
   BURST_POSTS_MIN,
   CALLER_BLOCK_FLOOR_FRACTION,
@@ -26,9 +27,12 @@ import {
   type ConformanceContext,
   CONTENT_SHAPES,
   DELIVERY_MS,
+  FAULT_POSITIONS_PER_SHAPE,
   livePayload,
   LIVE_SUBSCRIPTIONS,
   liveWriter,
+  pageLimitsFor,
+  PAGING_VOLUME,
   QUIET_BACKLOG_ROWS,
   QUIET_DELIVERY_MS,
   QUIET_IDLE_MS,
@@ -49,6 +53,7 @@ import {
   BROKEN_SUITE_MARK,
   BROKEN_VARIANTS,
   brokenShards,
+  MAX_BROKEN_SHARDS,
   LATE_DELIVERY_MS,
   LIVE_DEATHS,
   MAX_BLAST_FRACTION,
@@ -59,6 +64,7 @@ import {
 } from './reference-plugin.js';
 import {
   CAPABILITY_AXES,
+  cases,
   diagnosedAssertions,
   suiteSource,
   UNTABULATED_CAPABILITIES,
@@ -105,8 +111,8 @@ const KEPT_RUN = join(tmpdir(), `${KEPT_PREFIX}${process.pid}-${Date.now().toStr
 /** How long a kept run stays before the next run sweeps it. Far longer than any run takes. */
 const KEEP_FOR_MS = 6 * 60 * 60 * 1000;
 let keptRun = '';
-/** The exact bytes this run parsed, so the copy on disk can be shown to be the same run's. */
-let keptReportText = '';
+/** How many children this run actually spawned, so the merge can be graded against its own shape. */
+let shardsUsed = 0;
 const PARENT_STARTED_AT = Date.now();
 
 /**
@@ -117,26 +123,59 @@ const PARENT_STARTED_AT = Date.now();
 const NESTED_RUN_BUDGET_MS = 1_800_000;
 
 /**
- * What one clause against one variant is allowed to cost. Pessimistic against the run itself: the
- * suite carries real waits (SINCELESS_BLOCK_MS 12s, TAIL_BLOCK_MS 5s, STABILITY_SPAN_MS 3s) but
- * only a few clauses pay one, so the figure has to sit above the mean without being the worst case.
+ * What one case of one variant's run is allowed to cost ON AVERAGE. A MEAN, not a ceiling: the
+ * suite carries real waits (SINCELESS_BLOCK_MS 12s, TAIL_BLOCK_MS 5s, STABILITY_SPAN_MS 3s) and its
+ * worst single case is measured at 15s, while a whole variant is 9.6s-109.9s over 57 cases. Set
+ * above the measured mean so the figure below over-predicts the run rather than tracking it.
  */
-const SLOWEST_CLAUSE_MS = 1_500;
+const MEAN_CASE_MS = 350;
 
 /** What a child vitest costs before it grades anything. */
 const CHILD_STARTUP_MS = 10_000;
+
+/** Every fan-out the cap permits. The budget is graded at all of them, so no host is a special case. */
+const PERMITTED_SHARDS = Array.from({ length: MAX_BROKEN_SHARDS }, (_, at) => at + 1);
+
+/**
+ * The tables the shared suite fans an `it.each` out over. One entry per `it.each` in `src/`, so a
+ * case registered inside an existing clause counts — the denominator every bound in this file is a
+ * fraction OF is CASES, and a figure counted in clauses does not move when a clause grows rows.
+ */
+const REGISTRATION_TABLES: ReadonlyArray<readonly [name: string, rows: number]> = [
+  ['CONTENT_SHAPES', CONTENT_SHAPES.length],
+  ['FAILURE_SHAPE_NAMES x FAULT_POSITIONS_PER_SHAPE', FAILURE_SHAPE_NAMES.length * FAULT_POSITIONS_PER_SHAPE],
+  ['pageLimitsFor(PAGING_VOLUME)', pageLimitsFor(PAGING_VOLUME.length - 1).length],
+  ['BLOCKING_POST_OFFSETS', BLOCKING_POST_OFFSETS.length],
+];
+
+/** The `it.each` registration sites in the suite's own source — one per {@link REGISTRATION_TABLES}. */
+const eachSites = (): string[] =>
+  cases()
+    .filter((c) => /^[ \t]*it\.each\(/.test(c.body))
+    .map((c) => c.title);
+
+/**
+ * How many cases ONE variant's child run must register: every plain `it` plus every row of every
+ * table the suite fans out on. Derived from the suite's own source and its own tables, so a clause
+ * that stops registering, a case module that is no longer called, and a table shrunk to one row all
+ * move it — an absolute floor proves only that the report is non-empty.
+ */
+const expectedCasesPerVariant = (): number =>
+  cases().length -
+  eachSites().length +
+  REGISTRATION_TABLES.reduce((n, [, rows]) => n + rows, 0);
 
 /**
  * The wall clock the shards must be ALLOWED to spend, from the work they are asked to do.
  *
  * Every other budget row in this file bounds a figure from ABOVE, by the harness timeout. Nothing
  * bounded one from below, which is the direction that fails: the nested run grows MULTIPLICATIVELY
- * — one clause is one case times every variant — so a clause or a variant added to the shared suite
- * silently spends headroom until the day the whole file SKIPS and reports nothing. Computed from
- * the two lengths, so adding either MOVES the required figure and reddens the row.
+ * — every CASE the suite registers, against every variant — so a case or a variant added to the
+ * shared suite silently spends headroom until the day the whole file SKIPS and reports nothing.
+ * Computed from the two counts, so adding either MOVES the required figure and reddens the row.
  */
-const requiredBudgetMs = (variants: number, clauses: number, shards: number): number =>
-  CHILD_STARTUP_MS + Math.ceil(variants / shards) * clauses * SLOWEST_CLAUSE_MS;
+const requiredBudgetMs = (variants: number, cases: number, shards: number): number =>
+  CHILD_STARTUP_MS + Math.ceil(variants / shards) * cases * MEAN_CASE_MS;
 
 beforeAll(async () => {
   for (const entry of readdirSync(tmpdir())) {
@@ -150,6 +189,7 @@ beforeAll(async () => {
   }
   const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-run-'));
   const shards = brokenShards();
+  shardsUsed = shards;
   try {
     /**
      * One child per shard, run CONCURRENTLY. vitest schedules at file granularity, so one file
@@ -161,7 +201,17 @@ beforeAll(async () => {
         const out = join(dir, `report-${shard}.json`);
         const run = await promisify(execFile)(
           'npx',
-          ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=30000'],
+          [
+            'vitest',
+            'run',
+            TARGET,
+            // Keep BOTH reporters, so that the kept log holds the failing case names: `--reporter=json`
+            // alone REPLACES the human reporter, and the file was then 1,887 bytes for 4,560 cases.
+            '--reporter=default',
+            '--reporter=json',
+            `--outputFile.json=${out}`,
+            '--testTimeout=30000',
+          ],
           {
             cwd: REPO_ROOT,
             env: {
@@ -191,8 +241,7 @@ beforeAll(async () => {
       startTime: Math.min(...parsed.map((p) => p.startTime)),
       testResults: parsed.flatMap((p) => p.testResults),
     };
-    keptReportText = JSON.stringify(merged);
-    writeFileSync(join(KEPT_RUN, 'report.json'), keptReportText);
+    writeFileSync(join(KEPT_RUN, 'report.json'), JSON.stringify(merged));
     keptRun = KEPT_RUN;
     report = merged;
   } finally {
@@ -217,6 +266,9 @@ const variantOf = (row: Row): string | undefined => {
 const claims = (name: string, row: Row): boolean => variantOf(row) === name;
 
 const rowsOf = (name: string): Row[] => results().filter((row) => claims(name, row));
+
+/** Ran, in the sense every count here needs: the runner reached the body. A skip grades nothing. */
+const ran = (row: Row): boolean => row.status === 'passed' || row.status === 'failed';
 
 /**
  * The one-to-one-ness, made mechanical. A clause with no variant is a clause whose assertions can be
@@ -337,11 +389,18 @@ describe('every assertion carrying its own diagnostic has a variant that reaches
    */
   it('knows every diagnostic the broken variants actually printed', () => {
     const printed = [...new Set(printedDiagnostics())];
+    // De-duplicated by the FRAGMENT each diagnostic matched, not by the printed text: the printed
+    // text is interpolated, so "…a 255…" and "…a 2098…" counted as two distinct diagnostics and the
+    // margin read wider than it was.
+    const fragments = new Set(
+      printed.flatMap((why) => diagnosed.filter((d) => why.includes(d) || d.includes(why))),
+    );
     expect(
-      printed.length,
-      'the broken variants printed almost no diagnostics — either they have stopped reaching the ' +
-        'assertions that carry one, or the recovery below can no longer read what the runner ' +
-        'prints, and the subset check is then satisfied by an empty list',
+      fragments.size,
+      `the broken variants printed ${printed.length} messages matching only ${fragments.size} of ` +
+        'the assertions this scan knows about — either they have stopped reaching the assertions ' +
+        'that carry a diagnostic, or the recovery below can no longer read what the runner prints, ' +
+        'and the subset check is then satisfied by an empty list',
     ).toBeGreaterThanOrEqual(CLAUSES.length);
     expect(
       printed.filter((why) => !diagnosed.some((d) => why.includes(d) || d.includes(why))),
@@ -455,24 +514,65 @@ describe('every arm of every capability flag has a plugin that fails it', () => 
  */
 describe('the nested run is allowed the time the table it drives will take', () => {
   it.each([
-    ['one variant, one clause, one shard', 1, 1, 1, CHILD_STARTUP_MS + SLOWEST_CLAUSE_MS],
-    ['a variant added', 2, 1, 1, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
-    ['a clause added', 1, 2, 1, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
-    ['the same work spread over two shards', 2, 1, 2, CHILD_STARTUP_MS + SLOWEST_CLAUSE_MS],
-    ['an odd split, which rounds up', 3, 1, 2, CHILD_STARTUP_MS + 2 * SLOWEST_CLAUSE_MS],
-  ])('%s moves the required budget', (_label, variants, clauses, shards, required) => {
-    expect(requiredBudgetMs(variants, clauses, shards)).toBe(required);
+    ['one variant, one case, one shard', 1, 1, 1, CHILD_STARTUP_MS + MEAN_CASE_MS],
+    ['a variant added', 2, 1, 1, CHILD_STARTUP_MS + 2 * MEAN_CASE_MS],
+    ['a case added inside an existing clause', 1, 2, 1, CHILD_STARTUP_MS + 2 * MEAN_CASE_MS],
+    ['the same work spread over two shards', 2, 1, 2, CHILD_STARTUP_MS + MEAN_CASE_MS],
+    ['an odd split, which rounds up', 3, 1, 2, CHILD_STARTUP_MS + 2 * MEAN_CASE_MS],
+  ])('%s moves the required budget', (_label, variants, cases, shards, required) => {
+    expect(requiredBudgetMs(variants, cases, shards)).toBe(required);
   });
 
-  it('the budget covers the whole table, so growing the table reddens this instead of skipping', () => {
-    expect(
-      NESTED_RUN_BUDGET_MS,
-      `${BROKEN_VARIANTS.length} variants x ${CLAUSES.length} clauses over ${brokenShards()} ` +
-        'shards no longer fit the budget. Raise it, or split the shards further — a nested run ' +
-        'that runs out of time SKIPS every check in this file and reports nothing',
-    ).toBeGreaterThanOrEqual(
-      requiredBudgetMs(BROKEN_VARIANTS.length, CLAUSES.length, brokenShards()),
+  /**
+   * Every axis this figure has to grow along, each asserted to move it STRICTLY. The table above
+   * pins five values; this pins the direction, which is what a refactor of the formula loses. The
+   * second row is the one the previous formula got wrong: it multiplied by CLAUSES.length while the
+   * work is CASES, so the handler-fault clause growing from 18 rows to 21 — the exact growth this
+   * repo keeps having — did not move the budget at all.
+   */
+  const GROWTH_AXES: ReadonlyArray<readonly [name: string, variants: number, cases: number, shards: number]> = [
+    ['a variant added', 41, 57, 4],
+    ['a case added, whether or not it brought a clause with it', 40, 58, 4],
+    ['a shard removed', 40, 57, 3],
+  ];
+
+  it.each(GROWTH_AXES)('%s raises the required budget', (_name, variants, cases, shards) => {
+    expect(requiredBudgetMs(variants, cases, shards)).toBeGreaterThan(
+      requiredBudgetMs(40, 57, 4),
     );
+  });
+
+  it.each(PERMITTED_SHARDS.map((n) => [n]))(
+    'the budget covers the whole table over %i shards, so growing it reddens this instead of skipping',
+    (shards) => {
+      expect(
+        NESTED_RUN_BUDGET_MS,
+        `${BROKEN_VARIANTS.length} variants x ${expectedCasesPerVariant()} cases over ${shards} ` +
+          'shards no longer fit the budget. Raise it, or cut the table — a nested run that runs ' +
+          'out of time SKIPS every check in this file and reports nothing',
+      ).toBeGreaterThanOrEqual(
+        requiredBudgetMs(BROKEN_VARIANTS.length, expectedCasesPerVariant(), shards),
+      );
+    },
+  );
+
+  /**
+   * The same commit used to be RED on a one-core host and GREEN on eight, because the row above
+   * divided the work by `brokenShards()` — `availableParallelism()`, read off whichever machine was
+   * grading. Keep the divisor a declared constant, so that what this file demands of the budget is a
+   * property of the table and not of the box: a developer here would otherwise add variants until CI
+   * reddened for a reason their own machine could not reproduce.
+   */
+  it.each([
+    [1, 1],
+    [2, 2],
+    [4, 4],
+    [8, 8],
+    [64, MAX_BROKEN_SHARDS],
+    [128, MAX_BROKEN_SHARDS],
+  ])('a %i-core host fans out to %i children', (cores, shards) => {
+    expect(brokenShards(cores)).toBe(shards);
+    expect(brokenShards(cores)).toBeLessThanOrEqual(BROKEN_VARIANTS.length);
   });
 });
 
@@ -638,26 +738,51 @@ describe('the suite rejects a non-conformant plugin', () => {
         'leaves nothing to read: not which cases the child failed, not its output, not even ' +
         'whether the child agreed with itself',
     ).toEqual([]);
-    // Kept files are THIS run's, byte for byte. The path used to be fixed and the only check on
-    // its contents was a row count that is the same figure for every run, so a report another
-    // worktree had written hours earlier satisfied it — and the copy meant to explain a red row
-    // described a different run. Two agents on one machine interleave; a per-run path plus an
-    // exact comparison is what makes the evidence attributable.
-    expect(
-      readFileSync(join(keptRun, 'report.json'), 'utf8'),
-      'the kept report is not the one this run parsed',
-    ).toBe(keptReportText);
-    expect(
-      readFileSync(join(keptRun, 'run.log'), 'utf8'),
-      'the kept log is not this run’s output — a non-empty file is not evidence of anything; an ' +
-        'npm notice banner alone satisfies a length check',
-    ).toBe(stdout);
-    const kept = JSON.parse(keptReportText) as JsonReport;
-    expect(kept.testResults.flatMap((f) => f.assertionResults).length).toBe(results().length);
+    const kept = JSON.parse(readFileSync(join(keptRun, 'report.json'), 'utf8')) as JsonReport;
     expect(
       kept.startTime,
       'the child report predates this run, so it was written by another one',
     ).toBeGreaterThanOrEqual(PARENT_STARTED_AT);
+    const keptRows = kept.testResults.flatMap((f) => f.assertionResults);
+    expect(
+      BROKEN_VARIANTS.filter((v) => !keptRows.some((r) => claims(v.name, r))).map((v) => v.name),
+      'the report on disk does not hold every variant this run graded',
+    ).toEqual([]);
+  });
+
+  /**
+   * The kept LOG, graded by a property of its content the writing code does not trivially supply.
+   * Three of the checks here used to be self-comparisons made in the hook that wrote the files —
+   * readFileSync(report.json) === the string just written, readFileSync(run.log) === stdout, and a
+   * row count of the object that string was stringified from. None of them could fail. Meanwhile
+   * the diagnostic beside them ("an npm notice banner alone satisfies a length check") had become a
+   * description of the file it was guarding: 235 bytes for 570 cases, an npm warning plus "JSON
+   * report written to …".
+   */
+  it('the kept log names every variant that failed in this run', () => {
+    const log = readFileSync(join(keptRun, 'run.log'), 'utf8');
+    const failing = [
+      ...new Set(results().filter((r) => r.status === 'failed').map(variantOf)),
+    ].filter((name): name is string => name !== undefined);
+    expect(failing.length).toBeGreaterThan(0);
+    expect(
+      failing.filter((name) => !log.includes(name)),
+      'the kept log does not name the variants that failed, so it cannot explain a red row',
+    ).toEqual([]);
+  });
+
+  /**
+   * The merge's own shape. A duplicated merge IS caught downstream — every variant's failure count
+   * doubles and 43 rows redden — but each of those rows blames its VARIANT and offers "or its
+   * blastRadius needs raising", which restores green while the run does N times the work. Graded
+   * here, where the cause is: one report per child, no more.
+   */
+  it('merged one report per shard, so no variant is counted twice', () => {
+    expect(shardsUsed).toBeGreaterThan(0);
+    expect(
+      report.testResults.length,
+      'the merged report holds a different number of child reports than children were spawned',
+    ).toBe(shardsUsed);
   });
 
   // Without this the per-variant rows below read an empty report and pass having graded nothing.
@@ -696,12 +821,10 @@ describe('the suite rejects a non-conformant plugin', () => {
    * The denominator the bound below is a fraction OF. Every variant runs the same registered suite,
    * so a per-variant failure count is only readable against a case count that is the same for all of
    * them and is not zero — an upper bound over rows nobody collected passes by finding nothing.
-   * The floor is an absolute figure rather than a count read back off the suite, so a report that
-   * collapses to a handful of rows cannot lower the standard it is graded by.
+   * Rows that did not RUN are not part of it: a case that starts skipping itself would otherwise
+   * keep the denominator while grading nothing.
    */
-  const MIN_SUITE_CASES = 20;
-
-  const suiteCases = (): number => rowsOf(BROKEN_VARIANTS[0]!.name).length;
+  const suiteCases = (): number => rowsOf(BROKEN_VARIANTS[0]!.name).filter(ran).length;
 
   /**
    * The ceiling, as the fraction of the suite it always was. Held as a literal it took a manual
@@ -727,13 +850,23 @@ describe('the suite rejects a non-conformant plugin', () => {
     Math.max(clauseSize(mustFail), maxBlastRadius());
 
   it('every variant ran the same whole suite, so a failure count is a fraction of something known', () => {
-    const collected = BROKEN_VARIANTS.map((v) => [v.name, rowsOf(v.name).length] as const);
+    const collected = BROKEN_VARIANTS.map((v) => [v.name, rowsOf(v.name).filter(ran).length] as const);
     expect(
       collected.filter(([, n]) => n !== suiteCases()),
       'a variant that did not run the same set of cases as the others — a bound on how many it ' +
         'fails cannot be compared against one that ran a different suite',
     ).toEqual([]);
-    expect(suiteCases()).toBeGreaterThanOrEqual(MIN_SUITE_CASES);
+    expect(
+      results().filter((r) => !ran(r)).map((r) => r.fullName),
+      'the merged child report holds a case that did not run — every count in this file is over ' +
+        'rows, and a skipped row is a denominator with no grading behind it',
+    ).toEqual([]);
+    expect(
+      suiteCases(),
+      'a variant no longer runs the number of cases the suite\u2019s own tables register. Comparing ' +
+        'the variants to EACH OTHER cannot see this: a table shrunk at its source shrinks every ' +
+        'variant equally, and 160 graded cases once vanished with this package green',
+    ).toBe(expectedCasesPerVariant());
     // The ceiling is only a bound if it is well under the whole suite: a fraction at or past 1
     // would admit a plugin that fails everything as a control for each case in turn.
     expect(MAX_BLAST_FRACTION).toBeLessThanOrEqual(1 / 2);
@@ -837,8 +970,9 @@ describe('the suite rejects a non-conformant plugin', () => {
       expect(
         failed.length,
         `"${name}" may fail at most ${radius} of ${suiteCases()} cases and failed ` +
-          `${failed.length}. Either the mutation now breaks more than it is aimed at — in which ` +
-          `case it no longer shows "${mustFail}" is alive — or its blastRadius needs raising. ` +
+          `${failed.length}. If EVERY variant is over by the same multiple, read the merge row ` +
+          `above first — the answer is not here. Otherwise the mutation now breaks more than it ` +
+          `is aimed at, and no longer shows "${mustFail}" is alive; narrow it. ` +
           `The child run that produced this is kept at ${keptRun}:\n` +
           titles,
       ).toBeLessThanOrEqual(radius);
