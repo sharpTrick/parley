@@ -58,6 +58,14 @@ could not serve it, and `subscribe` states the lossiness it always had. Read **U
 
 ### Added
 
+- `@sharptrick/parley-net-util` declares `typescript` as an **optional** peer dependency. Its
+  `/testing` subpath now reads the import graph through the TypeScript AST instead of five
+  hand-rolled regex readers, so a consumer of that subpath supplies its own `typescript` (the
+  runtime entry point is untouched and still dependency-free). The subpath gains
+  `checkedExports`, `consumedNames`, `declaredExports`, `starReexports`, `unusedImports`,
+  `ImportBinding` and `WorkspacePackage`. `ImportBinding` gained two REQUIRED fields — `kind`
+  (`'import'` or `'reexport'`) and `sourceNames` — so code that builds one by hand no longer
+  compiles; code that only reads them is unaffected.
 - `@sharptrick/parley-core/testing` is a published subpath: `startFakeOidc`, `FakeOidc`,
   `FakeOidcClaims` and the shared failure shapes ship there for downstream test suites.
 - Every backend ships a `parley-<name>` bin; previously only `parley-sqlite` existed and the other
