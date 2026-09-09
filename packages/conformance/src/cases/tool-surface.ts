@@ -112,6 +112,39 @@ const catchUpAsAnAgentWould = async (
  * backends, in its second session and in every session after it, while the suite stayed green
  * because the suite never called the tool.
  */
+/**
+ * One row per CALLER INTENT the tool description names, each with the argument spelling that
+ * expresses it. A capability with no spelling fails its row rather than disappearing quietly: "the
+ * newest page" was reachable by omitting `since` until a since-less read was redefined to resume
+ * from the stored position, and nothing anywhere asked whether the intent still had a spelling.
+ *
+ * Judged on WHICH END of the backlog comes back, so an intent answered by the wrong one — the
+ * commonest way one of these silently becomes an alias of another — fails.
+ */
+const INTENTS: ReadonlyArray<
+  readonly [
+    intent: string,
+    spell: (cursorFromAPreviousPage: string) => Record<string, unknown>,
+    holds: (got: readonly string[], missed: readonly string[]) => void,
+  ]
+> = [
+  [
+    'resume where I left off',
+    () => ({}),
+    (got, missed) => expect(got[0]).toBe(missed[0]),
+  ],
+  [
+    'everything since cursor C',
+    (cursor) => ({ since: cursor }),
+    (got, missed) => expect(got[0]).toBe(missed[0]),
+  ],
+  [
+    'the newest page',
+    () => ({ from: 'recent' }),
+    (got, missed) => expect(got.at(-1)).toBe(missed.at(-1)),
+  ],
+];
+
 export function toolSurfaceCases(ctx: ConformanceContext): void {
   it('the fetch_recent tool hands a resuming session everything it missed', async () => {
     const topic = ctx.freshTopic();
@@ -149,5 +182,62 @@ export function toolSurfaceCases(ctx: ConformanceContext): void {
 
     // A session that has caught up is not handed the same backlog again on the next start.
     expect(await catchUpAsAnAgentWould(fetchRecent, topic, backlog)).toEqual([]);
+  });
+
+  /** The bridge a case drives: core's tool handlers over this backend, with a fresh position. */
+  const rig = (): { fetchRecent: ToolHandler; topic: Topic } => {
+    const topic = ctx.freshTopic();
+    return {
+      topic,
+      fetchRecent: toolsOf({
+        plugin: ctx.plugin,
+        identity: SENDER,
+        allow: new Allowlist([String(topic)]),
+        seen: new SeenSet(),
+        readState: position(),
+        blockMaxMs: 60_000,
+        blockPollIntervalMs: 20,
+      }).get('parley_fetch_recent')!,
+    };
+  };
+
+  /** A session that read once, then missed more than one page. */
+  const away = async (
+    fetchRecent: ToolHandler,
+    topic: Topic,
+  ): Promise<{ cursor: string; missed: string[] }> => {
+    await ctx.plugin.post(topic, SENDER, 'read-in-session-one');
+    const opening = answerOf(await fetchRecent({ topic: String(topic), limit: TOOL_PAGE }));
+    expect(opening.nextCursor, 'the opening read handed back no cursor to page from').toBeDefined();
+    const missed = Array.from({ length: TOOL_BACKLOG_MIN + 1 }, (_u, i) => `missed-${i}`);
+    for (const content of missed) await ctx.plugin.post(topic, SENDER, content);
+    return { cursor: opening.nextCursor!, missed };
+  };
+
+  it.each(INTENTS)('an agent can spell the intent: %s', async (_intent, spell, holds) => {
+    const { fetchRecent, topic } = rig();
+    const { cursor, missed } = await away(fetchRecent, topic);
+    const answer = answerOf(
+      await fetchRecent({ topic: String(topic), limit: TOOL_PAGE, ...spell(cursor) }),
+    );
+    holds(
+      answer.messages.map((m) => m.content),
+      missed,
+    );
+  });
+
+  /**
+   * The newest page is a READ, not a seek: an agent that asks what is happening now must not lose
+   * the backlog by asking. The stored position is the only thing that makes the backlog reachable.
+   */
+  it('asking for the newest page does not consume the backlog', async () => {
+    const { fetchRecent, topic } = rig();
+    const { missed } = await away(fetchRecent, topic);
+    await fetchRecent({ topic: String(topic), limit: TOOL_PAGE, from: 'recent' });
+    expect(
+      await catchUpAsAnAgentWould(fetchRecent, topic, missed.length),
+      'a read of the newest page dragged the stored position past the backlog, so everything ' +
+        'between the two is now unreachable by resuming',
+    ).toEqual(missed);
   });
 }
