@@ -111,8 +111,8 @@ const KEPT_RUN = join(tmpdir(), `${KEPT_PREFIX}${process.pid}-${Date.now().toStr
 /** How long a kept run stays before the next run sweeps it. Far longer than any run takes. */
 const KEEP_FOR_MS = 6 * 60 * 60 * 1000;
 let keptRun = '';
-/** The exact bytes this run parsed, so the copy on disk can be shown to be the same run's. */
-let keptReportText = '';
+/** How many children this run actually spawned, so the merge can be graded against its own shape. */
+let shardsUsed = 0;
 const PARENT_STARTED_AT = Date.now();
 
 /**
@@ -170,9 +170,9 @@ const expectedCasesPerVariant = (): number =>
  *
  * Every other budget row in this file bounds a figure from ABOVE, by the harness timeout. Nothing
  * bounded one from below, which is the direction that fails: the nested run grows MULTIPLICATIVELY
- * — one clause is one case times every variant — so a clause or a variant added to the shared suite
- * silently spends headroom until the day the whole file SKIPS and reports nothing. Computed from
- * the two lengths, so adding either MOVES the required figure and reddens the row.
+ * — every CASE the suite registers, against every variant — so a case or a variant added to the
+ * shared suite silently spends headroom until the day the whole file SKIPS and reports nothing.
+ * Computed from the two counts, so adding either MOVES the required figure and reddens the row.
  */
 const requiredBudgetMs = (variants: number, cases: number, shards: number): number =>
   CHILD_STARTUP_MS + Math.ceil(variants / shards) * cases * MEAN_CASE_MS;
@@ -189,6 +189,7 @@ beforeAll(async () => {
   }
   const dir = mkdtempSync(join(tmpdir(), 'parley-negative-control-run-'));
   const shards = brokenShards();
+  shardsUsed = shards;
   try {
     /**
      * One child per shard, run CONCURRENTLY. vitest schedules at file granularity, so one file
@@ -200,7 +201,17 @@ beforeAll(async () => {
         const out = join(dir, `report-${shard}.json`);
         const run = await promisify(execFile)(
           'npx',
-          ['vitest', 'run', TARGET, '--reporter=json', `--outputFile=${out}`, '--testTimeout=30000'],
+          [
+            'vitest',
+            'run',
+            TARGET,
+            // Keep BOTH reporters, so that the kept log holds the failing case names: `--reporter=json`
+            // alone REPLACES the human reporter, and the file was then 1,887 bytes for 4,560 cases.
+            '--reporter=default',
+            '--reporter=json',
+            `--outputFile.json=${out}`,
+            '--testTimeout=30000',
+          ],
           {
             cwd: REPO_ROOT,
             env: {
@@ -230,8 +241,7 @@ beforeAll(async () => {
       startTime: Math.min(...parsed.map((p) => p.startTime)),
       testResults: parsed.flatMap((p) => p.testResults),
     };
-    keptReportText = JSON.stringify(merged);
-    writeFileSync(join(KEPT_RUN, 'report.json'), keptReportText);
+    writeFileSync(join(KEPT_RUN, 'report.json'), JSON.stringify(merged));
     keptRun = KEPT_RUN;
     report = merged;
   } finally {
@@ -379,11 +389,18 @@ describe('every assertion carrying its own diagnostic has a variant that reaches
    */
   it('knows every diagnostic the broken variants actually printed', () => {
     const printed = [...new Set(printedDiagnostics())];
+    // De-duplicated by the FRAGMENT each diagnostic matched, not by the printed text: the printed
+    // text is interpolated, so "…a 255…" and "…a 2098…" counted as two distinct diagnostics and the
+    // margin read wider than it was.
+    const fragments = new Set(
+      printed.flatMap((why) => diagnosed.filter((d) => why.includes(d) || d.includes(why))),
+    );
     expect(
-      printed.length,
-      'the broken variants printed almost no diagnostics — either they have stopped reaching the ' +
-        'assertions that carry one, or the recovery below can no longer read what the runner ' +
-        'prints, and the subset check is then satisfied by an empty list',
+      fragments.size,
+      `the broken variants printed ${printed.length} messages matching only ${fragments.size} of ` +
+        'the assertions this scan knows about — either they have stopped reaching the assertions ' +
+        'that carry a diagnostic, or the recovery below can no longer read what the runner prints, ' +
+        'and the subset check is then satisfied by an empty list',
     ).toBeGreaterThanOrEqual(CLAUSES.length);
     expect(
       printed.filter((why) => !diagnosed.some((d) => why.includes(d) || d.includes(why))),
@@ -721,26 +738,51 @@ describe('the suite rejects a non-conformant plugin', () => {
         'leaves nothing to read: not which cases the child failed, not its output, not even ' +
         'whether the child agreed with itself',
     ).toEqual([]);
-    // Kept files are THIS run's, byte for byte. The path used to be fixed and the only check on
-    // its contents was a row count that is the same figure for every run, so a report another
-    // worktree had written hours earlier satisfied it — and the copy meant to explain a red row
-    // described a different run. Two agents on one machine interleave; a per-run path plus an
-    // exact comparison is what makes the evidence attributable.
-    expect(
-      readFileSync(join(keptRun, 'report.json'), 'utf8'),
-      'the kept report is not the one this run parsed',
-    ).toBe(keptReportText);
-    expect(
-      readFileSync(join(keptRun, 'run.log'), 'utf8'),
-      'the kept log is not this run’s output — a non-empty file is not evidence of anything; an ' +
-        'npm notice banner alone satisfies a length check',
-    ).toBe(stdout);
-    const kept = JSON.parse(keptReportText) as JsonReport;
-    expect(kept.testResults.flatMap((f) => f.assertionResults).length).toBe(results().length);
+    const kept = JSON.parse(readFileSync(join(keptRun, 'report.json'), 'utf8')) as JsonReport;
     expect(
       kept.startTime,
       'the child report predates this run, so it was written by another one',
     ).toBeGreaterThanOrEqual(PARENT_STARTED_AT);
+    const keptRows = kept.testResults.flatMap((f) => f.assertionResults);
+    expect(
+      BROKEN_VARIANTS.filter((v) => !keptRows.some((r) => claims(v.name, r))).map((v) => v.name),
+      'the report on disk does not hold every variant this run graded',
+    ).toEqual([]);
+  });
+
+  /**
+   * The kept LOG, graded by a property of its content the writing code does not trivially supply.
+   * Three of the checks here used to be self-comparisons made in the hook that wrote the files —
+   * readFileSync(report.json) === the string just written, readFileSync(run.log) === stdout, and a
+   * row count of the object that string was stringified from. None of them could fail. Meanwhile
+   * the diagnostic beside them ("an npm notice banner alone satisfies a length check") had become a
+   * description of the file it was guarding: 235 bytes for 570 cases, an npm warning plus "JSON
+   * report written to …".
+   */
+  it('the kept log names every variant that failed in this run', () => {
+    const log = readFileSync(join(keptRun, 'run.log'), 'utf8');
+    const failing = [
+      ...new Set(results().filter((r) => r.status === 'failed').map(variantOf)),
+    ].filter((name): name is string => name !== undefined);
+    expect(failing.length).toBeGreaterThan(0);
+    expect(
+      failing.filter((name) => !log.includes(name)),
+      'the kept log does not name the variants that failed, so it cannot explain a red row',
+    ).toEqual([]);
+  });
+
+  /**
+   * The merge's own shape. A duplicated merge IS caught downstream — every variant's failure count
+   * doubles and 43 rows redden — but each of those rows blames its VARIANT and offers "or its
+   * blastRadius needs raising", which restores green while the run does N times the work. Graded
+   * here, where the cause is: one report per child, no more.
+   */
+  it('merged one report per shard, so no variant is counted twice', () => {
+    expect(shardsUsed).toBeGreaterThan(0);
+    expect(
+      report.testResults.length,
+      'the merged report holds a different number of child reports than children were spawned',
+    ).toBe(shardsUsed);
   });
 
   // Without this the per-variant rows below read an empty report and pass having graded nothing.
@@ -928,8 +970,9 @@ describe('the suite rejects a non-conformant plugin', () => {
       expect(
         failed.length,
         `"${name}" may fail at most ${radius} of ${suiteCases()} cases and failed ` +
-          `${failed.length}. Either the mutation now breaks more than it is aimed at — in which ` +
-          `case it no longer shows "${mustFail}" is alive — or its blastRadius needs raising. ` +
+          `${failed.length}. If EVERY variant is over by the same multiple, read the merge row ` +
+          `above first — the answer is not here. Otherwise the mutation now breaks more than it ` +
+          `is aimed at, and no longer shows "${mustFail}" is alive; narrow it. ` +
           `The child run that produced this is kept at ${keptRun}:\n` +
           titles,
       ).toBeLessThanOrEqual(radius);

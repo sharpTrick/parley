@@ -233,7 +233,9 @@ everywhere:
   than kept in step by hand: seven clauses once had no control at all, so their assertions could be
   gutted with this whole package staying green while every backend kept being certified against the
   weakened clause. Vitest cannot invert a suite's result in-process, so that run happens in a child
-  process behind `PARLEY_CONFORMANCE_BROKEN=1` and this test grades its JSON report.
+  processes behind `PARLEY_CONFORMANCE_BROKEN=1`. `PARLEY_CONFORMANCE_BROKEN_SHARD=i/N` tells each
+  child which slice of the variants to register, so the ~80 nested suites are not run strictly
+  serially in one vitest worker, and this test grades their merged JSON report.
 
 Plus the self-tests: that the context validator rejects a malformed fixture, that every clause in
 `CLAUSES` still owns a case, and that no case buys itself out of asserting on a capability flag.
