@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from './failure-shapes.js';
+import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES, unhandledDuring } from './failure-shapes.js';
 
 /**
  * CLASS: a shared fault table with no FLOOR. Every fire-and-forget site in this repo — and, through
@@ -122,4 +122,66 @@ describe('the shared fault table keeps every property its consumers differ on', 
       ).toBeGreaterThan(0);
     },
   );
+});
+
+/**
+ * CLASS: an escape detector that watches ONE of the two ways a failure leaves a fire-and-forget
+ * site. A rejection nothing attached to arrives as `unhandledRejection`; a SYNCHRONOUS throw out of
+ * a detached task arrives as `uncaughtException` — a different event, and a listener registered for
+ * the first reports the second as clean. The run still exits non-zero, but no row reddens, so
+ * anything reading the report sees green. The conformance clause that grades all ten backends' live
+ * paths listened for rejections alone until this landed.
+ *
+ * The rejection-only control is what makes the row below unsatisfiable by half a detector.
+ */
+const rejectionsOnly = async (work: () => Promise<void>): Promise<unknown[]> => {
+  const seen: unknown[] = [];
+  const capture = (reason: unknown): void => {
+    seen.push(reason);
+  };
+  const swallow = (): void => {};
+  process.on('unhandledRejection', capture);
+  process.on('uncaughtException', swallow);
+  try {
+    await work();
+    await new Promise((r) => setTimeout(r, 40));
+  } finally {
+    process.off('unhandledRejection', capture);
+    process.off('uncaughtException', swallow);
+  }
+  return seen;
+};
+
+const detachedThrow = async (): Promise<void> => {
+  setTimeout(() => {
+    throw new Error('escaped synchronously');
+  }, 0);
+};
+
+const detachedRejection = async (): Promise<void> => {
+  void Promise.reject(new Error('escaped as a rejection'));
+};
+
+describe('the escape detector sees both ways a fire-and-forget failure leaves', () => {
+  it('sees a rejection nothing attached to', async () => {
+    const escaped = await unhandledDuring(detachedRejection);
+    expect(escaped.map(String).join(' ')).toContain('escaped as a rejection');
+  });
+
+  it('sees a synchronous throw out of a detached task', async () => {
+    const escaped = await unhandledDuring(detachedThrow);
+    expect(
+      escaped.map(String).join(' '),
+      'a synchronous throw that leaves a detached task reached nothing here. It arrives as ' +
+        'uncaughtException, not as a rejection, so a detector registered for rejections alone ' +
+        'reports the run clean while it exits non-zero with no row red',
+    ).toContain('escaped synchronously');
+  });
+
+  it('is not satisfiable by a rejection-only listener, which is the half that was missing', async () => {
+    expect((await rejectionsOnly(detachedRejection)).map(String).join(' ')).toContain(
+      'escaped as a rejection',
+    );
+    expect(await rejectionsOnly(detachedThrow)).toEqual([]);
+  });
 });
