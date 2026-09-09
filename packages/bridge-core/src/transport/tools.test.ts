@@ -381,6 +381,29 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
   };
 
   /**
+   * The loop an agent runs if it reads "stop when a page comes back empty" — the control the
+   * comparison needs. A backlog that stops producing an all-foreign page lets the loop above pass
+   * for the wrong reason, and only running both over the same backlog tells those apart.
+   */
+  const stopOnTheFirstEmptyPage = async (client: Client): Promise<string[]> => {
+    const got: string[] = [];
+    let since: string | undefined;
+    for (let page = 0; page <= MISSED; page++) {
+      const args: Record<string, unknown> = { topic: 'ctx', limit: PAGE };
+      if (since !== undefined) args.since = since;
+      const out = parse(await client.callTool({ name: 'parley_fetch_recent', arguments: args })) as {
+        messages: Array<{ content: string }>;
+        nextCursor?: string;
+      };
+      if (out.messages.length === 0) return got;
+      got.push(...out.messages.map((m) => m.content));
+      if (out.nextCursor === undefined || out.nextCursor === since) return got;
+      since = out.nextCursor;
+    }
+    return got;
+  };
+
+  /**
    * One row per CALLER INTENT the tool description names, with the argument spelling that expresses
    * it. A capability whose intent has no spelling fails its row rather than disappearing quietly:
    * "the newest page" was reachable by omitting `since` until a since-less read was redefined to
@@ -663,12 +686,22 @@ describe('parley_fetch_recent resumes from where this instance last read', () =>
     for (let i = 0; i < FOREIGN_RUN; i++) add('secret-ops', `not-mine-${i}`);
     for (const content of missed) add('ctx', content);
 
+    // The empty-page stop runs FIRST, so the documented loop resumes from exactly where it left the
+    // position — the same session, over the same backlog, continuing the same catch-up.
+    const stopped = await stopOnTheFirstEmptyPage(client);
+    const reached = await drainAsAnAgentWould(client);
+
     expect(
-      await drainAsAnAgentWould(client),
+      [...stopped, ...reached],
       'the documented catch-up loop stopped on a page that held only other topics’ messages. ' +
         'That page is not the end of the topic — its cursor moved on — so everything behind it is ' +
         'unread, and the next call opens further along still',
     ).toEqual(missed);
+    expect(
+      stopped,
+      'the empty-page stop reached something here, so this backlog no longer produces the page ' +
+        'that holds only other topics’ rows and the comparison above proves nothing',
+    ).toEqual([]);
   });
 
   it('the documented loop advances it, because every page resumes from where the last stopped', async () => {
