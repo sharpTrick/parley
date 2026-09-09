@@ -27,17 +27,31 @@ export const MAX_FETCH_LIMIT = 1_000;
  * `bridge-core/src/transport/tools.ts` read by relative path, which reddens that plugin when this
  * file moves and reports the failure against the wrong package.
  */
+/**
+ * The terminal condition of the catch-up loop, in the words every artifact that teaches the loop
+ * ships. `TOOL_TEXT.fetch_recent` interpolates it; `skills/chat-handoff/SKILL.md` and
+ * `docs/CONVENTIONS.md` are graded against it by `skill-safety.test.ts`, so a correction here
+ * cannot be applied to the tool and left behind in the two documents an agent actually executes.
+ *
+ * Measured on live Synapse: an agent that stopped on the first EMPTY page reached 0 of the 3
+ * messages it had missed, and the same run reached all 3 once only cursor progress ended the loop.
+ */
+export const CATCH_UP_TERMINAL_CONDITION =
+  'keep calling with the `nextCursor` you are handed until it STOPS ADVANCING — the same cursor ' +
+  'twice, or none handed back at all. An EMPTY page does not mean you are done: a backend whose ' +
+  "history read is coarser than one topic hands back a page of other topics' messages, which " +
+  'reaches you as an empty page whose cursor moved on, and stopping there leaves everything ' +
+  'behind it unread.';
+
 export const TOOL_TEXT = {
   fetch_recent:
     'Catch up on recent messages in a topic from the durable backend. Pass `since` (an opaque ' +
     'cursor from a previous call) to get only newer messages. Omit `since` and a bridge that keeps ' +
     'a read position for you resumes from it, so a session that was down comes back to the OLDEST ' +
     'message it has not seen; a bridge that keeps none — and a first-ever read of a topic — ' +
-    'answers with the most recent page instead. Either way, keep calling with the `nextCursor` you ' +
-    'are handed until it STOPS ADVANCING — the same cursor twice, or none handed back at all. An ' +
-    'EMPTY page does not mean you are done: a backend whose history read is coarser than one topic ' +
-    "hands back a page of other topics' messages, which reaches you as an empty page whose cursor " +
-    'moved on, and stopping there leaves everything behind it unread. Pass back only a ' +
+    'answers with the most recent page instead. Either way, ' +
+    CATCH_UP_TERMINAL_CONDITION +
+    ' Pass back only a ' +
     '`nextCursor` a previous page gave you: another cursor is read from, but does not move where ' +
     'this session resumes. Returns { messages, nextCursor } — ' +
     'nextCursor is omitted only when the read had no position to hand back at all: a since-less ' +

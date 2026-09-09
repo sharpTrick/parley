@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { CATCH_UP_TERMINAL_CONDITION, TOOL_TEXT } from './tools.js';
 
 /**
  * A shipped skill is agent context. `skills/chat-handoff/SKILL.md` is executed verbatim by whatever
@@ -17,7 +18,8 @@ import { describe, expect, it } from 'vitest';
  * The skill SET is discovered, not listed, so a new skill arrives as a red row rather than shipping
  * ungraded.
  */
-const SKILLS = fileURLToPath(new URL('../../../../skills/', import.meta.url));
+const REPO = fileURLToPath(new URL('../../../../', import.meta.url));
+const SKILLS = `${REPO}skills/`;
 
 const discovered = (): string[] =>
   readdirSync(SKILLS, { withFileTypes: true })
@@ -79,5 +81,69 @@ describe('every shipped skill carries the pinned untrusted-input boundary', () =
       skillText(skill),
       `${skill}/SKILL.md changed; read the new text, then update ${golden}`,
     ).toBe(readFileSync(golden, 'utf8'));
+  });
+});
+
+/** Whitespace-insensitive, so a markdown reflow is not a failure and a reworded clause is. */
+const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Every shipped artifact that teaches an agent to drive `parley_fetch_recent`, DISCOVERED rather
+ * than listed. `docs/` is read non-recursively, so the review archive under `docs/findings/` — which
+ * quotes the tool by name in every round's JSON — is not mistaken for an instruction to an agent.
+ */
+const teachesTheLoop = (): Array<[rel: string, text: string]> =>
+  [
+    ...readdirSync(`${REPO}docs`, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.md'))
+      .map((e) => `docs/${e.name}`),
+    ...discovered().map((s) => `skills/${s}/SKILL.md`),
+  ]
+    .map((rel): [string, string] => [rel, readFileSync(`${REPO}${rel}`, 'utf8')])
+    .filter(([, text]) => text.includes('parley_fetch_recent'))
+    .sort();
+
+/**
+ * A byte-pin detects that a shipped skill CHANGED; it can never detect that it is FALSE. The skill
+ * above shipped a catch-up procedure with no terminal condition at all, and stayed pinned, green and
+ * wrong, while `docs/CONVENTIONS.md` and the tool description carried the correction — an agent
+ * executing it reached 0 of 3 missed messages on live Synapse.
+ *
+ * So the condition is ONE exported statement and every artifact that teaches the loop is graded
+ * against it. Correcting it in one place and not the others is what reddens.
+ */
+describe('one statement of the catch-up terminal condition, read by everything that teaches it', () => {
+  const artifacts = teachesTheLoop();
+  const rels = artifacts.map(([rel]) => rel);
+
+  it('finds the artifacts that teach it (witness: the skill and the convention doc)', () => {
+    expect(rels).toEqual(
+      expect.arrayContaining(['docs/CONVENTIONS.md', 'skills/chat-handoff/SKILL.md']),
+    );
+  });
+
+  it('the tool description core sends the model is built from it', () => {
+    expect(flat(TOOL_TEXT.fetch_recent)).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
+  });
+
+  it.each(rels)('%s states it, in those words', (rel) => {
+    expect(
+      flat(artifacts.find(([r]) => r === rel)![1]),
+      `${rel} teaches an agent to call parley_fetch_recent but does not state the terminal ` +
+        'condition CATCH_UP_TERMINAL_CONDITION holds. An agent that stops on the first EMPTY page ' +
+        'reaches none of what it missed on a backend whose history read is coarser than one topic',
+    ).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
+  });
+
+  /**
+   * The fenced block is the text CONVENTIONS.md tells operators to paste into another repo's
+   * `CLAUDE.md`, so it is agent context in a repo this suite will never see. Grade it on its own:
+   * the prose around it satisfying the row above says nothing about what was copied out.
+   */
+  it('the CLAUDE.md snippet CONVENTIONS.md ships into other repos states it too', () => {
+    const doc = readFileSync(`${REPO}docs/CONVENTIONS.md`, 'utf8');
+    const snippet = /```md\n([\s\S]*?)```/.exec(doc)?.[1];
+    expect(snippet, 'CONVENTIONS.md no longer ships a ```md snippet to paste').toBeDefined();
+    expect(flat(snippet!)).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
   });
 });
