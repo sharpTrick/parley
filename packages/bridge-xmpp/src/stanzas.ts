@@ -122,7 +122,28 @@ export const stanzaError = (stanza: El): { condition: string; text: string } => 
 export const describeError = (e: { condition: string; text: string }): string =>
   e.text !== '' ? `${e.condition}: ${e.text}` : e.condition;
 
-export const asError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
+/** A value's own text, for a value whose rendering can itself throw. */
+const errorText = (err: unknown): string => {
+  try {
+    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return 'an error with no text form';
+  }
+};
+
+/**
+ * Any thrown value as an Error whose message is bounded and flattened. A `<stream:error><text>` is
+ * SERVER-written and arrives here as a driver Error, so this is the one boundary between that text
+ * and the four diagnostics it reaches — one of which core renders into model context. Keep the
+ * error OBJECT rather than a replacement, so that {@link JoinError}'s `condition` survives the
+ * `err instanceof JoinError` branch the join ladder retries on.
+ */
+export const asError = (err: unknown): Error => {
+  const text = sanitizeBody(errorText(err));
+  if (!(err instanceof Error)) return new Error(text);
+  if (err.message !== text) err.message = text;
+  return err;
+};
 export const conditionOf = (err: unknown): string =>
   typeof (err as { condition?: unknown })?.condition === 'string'
     ? (err as { condition: string }).condition
