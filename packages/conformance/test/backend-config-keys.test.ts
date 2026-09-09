@@ -1,7 +1,8 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { backendPackages, workspacePackages } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -48,32 +49,11 @@ function isPluginConstructor(value: unknown): value is PluginCtor {
   return SEAM_METHODS.every((m) => typeof proto[m] === 'function');
 }
 
-interface Manifest {
-  name: string;
-  exports?: unknown;
-  workspaces?: string[];
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
-}
-
-/** Every workspace manifest, from the root `workspaces` globs — the set, never a member. */
-function workspaceManifests(): Manifest[] {
-  const root = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as Manifest;
-  const areas = [...new Set(root.workspaces?.map((w) => w.replace(/\/\*+$/, '')) ?? [])];
-  return areas.flatMap((area) => {
-    const at = join(REPO, area);
-    if (!existsSync(at)) return [];
-    return readdirSync(at)
-      .map((d) => join(at, d))
-      .filter((d) => statSync(d).isDirectory() && existsSync(join(d, 'package.json')))
-      .map((d) => JSON.parse(readFileSync(join(d, 'package.json'), 'utf8')) as Manifest);
-  });
-}
-
 /** A workspace with no `exports` map is not importable by name; nothing else may fail to import. */
-const IMPORTABLE = workspaceManifests().filter((m) => m.exports !== undefined);
+const IMPORTABLE = workspacePackages(REPO)
+  .map((p) => p.manifest)
+  .filter((m) => m.exports !== undefined);
 
-const SUITE = '@sharptrick/parley-conformance';
 
 /**
  * Which packages that run the shared suite this table does NOT reach. A backend whose plugin class
@@ -83,12 +63,10 @@ const SUITE = '@sharptrick/parley-conformance';
 export const ungraded = (consumers: readonly string[], graded: readonly string[]): string[] =>
   consumers.filter((name) => !graded.includes(name));
 
-const SUITE_CONSUMERS = workspaceManifests()
-  .filter((m) => SUITE in { ...m.dependencies, ...m.devDependencies })
-  .map((m) => m.name);
+const SUITE_CONSUMERS = backendPackages(REPO).map((p) => p.name);
 
 const PLUGINS: { name: string; Ctor: PluginCtor }[] = [];
-for (const { name } of IMPORTABLE) {
+for (const { name = '' } of IMPORTABLE) {
   const mod = (await import(name)) as Record<string, unknown>;
   for (const [, value] of Object.entries(mod)) {
     if (isPluginConstructor(value)) PLUGINS.push({ name, Ctor: value });

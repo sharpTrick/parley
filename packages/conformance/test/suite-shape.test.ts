@@ -702,7 +702,7 @@ describe('the tables the suite fans out on still cover what they were written fo
   it.each(
     derivedRows('the handler faults', () => [...FAILURE_SHAPE_NAMES], {
       floor: 7,
-      witness: [...FAILURE_SHAPE_NAMES],
+      witness: [...FAILURE_SHAPE_NAMES] as unknown as [string, ...string[]],
     }),
   )('faults a live handler by %s', (shape) => {
     expect(FAILURE_SHAPES[shape]).toBeTypeOf('function');
