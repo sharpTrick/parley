@@ -196,15 +196,14 @@ describe('every public workspace ships only what a consumer can run', () => {
   );
 
   /**
-   * The rule above reads BUILT output, so a package can import a workspace its manifest never
+   * The rule above reads BUILT output, so a workspace can import another one its manifest never
    * declares as long as the importer is a test source: tsc never emits it, npm never packs it, and
-   * vitest's alias table resolves the specifier from the repo root whatever the manifest says. That
-   * is how bridge-sqlite's own hostile-config-render test imported `@sharptrick/parley-net-util`
-   * while sqlite declared it in no field at all.
+   * the test runner's alias table resolves the specifier from the repo root whatever the manifest
+   * says. Two such imports were live when this was written, in two different workspaces.
    *
    * So grade the SOURCES too, over `src/**` and `test/**` alike rather than one directory, and let
-   * a file the build does not emit reach devDependencies — the package's own and the workspace
-   * root's, which is where a monorepo legitimately keeps `vitest`.
+   * a file the build does not emit reach devDependencies — the workspace's own and the repo root's,
+   * which is where a monorepo legitimately keeps its test runner.
    */
   it.each(WORKSPACES.map((w) => [w.name, w] as const))(
     '%s imports only what some manifest makes installable',

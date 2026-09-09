@@ -26,6 +26,7 @@ import {
 } from './regex-safety.js';
 import { FakePlugin } from './testing/fake-plugin.js';
 import { harness } from './testing/tool-harness.js';
+import { boundedLine, MAX_NAMED_FRAGMENT } from './bounded-line.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
 import { DEFAULT_HASH_LEN, MAX_HASH_LEN, MIN_HASH_LEN, safeName } from './topic-name.js';
 import { MAX_FETCH_LIMIT } from './transport/tools.js';
@@ -132,6 +133,12 @@ const BOUNDS: StatedBound[] = [
     // Each `a?` doubles the paths the engine can explore, so n optional atoms cost exactly 2^n.
     probe: (n) => (isRedosSafeSource(`${'a?'.repeat(n)}b`) ? 'accepted' : 'refused'),
   },
+  {
+    label: 'named-fragment length in a diagnostic (MAX_NAMED_FRAGMENT)',
+    bound: MAX_NAMED_FRAGMENT,
+    legal: 'at-or-below',
+    probe: (len) => (boundedLine('x'.repeat(len)).endsWith('[truncated]') ? 'refused' : 'accepted'),
+  },
 ];
 
 function hashLenVerdict(hashLen: number): Verdict {
@@ -159,6 +166,7 @@ describe('every documented inclusive bound is graded AT the bound', () => {
       'catchup.block_max_ms ceiling (MAX_BLOCK_MS)',
       'catchup.block_poll_interval_ms ceiling (MAX_TIMER_MS)',
       'regex screen ambiguity budget (MAX_AMBIGUITY)',
+      'named-fragment length in a diagnostic (MAX_NAMED_FRAGMENT)',
     ]);
     for (const b of BOUNDS) expect(Number.isInteger(b.bound), b.label).toBe(true);
   });
@@ -330,6 +338,14 @@ const CAPACITIES: Capacity[] = [
           catchup: { block_poll_interval_ms: MAX_TIMER_MS + 1 },
         }),
       ),
+  },
+  {
+    name: 'MAX_NAMED_FRAGMENT',
+    actual: MAX_NAMED_FRAGMENT,
+    expected: 128,
+    realistic: 'backend_config.gateway_dialers (30 chars)',
+    accepts: () => boundedLine('backend_config.gateway_dialers') === 'backend_config.gateway_dialers',
+    refusesPast: () => boundedLine('x'.repeat(MAX_NAMED_FRAGMENT + 1)).endsWith('[truncated]'),
   },
   {
     name: 'MAX_MATCH_INPUT',

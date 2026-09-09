@@ -6,6 +6,5 @@ expectLabelledRefusal('zulip', {
   keys: ['site_url', 'email', 'api_key', 'stream', 'events_timeout_ms'],
   declared: CONFIG_KEYS.keys,
   credentialKeys: { api_key: boxedSecret(), site_url: boxedSecret() },
-  textKeys: ['events_timeout_ms'],
   validate: (key, value) => void resolveConfig({ [key]: value }),
 });

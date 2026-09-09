@@ -2,6 +2,7 @@ import {
   assertKnownConfigKeys,
   type BackendConfig,
   type BackendConfigKeys,
+  boundedLine,
   isPlainObject,
   MAX_TIMER_MS,
   type Topic,
@@ -93,12 +94,12 @@ const SHAPE_REFUSALS: Record<ConfigShape, (value: unknown) => string | undefined
     for (const [topic, channel] of Object.entries(value)) {
       if (typeof channel !== 'string') {
         return (
-          `the channel id for topic ${JSON.stringify(topic)} is ${typeName(channel)}, not a ` +
+          `the channel id for topic ${JSON.stringify(boundedLine(topic))} is ${typeName(channel)}, not a ` +
           "string; a Discord channel id is 17-19 digits and exceeds JavaScript's exact integer " +
           'range, so quote it'
         );
       }
-      if (channel === '') return `the channel id for topic ${JSON.stringify(topic)} is empty`;
+      if (channel === '') return `the channel id for topic ${JSON.stringify(boundedLine(topic))} is empty`;
     }
     return undefined;
   },
@@ -177,7 +178,8 @@ export function requireDistinctChannels(map: Map<string, string>): Map<string, s
     const prior = owner.get(channel);
     if (prior !== undefined) {
       throw new Error(
-        `Discord channel_map maps both ${JSON.stringify(prior)} and ${JSON.stringify(topic)} to ` +
+        `Discord channel_map maps both ${JSON.stringify(boundedLine(prior))} and ` +
+          `${JSON.stringify(boundedLine(topic))} to ` +
           `channel ${channel}; each topic needs its own channel`,
       );
     }

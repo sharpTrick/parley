@@ -16,6 +16,5 @@ expectLabelledRefusal('matrix', {
   declared: CONFIG_KEYS.keys,
   accepts: { invite: ['an array'] },
   credentialKeys: { password: boxedSecret(), homeserver_url: boxedSecret() },
-  textKeys: ['sync_timeout_ms', 'room_preset'],
   validate: (key, value) => void validateConfig({ [key]: value } as MatrixBackendConfig),
 });

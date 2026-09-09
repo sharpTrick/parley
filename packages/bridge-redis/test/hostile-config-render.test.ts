@@ -6,6 +6,5 @@ expectLabelledRefusal('redis', {
   keys: CONFIG_KEYS.map(String),
   declared: CONFIG_KEYS.map(String),
   credentialKeys: { url: boxedSecret() },
-  textKeys: ['block_ms', 'connect_timeout_ms', 'retention_days'],
   validate: (key, value) => void resolveConfig({ [key]: value } as RedisBackendConfig),
 });

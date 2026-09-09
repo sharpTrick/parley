@@ -1,4 +1,9 @@
-import { assertKnownConfigKeys, type BackendConfigKeys, MAX_TIMER_MS } from '@sharptrick/parley-core';
+import {
+  assertKnownConfigKeys,
+  type BackendConfigKeys,
+  boundedLine,
+  MAX_TIMER_MS,
+} from '@sharptrick/parley-core';
 import {
   DEFAULT_DEADLINE_MS,
   describeConfigValue,
@@ -137,7 +142,8 @@ export function validateConfig(cfg: MatrixBackendConfig): void {
         'shared_room',
         `a room alias localpart of ${LEGAL_LOCALPART.source} whose alias ` +
           `#<shared_room>:<server_name> fits ${MAX_ALIAS_BYTES} bytes`,
-        ` It is used verbatim: ${JSON.stringify(alias)} is ${Buffer.byteLength(alias, 'utf8')} ` +
+        ` It is used verbatim: ${JSON.stringify(boundedLine(alias))} is ` +
+          `${Buffer.byteLength(alias, 'utf8')} ` +
           'bytes, and Matrix splits an alias on its FIRST colon — so a localpart carrying one ' +
           'names a different server than backend_config.server_name, and an over-long one is ' +
           'refused by createRoom while every read of it returns the empty page an unwritten topic ' +

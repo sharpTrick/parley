@@ -7,6 +7,5 @@ expectLabelledRefusal('slack', {
   mapKeys: ['channel_map', 'mention_map'],
   declared: CONFIG_KEYS.keys,
   credentialKeys: { bot_token: boxedSecret(), app_token: boxedSecret() },
-  textKeys: ['api_url', 'handshake_timeout_ms', 'rotation_grace_ms'],
   validate: (key, value) => void resolveConfig({ [key]: value } as SlackBackendConfig),
 });

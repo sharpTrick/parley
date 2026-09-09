@@ -6,6 +6,5 @@ expectLabelledRefusal('sqlite', {
   keys: ['db_path', 'poll_interval_ms', 'retention_days'],
   declared: CONFIG_KEYS.keys,
   credentialKeys: { db_path: boxedSecret() },
-  textKeys: ['poll_interval_ms', 'retention_days'],
   validate: (key, value) => void validateBackendConfig({ [key]: value }),
 });

@@ -45,8 +45,12 @@ export interface RefusalSpec {
    * refusal to have happened.
    */
   credentialKeys?: Readonly<Record<string, unknown>>;
-  /** Keys a hostile STRING is refused under: the only path caller-authored text takes into a refusal. */
-  textKeys?: readonly string[];
+  /**
+   * Graded keys a hostile STRING is NOT crossed over, each with the reason. An OPT-OUT, because
+   * the opt-in form is a fourth skip mechanism with no completeness check: matrix declared two of
+   * its keys and the one key whose refusal echoes caller text verbatim was not among them.
+   */
+  textExempt?: Readonly<Record<string, string>>;
   /** Hand the validator one key/value pair. It is expected to throw. */
   validate: (key: string, value: unknown) => void;
 }
@@ -149,6 +153,9 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
   const accepted = (key: string, label: string): boolean =>
     (spec.accepts?.[key] ?? []).includes(label);
 
+  const text = (label: string): string =>
+    UNSAFE_TEXT.find(([rowLabel]) => rowLabel === label)?.[1] ?? '';
+
   describe(`${plugin} refuses an unrenderable backend_config value under its own label`, () => {
     it('names only corpus rows that exist among the values it excuses', () => {
       const labels = new Set(
@@ -213,20 +220,53 @@ export function expectLabelledRefusal(plugin: string, spec: RefusalSpec): void {
     }
   });
 
-  if ((spec.textKeys ?? []).length > 0) {
-    describe(`${plugin} bounds and flattens the text a rejected value carries`, () => {
-      for (const key of spec.textKeys ?? []) {
-        it.each(UNSAFE_TEXT)(`${key} = %s is one bounded, harmless line`, (label, text) => {
-          if (accepted(key, label)) {
-            expect(() => spec.validate(key, wrap(key, text))).not.toThrow();
-            return;
-          }
-          const message = expectRefusalMessage(spec, key, wrap(key, text));
-          expect(message).not.toMatch(FORBIDDEN_IN_RENDER);
-          expect(message).not.toMatch(/[\n\r]/);
-          expect(message.length).toBeLessThan(MAX_ERROR_BODY + 1024);
+  const textGraded = graded.filter((key) => spec.textExempt?.[key] === undefined);
+
+  /** Every way one key can be handed hostile text: as its value, and — for a map — as an ENTRY KEY. */
+  const textPlacements = (key: string): [string, (text: string) => unknown][] =>
+    (spec.mapKeys ?? []).includes(key)
+      ? [
+          ['as an entry value', (text) => ({ 'a-topic': text })],
+          ['as an entry key', (text) => ({ [text]: null })],
+        ]
+      : [['', (text) => text]];
+
+  const graderOf = (key: string, place: (text: string) => unknown, label: string): Refusal =>
+    accepted(key, label) ? { threw: false } : refusalOf(spec, key, place(text(label)));
+
+  describe(`${plugin} bounds and flattens the text a rejected value carries`, () => {
+    it('exempts no key it does not grade, and none with an empty reason', () => {
+      const stale = Object.entries(spec.textExempt ?? {}).filter(
+        ([key, reason]) => !graded.includes(key) || reason === '',
+      );
+      expect(stale.map(([key]) => key), 'this exemption names a key it does not exempt').toEqual([]);
+    });
+
+    it.each(UNSAFE_TEXT)('%s is refused somewhere, so its rows are not all vacuous', (label) => {
+      const refused = textGraded.flatMap((key) =>
+        textPlacements(key)
+          .filter(([, place]) => graderOf(key, place, label).threw)
+          .map(([where]) => `${key} ${where}`),
+      );
+      expect(
+        refused,
+        'no graded key refuses this text at all, so every row for it grades an absent message',
+      ).not.toEqual([]);
+    });
+
+    for (const key of textGraded) {
+      for (const [where, place] of textPlacements(key)) {
+        it.each(UNSAFE_TEXT)(`${key} ${where} = %s is one bounded, harmless line`, (label) => {
+          const refusal = graderOf(key, place, label);
+          // A key that ACCEPTS this text rendered nothing, so there is no message to grade. That is
+          // the difference from the secret corpus: accepting hostile text is legitimate; accepting a
+          // credential under the key it was handed is the finding.
+          if (!refusal.threw) return;
+          expect(refusal.message).not.toMatch(FORBIDDEN_IN_RENDER);
+          expect(refusal.message).not.toMatch(/[\n\r]/);
+          expect(refusal.message.length).toBeLessThan(MAX_ERROR_BODY + 1024);
         });
       }
-    });
-  }
+    }
+  });
 }

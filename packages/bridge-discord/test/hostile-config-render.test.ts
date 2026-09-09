@@ -12,6 +12,5 @@ expectLabelledRefusal('discord', {
       'member is a boolean or an id list with no rendered refusal of its own',
   },
   credentialKeys: { token: boxedSecret() },
-  textKeys: ['handshake_timeout_ms', 'gateway_dialers'],
   validate: (key, value) => void assertKnownBackendConfig({ [key]: value }),
 });

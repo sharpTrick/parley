@@ -20,7 +20,6 @@ expectLabelledRefusal('telegram', {
       'a wrong-typed map is ACCEPTED and every topic is then used as a literal chat id; carried ' +
       'as pre-existing debt, not this chunk',
   },
-  textKeys: KNOBS,
   validate: (key, value) =>
     void requireNumericKnobs({ [key]: value } as unknown as TelegramBackendConfig),
 });

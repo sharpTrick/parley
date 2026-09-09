@@ -1,5 +1,6 @@
 import {
   assertKnownConfigKeys,
+  boundedLine,
   parseMentions,
   type BackendConfigKeys,
   MAX_TIMER_MS,
@@ -120,13 +121,13 @@ function requireUsableMap(
   for (const [key, value] of Object.entries(map)) {
     if (typeof value !== 'string' || value.length === 0) {
       throw new Error(
-        `Slack ${configKey} maps ${JSON.stringify(key)} to ${describeConfigValue(configKey, value)}, ` +
+        `Slack ${configKey} maps ${JSON.stringify(boundedLine(key))} to ${describeConfigValue(configKey, value)}, ` +
           `which is not ${what}`,
       );
     }
     if (grammar !== undefined && !grammar.accepts(value)) {
       throw new Error(
-        `Slack ${configKey} maps ${JSON.stringify(key)} to ${describeConfigValue(configKey, value)}, ` +
+        `Slack ${configKey} maps ${JSON.stringify(boundedLine(key))} to ${describeConfigValue(configKey, value)}, ` +
           `which is not ${what}: ${grammar.requirement}`,
       );
     }

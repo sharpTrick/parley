@@ -37,7 +37,6 @@ expectLabelledRefusal('nats', {
     stream_prefix: ['a RIGHT-TO-LEFT OVERRIDE (U+202E)'],
   },
   credentialKeys: { subject_prefix: boxedSecret(), stream_prefix: boxedSecret() },
-  textKeys: ['subject_prefix', 'stream_prefix', 'retention_days'],
   validate: (key, value) => {
     (VALIDATORS[key] as (v: unknown) => void)(value);
   },

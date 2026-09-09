@@ -165,10 +165,17 @@ describe('README', () => {
           }
         })
         .filter((v): v is { dir: string; pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> } } => v !== undefined)
-        .map(({ dir, pkg }) => ({ dir, deps: { ...pkg.dependencies, ...pkg.devDependencies } }))
+        .map(({ dir, pkg }) => ({
+          dir,
+          deps: { ...pkg.dependencies, ...pkg.devDependencies },
+          // Whether a backend CONSUMES this package is a question about the shipped graph, so it is
+          // answered from `dependencies` alone: importing the test corpus from a devDependency is
+          // not a runtime dependency and does not belong in the README's consumer set.
+          runtime: { ...pkg.dependencies },
+        }))
         .filter(({ deps }) => SUITE in deps)
         .sort((a, b) => a.dir.localeCompare(b.dir))
-        .map(({ dir, deps }) => ({ dir, consumes: SELF in deps }));
+        .map(({ dir, runtime }) => ({ dir, consumes: SELF in runtime }));
 
     it('derives a backend set that is neither empty nor this package', () => {
       expect(backends().length).toBeGreaterThan(5);

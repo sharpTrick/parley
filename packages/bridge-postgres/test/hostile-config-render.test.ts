@@ -6,6 +6,5 @@ expectLabelledRefusal('postgres', {
   keys: ['url', 'table_name', 'pool_size', 'retention_days'],
   declared: CONFIG_KEYS.keys,
   credentialKeys: { url: boxedSecret() },
-  textKeys: ['pool_size', 'retention_days'],
   validate: (key, value) => void validateBackendConfig({ [key]: value }),
 });

@@ -6,6 +6,5 @@ expectLabelledRefusal('xmpp', {
   keys: CONFIG_KEYS.map(String),
   declared: CONFIG_KEYS.map(String),
   credentialKeys: { password: boxedSecret(), service: boxedSecret() },
-  textKeys: ['mam_page'],
   validate: (key, value) => void validateBackendConfig({ [key]: value }),
 });

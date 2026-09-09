@@ -17,6 +17,7 @@ export type {
   MessageHandler,
 } from './seam.js';
 export { safeDeliver } from './safe-deliver.js';
+export { boundedLine, MAX_NAMED_FRAGMENT } from './bounded-line.js';
 export { isArmableDelay, MAX_TIMER_MS } from './timer-bounds.js';
 export { isNoSuchTopicError, NoSuchTopicError } from './no-such-topic.js';
 export {
