@@ -760,11 +760,11 @@ describe('no it.each table can register nothing', () => {
   const KEEPS: ReadonlyArray<readonly [file: string, why: string]> = [
     ['packages/bridge-core/src/packaging.test.ts', 'seven publish-gate rows off WORKSPACES, a set a child process enumerates'],
     ['packages/bridge-core/src/transport/absent-topic-sites.test.ts', 'SENTINELS, from a walk of the transport sources'],
-    ['packages/bridge-core/src/transport/skill-safety.test.ts', 'pinned(), from a walk of the shipped skill files'],
+    ['packages/bridge-core/src/transport/skill-safety.test.ts', 'graded() and teachesTheLoop(), each from a walk of the shipped artifacts'],
     ['packages/bridge-matrix/test/shipped-artifacts.test.ts', 'configs, from a walk of the shipped example configs'],
     ['packages/bridge-net-util/test/refusal-coverage.test.ts', 'declared, from a walk one import hop away'],
     ['packages/bridge-net-util/test/retry-after-header.test.ts', 'clockShapedLiterals, from a walk of the package sources'],
-    ['packages/bridge-postgres/test/suite-hygiene.test.ts', 'testFiles, pgMockingFiles and publishedDocs, each from a walk'],
+    ['packages/bridge-postgres/test/suite-hygiene.test.ts', 'testFiles and pgMockingFiles, each from a walk'],
     ['packages/bridge-redis/test/readme.test.ts', 'linked, from a walk of the shipped documents'],
     ['packages/bridge-xmpp/test/backend-config.test.ts', 'exampleConfigs, from a walk with no floor at all'],
     ['packages/bridge-xmpp/test/creds-warning.test.ts', 'cells, declared empty and filled by nested loops'],
