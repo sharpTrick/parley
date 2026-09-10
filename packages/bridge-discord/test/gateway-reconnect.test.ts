@@ -722,7 +722,7 @@ describe('Discord gateway terminal failures are never invisible', () => {
 });
 
 describe('Discord IDENTIFY budget under sustained flapping', () => {
-  // Discord allows 1000 IDENTIFYs per 24h and PENALIZES an overrun by RESETTING the bot token, so
+  // Discord's per-token IDENTIFY quota, whose overrun RESETS the bot token, is spent here, so
   // the steady-state reconnect rate — not just the first few delays — has to sit under the quota.
   const DAY_MS = IDENTIFY_QUOTA_WINDOW_MS;
   const QUOTA_PER_DAY = IDENTIFY_QUOTA_PER_DAY;

@@ -1,7 +1,8 @@
 import { asCursor, asTopic, type Topic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Discord allows 1000 IDENTIFYs per 24h and penalizes an overrun by RESETTING the bot token, so
+// Discord's per-token IDENTIFY quota is spent by every path that opens a socket, and an overrun
+// RESETS the bot token, so
 // the dial rate has to hold under EVERY initiator, not just the reconnect loop the backoff ladder
 // was written for. These cases drive each entry point that can reach the gateway against each way
 // a dial can fail, and assert the same quota invariant for every cell.
@@ -236,7 +237,7 @@ describe('Discord IDENTIFY budget, whoever dials', () => {
   // The FAILURES axis above is parameterized over how a DIAL fails, so every IDENTIFY it counts is
   // one the ladder charged for. This axis is the other half: what a peer can make an ALREADY-OPEN
   // socket do. The frames cost the peer one send each, so anything the plugin answers with is
-  // amplification it pays for out of a 1000-per-24h quota whose overrun RESETS the bot token —
+  // amplification it pays for out of a per-token quota whose overrun RESETS the bot token —
   // and `gateway_url` reaching a peer that is not discord.com is a configuration the plugin only
   // warns about. Keep the axis a table of OPCODES rather than the HELLO that prompted it: the same
   // "peer frame drives an uncharged expensive action" arrives next wearing op 7 or a resume frame.
@@ -556,7 +557,7 @@ describe('Discord session state does not leak across a connect/disconnect cycle'
   // Every cell ABOVE pins `gateway_url`, which skips `GET /gateway/bot` — and with it the await the
   // PRODUCTION dial runs between "this session is alive" and "a socket exists". Nothing in this
   // package reached that window, so a dial released after its session was torn down could open a
-  // real gateway session, spend an IDENTIFY against the 1000/24h per-token quota, install itself as
+  // real gateway session, spend an IDENTIFY against the per-token quota, install itself as
   // the plugin's socket and register a heartbeat interval no teardown would ever clear — with the
   // suite fully green. This table is that window.
   //

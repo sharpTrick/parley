@@ -177,7 +177,7 @@ export function resetGateway(): void {
   state.requiredIntents = [...REQUIRED_INTENT_BITS];
 }
 
-/** IDENTIFYs sent across ALL sockets — the quantity Discord's 1000/24h quota counts. */
+/** IDENTIFYs sent across ALL sockets — the quantity Discord's per-token quota counts. */
 export const totalIdentifies = (): number =>
   instances.reduce((n, ws) => n + ws.sent.filter((f) => f.op === 2).length, 0);
 

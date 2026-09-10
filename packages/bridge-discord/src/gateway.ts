@@ -18,7 +18,7 @@ export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 /**
  * Terminal close codes — auth (4004), intents (4013/4014), API version (4012), sharding
  * (4010/4011). Keep them OFF the ladder, so that a failure only a human can fix does not re-send
- * IDENTIFY per attempt and burn the 1000/24h budget whose penalty is a bot-token RESET.
+ * IDENTIFY per attempt and burn the token's IDENTIFY quota, whose penalty is a bot-token RESET.
  */
 const TERMINAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
