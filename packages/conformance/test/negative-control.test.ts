@@ -756,12 +756,9 @@ describe('the suite rejects a non-conformant plugin', () => {
 
   /**
    * The kept LOG, graded by a property of its content the writing code does not trivially supply.
-   * Three of the checks here used to be self-comparisons made in the hook that wrote the files —
-   * readFileSync(report.json) === the string just written, readFileSync(run.log) === stdout, and a
-   * row count of the object that string was stringified from. None of them could fail. Meanwhile
-   * the diagnostic beside them ("an npm notice banner alone satisfies a length check") had become a
-   * description of the file it was guarding: 235 bytes for 570 cases, an npm warning plus "JSON
-   * report written to …".
+   * Neither a length check nor a comparison against the string the hook just wrote can fail here:
+   * a log holding nothing but an npm banner and "JSON report written to …" satisfies both, however
+   * many cases the run graded.
    */
   it('the kept log names every variant that failed in this run', () => {
     const log = readFileSync(join(keptRun, 'run.log'), 'utf8');
@@ -776,10 +773,11 @@ describe('the suite rejects a non-conformant plugin', () => {
   });
 
   /**
-   * The merge's own shape. A duplicated merge IS caught downstream — every variant's failure count
-   * doubles and 43 rows redden — but each of those rows blames its VARIANT and offers "or its
-   * blastRadius needs raising", which restores green while the run does N times the work. Graded
-   * here, where the cause is: one report per child, no more.
+   * The merge's own shape. A duplicated merge IS caught downstream — fold a child's report into
+   * `parsed` twice and every variant's failure count doubles, reddening its per-variant rows — but
+   * each of those rows blames its VARIANT and offers "or its blastRadius needs raising", which
+   * restores green while the run does N times the work. Graded here, where the cause is: one report
+   * per child, no more.
    */
   it('merged one report per shard, so no variant is counted twice', () => {
     expect(shardsUsed).toBeGreaterThan(0);
