@@ -46,6 +46,7 @@ export {
   loadConfig,
   instanceIdOf,
   MAX_BLOCK_MS,
+  MAX_TOPIC_LEN,
 } from './config.js';
 
 // Security: topic allowlist (DESIGN §14).

@@ -46,7 +46,7 @@ describe('public barrel surface', () => {
     'CHANNEL_NOTIFICATION_METHOD', 'CORE_VERSION',
     'CatchUpArgs', 'ConfigSchema', 'ConsentError', 'Cursor', 'DEFAULT_HASH_LEN',
     'FetchAbortedError', 'FetchRecentArgs', 'FetchRecentResult', 'Handle',
-    'MAX_BLOCK_MS', 'MAX_HASH_LEN', 'MAX_MATCH_INPUT', 'MAX_NAMED_FRAGMENT', 'MAX_TIMER_MS',
+    'MAX_BLOCK_MS', 'MAX_HASH_LEN', 'MAX_MATCH_INPUT', 'MAX_NAMED_FRAGMENT', 'MAX_TIMER_MS', 'MAX_TOPIC_LEN',
     'MIN_HASH_LEN', 'Message',
     'MessageHandler', 'NoSuchTopicError', 'OAuthRemoteOptions', 'OAuthRemoteServer',
     'OidcAuthConfig', 'OidcAuthSchema', 'OidcRemoteOptions', 'OidcRemoteServer',

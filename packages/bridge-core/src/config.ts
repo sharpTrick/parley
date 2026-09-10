@@ -83,8 +83,8 @@ const ConfigObject = z.object({
    * list. Invalid regexes are rejected at load (DESIGN §14). Capped at 64 entries: the ReDoS screen
    * bounds each source on its own, and `Allowlist.has` matches a caller-supplied topic against every
    * one of them, so the count is the other half of that bound. That bound clamps the INPUT too: a
-   * pattern here widens post/fetch only to topics of at most 64 characters (`MAX_MATCH_INPUT`),
-   * while this field and `topics` both accept a string of up to 512. A longer topic is refused
+   * pattern here widens post/fetch only to topics of at most `MAX_MATCH_INPUT` characters,
+   * while this field and `topics` both accept a string of up to `MAX_TOPIC_LEN`. A longer topic is refused
    * however well a pattern matches it, and has to be listed in `topics` to be reachable at all.
    */
   post_topics: z.array(topicString).max(MAX_POST_TOPICS).default([]),

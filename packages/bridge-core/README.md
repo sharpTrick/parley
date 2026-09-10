@@ -98,7 +98,7 @@ byte-stable across calls. `timestamp` is informational only; ordering and dedup 
 instance_id: agent-main         # read-state namespace; DISTINCT per concurrent session sharing a handle
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
-post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching topics of at most 64 characters
+post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching topics of at most `MAX_MATCH_INPUT` characters
                                 # (`MAX_MATCH_INPUT`); not subscribed. A longer topic must be
                                 # listed in `topics`.
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
@@ -131,10 +131,10 @@ Every topic argument goes through the topic `Allowlist`, which accepts a topic l
 `config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely
 widens the read/write surface beyond `topics`. Anything else throws `TopicNotAllowedError`.
 
-That widening stops at a length: a pattern is matched only against topics of at most 64 characters
+That widening stops at a length: a pattern is matched only against topics of at most `MAX_MATCH_INPUT` characters
 (`MAX_MATCH_INPUT`, exported), because the count cap and the backtracking screen bound the matching
 work only while the input is bounded too. A longer topic is refused however well a pattern matches
-it — `config.topics` accepts one up to 512 characters, so list it there instead.
+it — `config.topics` accepts one up to `MAX_TOPIC_LEN` characters, so list it there instead.
 
 ## Local (stdio) bridge
 

@@ -56,7 +56,7 @@ export interface AllowlistOptions {
    * validation rejects all three classes first; the constructor throws if one reaches here —
    * `SyntaxError` for an uncompilable source, {@link UnsafePatternError} for an unsafe one, and a
    * `RangeError` for too many. The last part of that bound is the INPUT: {@link has} matches these
-   * against topics of at most 64 characters ({@link MAX_MATCH_INPUT}) and refuses anything longer
+   * against topics of at most {@link MAX_MATCH_INPUT} characters and refuses anything longer
    * unmatched, so a pattern never widens post/fetch past that length.
    */
   postPatterns?: readonly string[];
@@ -70,7 +70,7 @@ export interface AllowlistOptions {
  *  - the POST/FETCH set — the explicit list PLUS any `post_topics` pattern match; gates
  *    `post`/`reply`/`fetch_recent` via {@link has}/{@link assert}.
  *
- * The pattern dimension is matched only against topics of at most 64 characters
+ * The pattern dimension is matched only against topics of at most {@link MAX_MATCH_INPUT} characters
  * ({@link MAX_MATCH_INPUT}) — the config loader accepts a topic string four times that long, so a
  * longer topic is refused however well a pattern matches it and reaches this bridge only by being
  * listed in `topics`. The EXPLICIT dimension carries no such clamp.
