@@ -144,20 +144,48 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     const initParam = syncFilterParam(roomId, 1);
     const incParam = syncFilterParam(roomId, INCREMENTAL_TIMELINE_LIMIT);
 
+    let nextBatch: string | undefined;
+    let consecutiveFailures = 0;
+    const reportSyncFailure = syncFailureReporter();
+    const position = async (): Promise<void> => {
+      const initial = await this.http(
+        'GET',
+        `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`,
+        { deadlineMs: syncDeadlineMs(0) },
+      );
+      nextBatch = positioningBatchOf(((await initial.json()) as SyncResponse).next_batch);
+    };
+
     // Establish the resume position BEFORE returning, so a post immediately after subscribe()
     // resolves is guaranteed to land in a subsequent sync (positioning is awaited).
-    const initial = await this.http('GET', `/_matrix/client/v3/sync?filter=${initParam}&timeout=0`, {
-      deadlineMs: syncDeadlineMs(0),
-    });
-    const positioned = (await initial.json()) as SyncResponse;
-    let nextBatch = positioningBatchOf(positioned.next_batch);
+    //
+    // Keep a positioning FAILURE on the ladder below rather than out of this call: it is the same
+    // fault the next `/sync` retries forever, and thrown from here it propagates through core's
+    // push loop into the attach rollback, taking down catch-up and every other topic with it.
+    try {
+      await position();
+    } catch (err) {
+      consecutiveFailures++;
+      reportSyncFailure(topic, consecutiveFailures, err);
+    }
     if (this.isStale(generation)) return;
 
     const loop = async (): Promise<void> => {
-      let consecutiveFailures = 0;
-      const reportSyncFailure = syncFailureReporter();
       while (!this.isStale(generation)) {
         const started = Date.now();
+        if (nextBatch === undefined) {
+          try {
+            await this.interruptibleDelay(syncRetryDelayMs(consecutiveFailures));
+            if (this.isStale(generation)) break;
+            await position();
+            consecutiveFailures = 0;
+          } catch (err) {
+            if (this.isStale(generation)) break;
+            consecutiveFailures++;
+            reportSyncFailure(topic, consecutiveFailures, err);
+          }
+          continue;
+        }
         // Keep EVERY use of the parsed body inside this try, so that a malformed-but-parseable
         // `/sync` — a JSON `null`, a `timeline.events` that is not a list — is reported and backed
         // off like any other fault rather than escaping the loop as an unhandled rejection, which

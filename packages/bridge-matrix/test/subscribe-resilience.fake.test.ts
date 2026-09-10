@@ -531,17 +531,67 @@ describe('a positioning /sync the plugin cannot resume from never replays the ro
         'history that was already in the room arrived as a live <channel> event',
       ).toEqual([]);
       expect(escaped.map(String)).toEqual([]);
-      for (const since of sinceParamsSince(from)) {
+      expect(resolved, 'subscribe() rejected, failing the whole attach over ONE topic').toBe(true);
+      const sinces = sinceParamsSince(from);
+      for (const since of sinces) {
         if (since !== null) expect(since).toMatch(MINTED_TOKEN);
       }
-      if (resolved) {
-        expect(seen, 'subscribe() resolved, so what landed after it still owes delivery').toContain(
+      // A shape the positioning read cannot resume from leaves the loop with no token to ask
+      // from, so it owes delivery only once it has reached an incremental sync at all.
+      if (sinces.some((since) => since !== null)) {
+        expect(seen, 'the loop positioned, so what landed after it still owes delivery').toContain(
           POST_SUBSCRIPTION.at(-1),
         );
         expect(
           fake.limitedEmitted,
           'the burst was never truncated, so no row here graded a `limited` sync at all',
         ).toBeGreaterThan(0);
+      }
+    }, 20_000);
+  }
+});
+
+/**
+ * The positioning read is a `/sync` like any other, and a fault in it is the same fault the loop
+ * retries one sync later. Thrown out of `subscribe` instead, it reaches core's push loop, which
+ * fails the attach and rolls the WHOLE bridge back — so one room answering a malformed body takes
+ * down catch-up and every other topic with it, permanently, on a fault the ladder would have healed
+ * on its next attempt.
+ */
+describe('a positioning /sync that fails is retried, not fatal', () => {
+  for (const [faultName, mangle] of Object.entries(BODY_FAULTS)) {
+    it(`${faultName}: subscribe resolves, and the retry delivers`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const p = await connectFake({});
+      const t = asTopic('repositioned');
+      for (const c of PRE_SUBSCRIPTION) await p.post(t, asHandle('writer'), c);
+      const from = fake.requestUrls.length;
+
+      const seen: string[] = [];
+      try {
+        // Armed ONCE: the next positioning attempt is answered honestly, which is what a transient
+        // fault looks like and what the ladder exists for.
+        fake.positioningBodyOverrides.push(mangle);
+        await p.subscribe(t, (m) => void seen.push(m.content));
+
+        // The retry lands after subscribe() has returned, so wait for the loop to hold a resume
+        // token before writing: anything posted before it is BELOW that position, and push is a
+        // subset of the post-subscribe tail.
+        await vi.waitFor(
+          () => expect(sinceParamsSince(from).some((since) => since !== null)).toBe(true),
+          { timeout: 8000, interval: 10 },
+        );
+        for (const c of POST_SUBSCRIPTION) fake.addMessage(String(t), c);
+        await vi.waitFor(() => expect(seen).toContain(POST_SUBSCRIPTION.at(-1)), {
+          timeout: 8000,
+          interval: 10,
+        });
+        expect(
+          seen.filter((c) => PRE_SUBSCRIPTION.includes(c)),
+          'the retry positioned from nowhere and replayed the room as live events',
+        ).toEqual([]);
+      } finally {
+        await p.disconnect();
       }
     }, 20_000);
   }
