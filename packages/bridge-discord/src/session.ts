@@ -2,7 +2,6 @@ import { type BackendConfig, type MessageHandler, safeDeliver, type Topic } from
 import {
   assertKnownBackendConfig,
   DEFAULT_ALLOWED_MENTIONS,
-  reconnectCapFor,
   requireDistinctChannels,
   requireRoutableChannel,
   type AllowedMentions,
@@ -11,6 +10,7 @@ import {
 import { plaintextCredentialRisks } from './creds.js';
 import { warn } from './diagnostics.js';
 import { DiscordGateway } from './gateway.js';
+import { dialBudgetFor } from './ladder.js';
 import { DiscordRest } from './rest.js';
 import { toMessage, type DiscordMessage } from './wire.js';
 
@@ -47,13 +47,13 @@ export abstract class DiscordSession {
     const cfg = config as DiscordBackendConfig;
     const channelMap = new Map(Object.entries(cfg.channel_map ?? {}));
     const channelOwner = requireDistinctChannels(channelMap);
-    const reconnectCapMs = reconnectCapFor(cfg.gateway_dialers);
+    const budget = dialBudgetFor(cfg.gateway_dialers);
 
     // Retire the previous session BEFORE installing the new config, so that a re-entrant connect()
     // cannot leave the old socket dispatching into a plugin that has already forgotten its topics.
     this.stopped = true;
     this.generation++;
-    this.gateway.restart(cfg, reconnectCapMs);
+    this.gateway.restart(cfg, budget);
     this.forgetTopics();
 
     this.rest.configure(cfg.api_url, cfg.token);

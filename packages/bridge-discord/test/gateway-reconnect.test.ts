@@ -15,6 +15,8 @@ import {
   BACKOFF_JITTER_MS,
   DEFAULT_HANDSHAKE_TIMEOUT_MS,
   DiscordPlugin,
+  IDENTIFY_QUOTA_PER_DAY,
+  IDENTIFY_QUOTA_WINDOW_MS,
   INVALID_SESSION_MIN_WAIT_MS,
   INVALID_SESSION_SPREAD_MS,
   RECONNECT_CAP_MS,
@@ -144,7 +146,7 @@ describe('Discord gateway reconnect & liveness', () => {
     await vi.advanceTimersByTimeAsync(100_000); // fire the pending reconnect
     const wsReady = gw.instances.at(-1)!;
     wsReady.hello(HUGE_HB); // → IDENTIFY → READY
-    await vi.advanceTimersByTimeAsync(61_000); // the connection proves itself stable
+    await vi.advanceTimersByTimeAsync(STABLE_CONNECTION_MS + 1000); // the connection proves itself stable
 
     const before = setTimeoutDelays(setTimeoutSpy).length;
     wsReady.serverClose(1006);
@@ -722,8 +724,8 @@ describe('Discord gateway terminal failures are never invisible', () => {
 describe('Discord IDENTIFY budget under sustained flapping', () => {
   // Discord allows 1000 IDENTIFYs per 24h and PENALIZES an overrun by RESETTING the bot token, so
   // the steady-state reconnect rate — not just the first few delays — has to sit under the quota.
-  const DAY_MS = 86_400_000;
-  const QUOTA_PER_DAY = 1000;
+  const DAY_MS = IDENTIFY_QUOTA_WINDOW_MS;
+  const QUOTA_PER_DAY = IDENTIFY_QUOTA_PER_DAY;
 
   beforeEach(() => {
     resetGateway();

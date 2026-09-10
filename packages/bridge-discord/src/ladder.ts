@@ -1,18 +1,43 @@
 import type { DiscordMessage } from './wire.js';
 
 /**
- * Reconnect backoff ceiling FOR ONE DIALER. Keep it above 86.4s (= 86400s / 1000) and multiplied by
- * the real `gateway_dialers` fan-out, so that a chronically flapping fleet stays under Discord's
- * 1000-IDENTIFY-per-24h PER-TOKEN quota — the penalty is a bot-token RESET that breaks every
- * Parley instance sharing that bot until a human re-provisions it.
+ * Discord's IDENTIFY allowance per BOT TOKEN, and the window it is measured over. The vendor's
+ * numbers, not ours: nothing here can measure them, and the penalty for an overrun is a bot-token
+ * RESET that breaks every Parley instance sharing that bot until a human re-provisions it. Every
+ * pacing figure below is chosen against these two.
+ */
+export const IDENTIFY_QUOTA_PER_DAY = 1000;
+export const IDENTIFY_QUOTA_WINDOW_MS = 86_400_000;
+
+/**
+ * Reconnect backoff ceiling FOR ONE DIALER: what a gateway that never comes up costs. Scaled by the
+ * `gateway_dialers` fan-out, so the fleet sharing one token — not the process — is what stays
+ * inside {@link IDENTIFY_QUOTA_PER_DAY}.
  */
 export const RECONNECT_CAP_MS = 120_000;
 
 /**
- * How long a socket must stay up AFTER READY before its reconnect budget is forgiven. Keep it well
- * above zero, so that a gateway dropping straight after READY cannot re-IDENTIFY once a second.
+ * How long a socket must stay up AFTER READY before its reconnect budget is forgiven, FOR ONE
+ * DIALER. A forgiven ladder re-dials from its FIRST rung, so this window — not the ceiling — is
+ * what paces a gateway that drops just after every READY, and it is scaled and bounded by the same
+ * quota for the same reason.
  */
-export const STABLE_CONNECTION_MS = 60_000;
+export const STABLE_CONNECTION_MS = 120_000;
+
+/** How the two pacing figures above are shared out across the instances holding one bot token. */
+export interface DialBudget {
+  reconnectCapMs: number;
+  stableConnectionMs: number;
+}
+
+/** One token's IDENTIFY budget, divided among the instances that share it. */
+export function dialBudgetFor(dialers: number | undefined): DialBudget {
+  const fanOut = dialers ?? 1;
+  return {
+    reconnectCapMs: RECONNECT_CAP_MS * fanOut,
+    stableConnectionMs: STABLE_CONNECTION_MS * fanOut,
+  };
+}
 
 /** First rung of the reconnect ladder, doubled per attempt up to {@link RECONNECT_CAP_MS}. */
 export const BACKOFF_BASE_MS = 1000;
@@ -40,8 +65,8 @@ export abstract class GatewayLadder {
   ready?: Promise<void>;
   /** Grows the delay 1s→2s→…→cap; RESET only by a socket up for {@link STABLE_CONNECTION_MS}. */
   reconnectAttempts = 0;
-  /** {@link RECONNECT_CAP_MS} scaled by `gateway_dialers` — the fleet's share of ONE token's quota. */
-  protected reconnectCapMs = RECONNECT_CAP_MS;
+  /** This instance's share of ONE token's quota: {@link dialBudgetFor} of `gateway_dialers`. */
+  protected budget: DialBudget = dialBudgetFor(1);
   /** Sticky from a TERMINAL close, so every later call fails fast instead of re-opening a socket. */
   protected fatal?: Error;
   /** Keep every dial behind this ONE budget, so no fast-retrying caller sets its own IDENTIFY rate. */
@@ -75,8 +100,8 @@ export abstract class GatewayLadder {
     return this.reconnectTimer !== undefined;
   }
 
-  protected resetLadder(reconnectCapMs: number): void {
-    this.reconnectCapMs = reconnectCapMs;
+  protected resetLadder(budget: DialBudget): void {
+    this.budget = budget;
     this.reconnectAttempts = 0;
     this.invalidSessionWaitMs = 0;
     this.nextDialAt = 0;
@@ -118,7 +143,7 @@ export abstract class GatewayLadder {
    * regardless of who initiated it.
    */
   protected chargeDialAttempt(): number {
-    const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, this.reconnectCapMs);
+    const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, this.budget.reconnectCapMs);
     const jitter = Math.floor(Math.random() * BACKOFF_JITTER_MS);
     const wait = Math.max(this.invalidSessionWaitMs, backoff + jitter);
     this.invalidSessionWaitMs = 0;

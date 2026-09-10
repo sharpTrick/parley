@@ -27,8 +27,8 @@ export interface DiscordBackendConfig {
   handshake_timeout_ms?: number;
   /**
    * How many bridge instances share this bot token AND open a gateway socket. Discord's
-   * 1000-IDENTIFY-per-24h quota is per BOT TOKEN, not per process, so the reconnect ceiling
-   * ({@link RECONNECT_CAP_MS}) is multiplied by this. Integer ≥ 1; default 1.
+   * {@link IDENTIFY_QUOTA_PER_DAY} allowance is per BOT TOKEN, not per process, so every pacing
+   * figure the ladder applies is multiplied by this. Integer ≥ 1; default 1.
    */
   gateway_dialers?: number;
   /**
@@ -186,15 +186,6 @@ export function requireDistinctChannels(map: Map<string, string>): Map<string, s
     owner.set(channel, topic);
   }
   return owner;
-}
-
-/**
- * The reconnect ceiling a validated `gateway_dialers` buys. It divides ONE token's IDENTIFY quota,
- * so the {@link SHAPE_REFUSALS} entry that bounds it is what keeps this product both a real
- * widening and a delay a timer can hold.
- */
-export function reconnectCapFor(value: number | undefined): number {
-  return RECONNECT_CAP_MS * (value ?? 1);
 }
 
 /**

@@ -2,7 +2,7 @@ import { asHandle, asTopic, MAX_TIMER_MS, type Topic } from '@sharptrick/parley-
 import { readFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CONFIG_SHAPES, MAX_DIALERS, type ConfigShape } from '../src/config.js';
-import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
+import { DiscordPlugin, RECONNECT_CAP_MS, type DialBudget } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 import { probe, settleOf } from './harness.js';
 
@@ -115,7 +115,7 @@ const armedFigures = (plugin: DiscordPlugin): Array<[string, number]> => {
   const gateway = probe<object>(plugin, 'gateway');
   return [
     ['the handshake watchdog', probe<number>(gateway, 'handshakeTimeoutMs')],
-    ['the reconnect ceiling', probe<number>(gateway, 'reconnectCapMs')],
+    ['the reconnect ceiling', probe<DialBudget>(gateway, 'budget').reconnectCapMs],
   ];
 };
 

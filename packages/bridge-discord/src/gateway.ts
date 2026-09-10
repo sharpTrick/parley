@@ -6,8 +6,8 @@ import {
   GatewayLadder,
   INVALID_SESSION_MIN_WAIT_MS,
   INVALID_SESSION_SPREAD_MS,
-  STABLE_CONNECTION_MS,
   TerminalGatewayCloseError,
+  type DialBudget,
   type GatewayHost,
 } from './ladder.js';
 import type { DiscordRest } from './rest.js';
@@ -45,13 +45,13 @@ export class DiscordGateway extends GatewayLadder {
     super(host);
   }
 
-  restart(cfg: DiscordBackendConfig, reconnectCapMs: number): void {
+  restart(cfg: DiscordBackendConfig, budget: DialBudget): void {
     this.epoch++;
     this.stop();
     this.token = cfg.token;
     this.urlOverride = cfg.gateway_url;
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
-    this.resetLadder(reconnectCapMs);
+    this.resetLadder(budget);
     this.seq = null;
   }
 
@@ -126,7 +126,7 @@ export class DiscordGateway extends GatewayLadder {
           switch (payload.op) {
             case OP.HELLO: {
               // Discord sends exactly ONE HELLO per connection. Keep the IDENTIFY behind this flag,
-              // so that a peer repeating HELLO on an open socket cannot spend the 1000/24h quota at
+              // so that a peer repeating HELLO on an open socket cannot spend the per-token quota at
               // its own frame rate — the penalty is a bot-token RESET.
               if (identified) {
                 warn(
@@ -243,7 +243,7 @@ export class DiscordGateway extends GatewayLadder {
             this.fatal = err;
             process.stderr.write(`parley-discord: ${err.message}\n`);
           } else if (ready) {
-            if (Date.now() - readyAt >= STABLE_CONNECTION_MS) this.reconnectAttempts = 0;
+            if (Date.now() - readyAt >= this.budget.stableConnectionMs) this.reconnectAttempts = 0;
             this.scheduleReconnect(epoch);
           }
         }

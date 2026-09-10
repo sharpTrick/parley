@@ -33,9 +33,11 @@ import {
 
 export { DEFAULT_HANDSHAKE_TIMEOUT_MS } from './gateway.js';
 export { REQUIRED_INTENTS } from './intents.js';
-export { BACKOFF_BASE_MS, BACKOFF_JITTER_MS, INVALID_SESSION_MIN_WAIT_MS,
-  INVALID_SESSION_SPREAD_MS, RECONNECT_CAP_MS, STABLE_CONNECTION_MS } from './ladder.js';
+export { BACKOFF_BASE_MS, BACKOFF_JITTER_MS, dialBudgetFor, IDENTIFY_QUOTA_PER_DAY,
+  IDENTIFY_QUOTA_WINDOW_MS, INVALID_SESSION_MIN_WAIT_MS, INVALID_SESSION_SPREAD_MS,
+  RECONNECT_CAP_MS, STABLE_CONNECTION_MS } from './ladder.js';
 export type { AllowedMentions, DiscordBackendConfig } from './config.js';
+export type { DialBudget } from './ladder.js';
 
 /** One exclusive-`since` catch-up: where it resumes, how much it wants, and the budget it shares. */
 interface Catchup {

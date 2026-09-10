@@ -8,7 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('ws', async () => ({ default: (await import('./fake-gateway.js')).FakeWs }));
 
-import { BACKOFF_BASE_MS, DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
+import {
+  BACKOFF_BASE_MS,
+  DiscordPlugin,
+  IDENTIFY_QUOTA_PER_DAY,
+  IDENTIFY_QUOTA_WINDOW_MS,
+  RECONNECT_CAP_MS,
+} from '../src/index.js';
 import {
   FakeWs,
   instances,
@@ -29,8 +35,8 @@ import {
 import { dialCeiling, ladderDelays } from './ladder.js';
 
 const HOUR_MS = 3_600_000;
-const DAY_MS = 86_400_000;
-const QUOTA_PER_DAY = 1000;
+const DAY_MS = IDENTIFY_QUOTA_WINDOW_MS;
+const QUOTA_PER_DAY = IDENTIFY_QUOTA_PER_DAY;
 const HANDSHAKE_MS = 10_000;
 const TOPIC = asTopic('880001');
 
