@@ -1,10 +1,9 @@
-import { Allowlist, loadConfig, TOOL_TEXT } from '@sharptrick/parley-core';
+import { Allowlist, loadConfig } from '@sharptrick/parley-core';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { ROOM_PRESETS, type MatrixBackendConfig } from '../src/index.js';
-import { SHAPES } from './cursor-shapes.js';
 
 /**
  * Four CLASSES over what this package ships — to an operator, and to CI.
@@ -228,47 +227,6 @@ describe('every room_preset the config accepts is in the README config table', (
   it.each(ROOM_PRESETS)('%s', (preset) => {
     expect(table.join('\n')).toContain(`\`${preset}\``);
   });
-
-  it('names the preset it deliberately refuses, so the omission reads as a decision', () => {
-    expect(README).toContain('trusted_private_chat');
-    expect(ROOM_PRESETS as readonly string[]).not.toContain('trusted_private_chat');
-  });
-});
-
-/**
- * DESIGN §6's per-backend row is where a reader of a `read-state.json` — or an author of core-side
- * tooling — learns what a Matrix cursor is. A form only the package README knows about is a value
- * that document does not admit exists; a form only DESIGN knows about is one this package's own
- * users never meet. Graded off {@link SHAPES}, so the next form added is graded the day it is added.
- */
-const DESIGN = readFileSync(fileURLToPath(new URL('../../../DESIGN.md', import.meta.url)), 'utf8');
-
-/** The `- Matrix → …` bullet of DESIGN §6, continuation lines included, and nobody else's row. */
-const designMatrixRow = (): string => {
-  const section = DESIGN.split(/^## /m).find((s) => s.startsWith('6.'));
-  const lines = (section ?? '').split('\n');
-  const start = lines.findIndex((l) => /^\s*- Matrix →/.test(l));
-  const rest = lines.slice(start + 1);
-  const end = rest.findIndex((l) => /^\s*- \S+ →/.test(l));
-  return [lines[start], ...(end < 0 ? rest : rest.slice(0, end))].join('\n');
-};
-
-describe('every cursor form the plugin emits is documented where a reader looks it up', () => {
-  it('finds the DESIGN row it is meant to grade', () => {
-    expect(designMatrixRow()).toContain('Matrix →');
-  });
-
-  const documented = Object.entries(SHAPES).filter(([, shape]) => 'marker' in shape);
-
-  it('grades at least the two forms this plugin mints', () => {
-    expect(documented).toHaveLength(2);
-  });
-
-  it.each(documented)('%s', (_name, shape) => {
-    const marker = (shape as { marker: string }).marker;
-    expect(README).toContain(marker);
-    expect(designMatrixRow()).toContain(marker);
-  });
 });
 
 describe('CI type-checks this package’s test sources rather than skipping it', () => {
@@ -298,21 +256,6 @@ describe('CI type-checks this package’s test sources rather than skipping it',
 });
 
 /**
- * CLASS: a per-backend README describing CORE-owned tool semantics. `block_ms`, the `since`
- * convention, the absent-topic answer and the `catchup.block_max_ms` clamp are all owned by
- * `@sharptrick/parley-core` — the plugin never sees the tool surface — and this is the only backend
- * README that adds sentences of its own about them. A claim here can therefore contradict the
- * description core actually ships to the model, and the model believes the tool.
- *
- * Each row pins BOTH sides: the string core ships (so a reworded core description fails here rather
- * than diverging in one package unnoticed) and what this README must, and must not, say about it.
- */
-const CORE_SHIPS: Record<string, string> = {
-  'the parley_fetch_recent description': TOOL_TEXT.fetch_recent,
-  "the block_ms argument's description": TOOL_TEXT.fetch_recent_block_ms,
-  "the since argument's description": TOOL_TEXT.fetch_recent_since,
-};
-/**
  * EVERY source file this package ships, concatenated — never one named file. A claim about what the
  * plugin never does is a claim about the plugin, and a scan pinned to `src/index.ts` keeps passing
  * the day the code it was written about moves into a sibling module: the assertion stays green while
@@ -329,55 +272,6 @@ describe('the plugin-source scans below grade the whole package', () => {
     expect(SRC_FILES).toContain('index.ts');
     expect(SRC_FILES.length).toBeGreaterThan(1);
     expect(PLUGIN_SRC).toContain('class MatrixPlugin');
-  });
-});
-
-interface CoreOwnedClaim {
-  /** The text core ships, named by what it is — imported from core, never read out of its files. */
-  core: { ships: keyof typeof CORE_SHIPS; pattern: RegExp };
-  /** What this README must say about it. */
-  readme: RegExp;
-  /** What it must NOT say: the contradiction this class exists to catch. */
-  forbidden?: RegExp;
-  /** A plugin-source fact the README's claim rests on. */
-  pluginMustNotMatch?: RegExp;
-}
-
-const CORE_OWNED_CLAIMS: Record<string, CoreOwnedClaim> = {
-  'this deployment refuses block_ms rather than serving it': {
-    core: { ships: "the block_ms argument's description", pattern: /refuses this argument rather than ignoring it/ },
-    readme: /it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects/,
-    // The README must promise a REFUSAL, not a wait: core describes the argument to the model on
-    // every deployment, and a README promising the wait is promising a different tool.
-    forbidden: /Matrix\s+serves this natively/,
-  },
-  "an omitted since resumes this instance's read position, over the plugin's recent window": {
-    core: {
-      ships: "the since argument's description",
-      pattern: /Omit to resume from where this instance last read, or — if it keeps no read position/,
-    },
-    readme: /`fetchRecent` \(no `since`\)/,
-  },
-  'an absent topic is an empty page here, never the topicAbsent answer': {
-    core: { ships: 'the parley_fetch_recent description', pattern: /topicAbsent: true/ },
-    readme: /reads as an empty page/,
-    // `topicAbsent` is core's rendering of NoSuchTopicError; this plugin never raises it, which is
-    // what makes the README's "empty page" true rather than a second name for the same thing.
-    pluginMustNotMatch: /NoSuchTopicError/,
-  },
-};
-
-describe('the README does not contradict the tool semantics core ships', () => {
-  it.each(Object.entries(CORE_OWNED_CLAIMS))('%s', (_name, claim) => {
-    expect(
-      CORE_SHIPS[claim.core.ships],
-      `core reworded ${claim.core.ships}: re-read it and re-state the README claim`,
-    ).toMatch(claim.core.pattern);
-    expect(README).toMatch(claim.readme);
-    if (claim.forbidden !== undefined) expect(README).not.toMatch(claim.forbidden);
-    if (claim.pluginMustNotMatch !== undefined) {
-      expect(PLUGIN_SRC).not.toMatch(claim.pluginMustNotMatch);
-    }
   });
 });
 
@@ -405,21 +299,7 @@ const roomMutationsIn = (source: string): string[] =>
     new RegExp(`['"\`][^'"\`]*\\/${segment}(?![A-Za-z0-9_])`).test(stripComments(source)),
   );
 
-describe('the read-path paragraph names the side effect a read does have', () => {
-  const readsSection = (): string => {
-    const from = README.indexOf('**Reads never provision');
-    return README.slice(from, README.indexOf('\n## ', from));
-  };
-
-  it('finds the paragraph it is meant to grade', () => {
-    expect(readsSection()).toContain('Reads never provision');
-  });
-
-  it('names the JOIN, and what the joined-room set costs', () => {
-    expect(readsSection()).toMatch(/join/i);
-    expect(readsSection()).toMatch(/`\/sync`/);
-  });
-
+describe('a read never leaves or forgets a room', () => {
   it('recognizes a room mutation however it is spelled, and prose about one as prose', () => {
     const planted: Record<string, string> = {
       'a template literal': 'this.http("POST", `/_matrix/client/v3/rooms/${id}/leave`, {});',

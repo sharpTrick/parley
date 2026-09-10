@@ -162,8 +162,8 @@ describe('limit is a hard cap even when a page lands part-full', () => {
  * must replay to everything after them. A cursor it never minted (purged / foreign) is allowed to
  * degrade to the documented recent window, but even then only ever to a SUFFIX: no mid-stream gap.
  *
- * `shape` names the cursor FORM the origin produces, out of {@link SHAPES} — the single table both
- * these tests and the doc-parity check in `shipped-artifacts.test.ts` are driven from.
+ * `shape` names the cursor FORM the origin produces, out of {@link SHAPES} — the one table that
+ * answers which shape an origin mints.
  */
 const CURSOR_ORIGINS: Record<
   string,
