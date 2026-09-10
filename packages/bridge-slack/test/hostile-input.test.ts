@@ -15,12 +15,15 @@ import { asCursor, asHandle, asTopic, parseMentions, type Topic } from '@sharptr
 import { describe, expect, it, vi } from 'vitest';
 import {
   compareTs,
+  configRisks,
+  describeRisk,
   MAX_TIMER_MS,
   requireUsableSocketUrl,
   SlackPlugin,
   TIMER_CONFIG_KEYS,
   TOKEN_CONFIG_KEYS,
   TS_RE,
+  type SlackBackendConfig,
 } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 import { capture, settleWithin, sleep, startSlack, withSlack } from './harness.js';
@@ -556,15 +559,30 @@ describe('slack api_url: rejected when unusable, warned when it would leak the t
         }
         await plugin.connect(config);
         const said = warn.mock.calls.map((c) => String(c[0])).join('\n');
+        const risks = configRisks(config as SlackBackendConfig);
         if (row.outcome === 'silent') {
+          expect(risks, 'a safe endpoint was classified as a risk').toEqual([]);
           expect(said, 'warned about a safe endpoint').toBe('');
           return;
         }
-        // The operator has to be able to act on it: which key, which origin, and what leaks.
-        expect(said).toContain('api_url');
-        expect(said).toContain(new URL(String(row.url)).origin);
-        expect(said).toContain('bot_token');
-        expect(said).toContain('app_token');
+        // Graded as the VALUE it is, not as substrings of the sentence: an inverted warning —
+        // "api_url is fine as configured; bot_token and app_token are unaffected by it" — passed
+        // every one of the four `toContain`s this replaced.
+        expect(risks).toEqual([
+          {
+            key: 'api_url',
+            origin: new URL(String(row.url)).origin,
+            exposes: [...TOKEN_CONFIG_KEYS],
+          },
+        ]);
+        // …and the operator is shown THAT risk: on the channel a warning goes to, marked as a
+        // security finding, naming every part of the risk, and rendered FROM it — so the line an
+        // operator acts on cannot come to describe a different config from the one it names.
+        expect(said).toContain('SECURITY');
+        for (const named of [risks[0]!.key, risks[0]!.origin, ...risks[0]!.exposes]) {
+          expect(said, `the warning never names ${named}`).toContain(named);
+        }
+        expect(said).toContain(describeRisk(risks[0]!));
         // Never the credentials themselves — a warning that leaks them into the log is the defect.
         expect(said).not.toContain('xoxb-secret');
         expect(said).not.toContain('xapp-secret');

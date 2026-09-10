@@ -252,18 +252,32 @@ export function resolveConfig(cfg: SlackBackendConfig): SlackSettings {
 }
 
 /**
- * Every config shape that widens this backend's trust boundary, phrased for the operator's stderr.
- * A risk documented only in the README is one an operator who copied a fixture config never sees,
- * so this warns from `connect` — a warning rather than a load error, because a plaintext endpoint is
- * a legitimate choice for a loopback fixture or a recording proxy.
+ * A config that widens this backend's trust boundary, as the FACT rather than as the sentence an
+ * operator reads: which key opens it, which origin the value names, and which of this config's
+ * secrets that origin then receives.
  */
-export function configRisks(cfg: SlackBackendConfig): string[] {
-  const plaintext = plaintextRemoteOrigin(cfg.api_url ?? DEFAULT_API_URL);
-  if (plaintext === undefined) return [];
+export interface ConfigRisk {
+  key: string;
+  origin: string;
+  exposes: string[];
+}
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export const describeRisk = (risk: ConfigRisk): string =>
+  `backend_config.${risk.key} ${risk.origin} is plaintext http:// to a non-loopback host, so ` +
+  `every call to it carries ${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} ` +
+  'across the network in the clear. Use https:// for any remote endpoint.';
+
+/**
+ * Every config shape that widens this backend's trust boundary. A risk documented only in the
+ * README is one an operator who copied a fixture config never sees, so this is warned from
+ * `connect` — a warning rather than a load error, because a plaintext endpoint is a legitimate
+ * choice for a loopback fixture or a recording proxy.
+ */
+export function configRisks(cfg: SlackBackendConfig): ConfigRisk[] {
+  const origin = plaintextRemoteOrigin(cfg.api_url ?? DEFAULT_API_URL);
+  if (origin === undefined) return [];
   return [
-    `backend_config.api_url ${plaintext} is plaintext http:// to a non-loopback host, so every Web ` +
-      'API call carries backend_config.bot_token across the network in the clear as an ' +
-      'Authorization header, and apps.connections.open carries backend_config.app_token the same ' +
-      'way. Use https:// for any remote endpoint.',
+    { key: 'api_url', origin, exposes: TOKEN_CONFIG_KEYS.filter((k) => cfg[k] !== undefined) },
   ];
 }

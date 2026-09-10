@@ -24,6 +24,7 @@ import {
 } from './api.js';
 import {
   configRisks,
+  describeRisk,
   resolveConfig,
   type SlackBackendConfig,
   type SlackSettings,
@@ -37,7 +38,9 @@ export type { SlackBackendConfig } from './config.js';
 export { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 export { DIAL_BACKOFF_MS, MAX_DIAL_BACKOFF_MS } from './socket.js';
 export { HISTORY_PAGE_LIMIT, MAX_HISTORY_PAGES } from './api.js';
-export { MAX_TIMER_MS, requireUsableSocketUrl, TIMER_CONFIG_KEYS, TOKEN_CONFIG_KEYS } from './config.js';
+export { configRisks, describeRisk, MAX_TIMER_MS, requireUsableSocketUrl, TIMER_CONFIG_KEYS,
+  TOKEN_CONFIG_KEYS } from './config.js';
+export type { ConfigRisk } from './config.js';
 export { compareTs, TS_RE } from './messages.js';
 export { escapeSlackText, unescapeSlackText } from './markup.js';
 
@@ -83,7 +86,8 @@ export class SlackPlugin implements BackendPlugin {
     // `auth.test` belong to its tokens, and leaving them would feed a handler the new
     // configuration never registered, off a socket it never opened.
     if (this.connected) await this.disconnect();
-    for (const risk of configRisks(cfg)) console.warn(`[parley-slack] SECURITY: ${risk}`);
+    for (const risk of configRisks(cfg))
+      console.warn(`[parley-slack] SECURITY: ${describeRisk(risk)}`);
     this.settings = settings;
     this.channelOwner.clear();
     // Keep configuration claiming its channels HERE, before any call arrives, so that an ad-hoc
