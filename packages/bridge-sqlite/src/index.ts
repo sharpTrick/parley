@@ -14,7 +14,7 @@ export {
   MIN_RETENTION_DAYS, POLL_BATCH, PRUNE_BATCH, PRUNE_INTERVAL_MS, retentionCutoff,
   type SqliteBackendConfig, validateBackendConfig,
 } from './config.js';
-export { backoffMs, type SubscriptionHealth, type SubscriptionState } from './poll.js';
+export { backoffMs } from './poll.js';
 
 /**
  * The SQLite backend (DESIGN §9). Zero-infra, **polling-only** — no socket, no notify bus,
@@ -53,9 +53,8 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
     this.stopped = false;
     // Keep the bump below every throw above it, so that a connect() that is refused — already
     // connected, or a store that failed after opening — cannot stop the loops an earlier connect()
-    // armed and left healthy.
+    // armed and left running.
     this.generation++;
-    this.health.length = 0;
     this.pruneFailures = 0;
     this.lastPruneDiag = 0;
     this.driver = driver;
@@ -79,10 +78,6 @@ export class SqlitePlugin extends SqlitePoller implements BackendPlugin {
     this.pruneBatchTimer = undefined;
     for (const cancel of this.cancellers) cancel();
     this.cancellers.length = 0;
-    for (const h of this.health) {
-      h.state = 'stopped';
-      h.lastError = 'disconnected';
-    }
     this.driver?.close();
     this.driver = undefined;
     this.storeId = undefined;

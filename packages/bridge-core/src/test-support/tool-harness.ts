@@ -3,6 +3,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
+import { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle } from '../message.js';
 import { registerTools, toolDepsFor, type ToolDeps } from '../transport/tools.js';
@@ -45,13 +46,15 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
   const plugin = (opts.plugin as FakePlugin | undefined) ?? new FakePlugin();
   await plugin.connect({});
 
+  const allow =
+    opts.allow ??
+    new Allowlist(opts.topics ?? ['ctx', 'ctx-reviews'], { postPatterns: opts.postPatterns });
   const deps: ToolDeps = {
     plugin,
     identity: asHandle('alice'),
-    allow:
-      opts.allow ??
-      new Allowlist(opts.topics ?? ['ctx', 'ctx-reviews'], { postPatterns: opts.postPatterns }),
+    allow,
     seen: new SeenSet(),
+    live: new LiveDeliveryLedger(allow.topics()),
     readState: memoryReadState(),
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,

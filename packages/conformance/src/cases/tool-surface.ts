@@ -1,6 +1,7 @@
 import {
   Allowlist,
   type Cursor,
+  LiveDeliveryLedger,
   registerTools,
   SeenSet,
   type Topic,
@@ -125,6 +126,7 @@ export function toolSurfaceCases(ctx: ConformanceContext): void {
       readState,
       blockMaxMs: 60_000,
       blockPollIntervalMs: 20,
+      live: new LiveDeliveryLedger([topic]),
     };
     const fetchRecent = toolsOf(deps).get('parley_fetch_recent')!;
 

@@ -6,6 +6,7 @@ import {
   asCursor,
   asHandle,
   catchUpTopic,
+  LiveDeliveryLedger,
   ReadStateStore,
   registerTools,
   SeenSet,
@@ -76,6 +77,7 @@ function withRig(storedCursor: string, body: (rig: Rig) => Promise<void>): Promi
         readState,
         blockMaxMs: 60_000,
         blockPollIntervalMs: 20,
+        live: new LiveDeliveryLedger([topic]),
       }),
     });
   });

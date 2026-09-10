@@ -50,9 +50,8 @@ interface EntryPoint {
   drive: (p: SqlitePlugin, topic: Topic) => Promise<unknown>;
   /**
    * Collections this call is DECLARED to extend once per call, with the caller's own topic list as
-   * the bound. `subscribe` is driven by the configured allowlist and its per-loop records are the
-   * contract `subscriptionHealth()` publishes; everything else must stay bounded however many
-   * distinct topics a caller names.
+   * the bound. `subscribe` is driven by the configured allowlist and arms one cancellable loop per
+   * call; everything else must stay bounded however many distinct topics a caller names.
    */
   perCall: string[];
 }
@@ -63,7 +62,7 @@ const ENTRY_POINTS: EntryPoint[] = [
   {
     name: 'subscribe',
     drive: (p, topic) => p.subscribe(topic, () => {}),
-    perCall: ['cancellers', 'health'],
+    perCall: ['cancellers'],
   },
 ];
 

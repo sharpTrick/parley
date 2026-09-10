@@ -65,6 +65,16 @@ export { MAX_MATCH_INPUT } from './regex-safety.js';
 export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
+// The run-time half of the seam's live-delivery clause: a push path that delivers NOTHING is
+// otherwise invisible to a deployment, because catch-up covers for it silently.
+// An out-of-tree composition root assembling `ToolDeps` by hand needs both: the ledger the tool
+// reads, and the one derivation of when it must refuse to answer.
+export {
+  LiveDeliveryLedger,
+  liveDeliveryBlockers,
+  type LiveDeliveryBlocker,
+  type LiveDeliveryPreconditions,
+} from './engine/live-delivery.js';
 export {
   fetchRecentBlocking,
   FetchAbortedError,

@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpTopic } from '../engine/catchup.js';
+import { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
@@ -43,6 +44,7 @@ async function wired(opts: { mentionFilter: boolean; identity: string }) {
   await startPushLoop(server, plugin, allow, seen, {
     mentionFilter: opts.mentionFilter,
     identity: asHandle(opts.identity),
+    live: new LiveDeliveryLedger(allow.topics()),
   });
   return { plugin, calls, seen };
 }
@@ -115,11 +117,13 @@ describe('startPushLoop (core emit handler)', () => {
         seen,
         blockMaxMs: 1_000,
         blockPollIntervalMs: 20,
+        live: new LiveDeliveryLedger([asTopic('ctx')]),
       });
       const emits = vi.spyOn(server.server, 'notification').mockResolvedValue(undefined);
       await startPushLoop(server, plugin, new Allowlist(['ctx']), seen, {
         mentionFilter: false,
         identity: asHandle('agent'),
+        live: new LiveDeliveryLedger([asTopic('ctx')]),
       });
       const [clientT, serverT] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
@@ -195,6 +199,7 @@ describe('startPushLoop (core emit handler)', () => {
       const start = startPushLoop(server, plugin, new Allowlist(topics), new SeenSet(), {
         mentionFilter: false,
         identity: asHandle('me'),
+        live: new LiveDeliveryLedger(topics.map(asTopic)),
       });
       return { plugin, subscribed, calls, start };
     }
@@ -246,7 +251,7 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
       plugin,
       new Allowlist(['ctx']),
       new SeenSet(),
-      { mentionFilter: false, identity: asHandle('me') },
+      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]) },
     );
     let seq = 0;
     return {

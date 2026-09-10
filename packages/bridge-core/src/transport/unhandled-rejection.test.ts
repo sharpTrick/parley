@@ -8,6 +8,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
+import { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import {
@@ -47,6 +48,7 @@ describe('no fire-and-forget seam call escapes as an unhandled rejection', () =>
       const escaped = await unhandledDuring(async () => {
         await startPushLoop(server, plugin, new Allowlist(['ctx']), new SeenSet(), {
           mentionFilter: false,
+          live: new LiveDeliveryLedger([]),
           identity: asHandle('agent'),
         });
         await plugin.post(asTopic('ctx'), asHandle('bob'), 'hi');

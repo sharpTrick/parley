@@ -122,8 +122,20 @@ export class FakePlugin implements BackendPlugin {
       .map((r) => r.msg);
   }
 
-  private require(): void {
+  protected require(): void {
     if (!this.connected) throw new Error('fake plugin is disconnected');
+  }
+}
+
+/**
+ * The one nonconformance the seam's third clause exists to forbid: a `subscribe` that resolves,
+ * registers nothing, and delivers nothing, over a `fetchRecent` that is complete. Every message
+ * still reaches the agent — through catch-up — so nothing above the seam errors, nothing is lost,
+ * and without a run-time enforcer the only difference from {@link FakePlugin} is latency.
+ */
+export class DeadListenerPlugin extends FakePlugin {
+  override async subscribe(_topic: Topic, _handler: MessageHandler): Promise<void> {
+    this.require();
   }
 }
 

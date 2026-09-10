@@ -15,9 +15,6 @@ import {
   SqlitePlugin,
 } from '../src/index.js';
 import { SQL } from '../src/schema.js';
-import { expectHealth } from './health.js';
-
-const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * The plugin runs two background jobs — the per-topic poll loop and the retention prune — and both
@@ -131,7 +128,7 @@ const BURST = 13;
  * depends on the error's CLASS. Driven over one representative spec per outcome rather than over
  * all seven: with escalation disabled every healable row of the full cross still passed, so the
  * other twelve measured the classifier a second time and the recovery itself is pinned on fake
- * timers in subscription-health.test.ts. The two DRIVER SHAPES stay on both axes — that is the one
+ * timers in poll-ladder.test.ts. The two DRIVER SHAPES stay on both axes — that is the one
  * thing a row here can see that the classifier's own tests cannot.
  */
 const BURST_REPRESENTATIVES = ['SQLITE_BUSY', 'SQLITE_CORRUPT'];
@@ -156,14 +153,14 @@ describe('poll loop error-class matrix', () => {
             timeout: 8000,
             interval: 10,
           });
-          expectHealth(p.subscriptionHealth(T), [
-            { topic: T, state: 'live', consecutiveFailures: 0 },
-          ]);
         } else {
-          await vi.waitFor(() => expect(p.subscriptionHealth(T)[0]?.state).toBe('stopped'), {
-            timeout: 3000,
-            interval: 5,
-          });
+          await vi.waitFor(
+            () =>
+              expect(
+                spy.mock.calls.map(([l]) => String(l)).some((l) => /stopped after/.test(l)),
+              ).toBe(true),
+            { timeout: 3000, interval: 5 },
+          );
           await p.post(T, me, 'after-recovery');
           await new Promise((r) => setTimeout(r, 100));
           expect(got).toEqual([]);
@@ -175,23 +172,22 @@ describe('poll loop error-class matrix', () => {
   }
 
   for (const c of ERROR_CASES) {
-    it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr and ${c.healable ? 'degraded' : 'stopped'} in health`, async () => {
+    it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr and ${c.healable ? 'keeps probing' : 'ends the loop'}`, async () => {
       const p = await plugin();
       const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
       let lines: string[] = [];
+      let probedAfterEscalation = false;
       try {
         await p.subscribe(T, () => {});
-        breakSelect(p, Number.POSITIVE_INFINITY, c.make());
-        await vi.waitFor(
-          () => {
-            expect(p.subscriptionHealth(T)[0]?.consecutiveFailures ?? 0).toBeGreaterThanOrEqual(
-              ESCALATE_AFTER,
-            );
-          },
-          { timeout: 3000, interval: 5 },
-        );
+        const attempts = breakSelect(p, Number.POSITIVE_INFINITY, c.make());
+        await vi.waitFor(() => expect(attempts()).toBeGreaterThanOrEqual(ESCALATE_AFTER), {
+          timeout: 3000,
+          interval: 5,
+        });
         // Give the loop time to run well past the escalation threshold either way.
+        const atEscalation = attempts();
         await new Promise((r) => setTimeout(r, 200));
+        probedAfterEscalation = attempts() > atEscalation;
         lines = spy.mock.calls.map(([l]) => String(l));
       } finally {
         spy.mockRestore();
@@ -204,15 +200,10 @@ describe('poll loop error-class matrix', () => {
         // Rate-limited: a persistent failure must not write one line per poll interval.
         expect(diags.length).toBeLessThanOrEqual(3);
       }
-      // Silent is not healthy: whatever the class, a run of ticks that read nothing escalates.
-      expectHealth(p.subscriptionHealth(T), [
-        {
-          topic: T,
-          state: c.healable ? 'degraded' : 'stopped',
-          consecutiveFailures: { atLeast: ESCALATE_AFTER },
-          lastError: new RegExp(escapeRegExp(c.make().message)),
-        },
-      ]);
+      // Silent is not healthy: whatever the class, a run of ticks that read nothing escalates —
+      // a healable store is probed forever, and only unrecoverable damage ends the loop, loudly.
+      expect(probedAfterEscalation).toBe(c.healable);
+      expect(lines.some((l) => /stopped after/.test(l))).toBe(!c.healable);
     });
   }
 });
@@ -235,7 +226,7 @@ describe('a throwing handler is a consumer fault, not a store outage', () => {
   const SENT = Array.from({ length: BURST + 3 }, (_u, i) => `m${i}`);
 
   for (const f of HANDLER_FAULTS) {
-    it(`${f.name}: keeps delivering, stays silent, stays live`, async () => {
+    it(`${f.name}: keeps delivering at full cadence, and stays silent`, async () => {
       const p = await plugin();
       const offered: string[] = [];
       const survived: string[] = [];
@@ -259,7 +250,14 @@ describe('a throwing handler is a consumer fault, not a store outage', () => {
       }
       expect(survived).toEqual(SENT.filter((_c, nth) => !f.fails(nth)));
       expect(lines.filter((l) => /poll error|poll loop/.test(l))).toEqual([]);
-      expectHealth(p.subscriptionHealth(T), [{ topic: T, state: 'live', consecutiveFailures: 0 }]);
+
+      // Full cadence, not a backed-off one: a handler fault counted as a store failure would have
+      // escalated well inside this burst, and the next message would wait out the backoff instead.
+      await p.post(T, me, 'after-the-faults');
+      await vi.waitFor(() => expect(offered).toContain('after-the-faults'), {
+        timeout: 2000,
+        interval: 10,
+      });
     });
   }
 });

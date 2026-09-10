@@ -2,6 +2,7 @@ import {
   Allowlist,
   asHandle,
   asTopic,
+  LiveDeliveryLedger,
   registerTools,
   SeenSet,
   type Cursor,
@@ -102,6 +103,7 @@ describe.skipIf(!up)('the catch-up loop ends on a cursor that stopped, not on an
         readState: { get: (t) => positions.get(t), set: (t, c) => void positions.set(t, c) },
         blockMaxMs: 60_000,
         blockPollIntervalMs: 20,
+        live: new LiveDeliveryLedger([mine]),
       };
       const fetchRecent = toolOf(deps);
 

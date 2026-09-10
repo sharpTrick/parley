@@ -1,5 +1,6 @@
 import { allowlistFor, type Allowlist } from '../allowlist.js';
 import type { ParleyConfig } from '../config.js';
+import { LiveDeliveryLedger, liveDeliveryBlockers } from '../engine/live-delivery.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import { asHandle, type Handle } from '../message.js';
@@ -34,6 +35,12 @@ export interface ToolDeps {
   blockMaxMs: number;
   /** Poll cadence (ms) at which core re-drives a plugin that came back early from a budget. */
   blockPollIntervalMs: number;
+  /**
+   * Run-time enforcer for the seam's live-delivery clause, shared with the push loop that feeds its
+   * other half. `parley_live_status` reads it; both roots supply one, and the one built where the
+   * counters cannot be compared refuses to answer rather than reporting health.
+   */
+  live: LiveDeliveryLedger;
 }
 
 /**
@@ -46,13 +53,22 @@ export function toolDepsFor(
   cfg: ParleyConfig,
   extras?: { seen?: SeenSet; readState?: ToolDeps['readState'] },
 ): ToolDeps {
+  const allow = allowlistFor(cfg);
   return {
     plugin,
     identity: asHandle(cfg.identity.handle),
-    allow: allowlistFor(cfg),
+    allow,
     blockMaxMs: cfg.catchup.block_max_ms,
     blockPollIntervalMs: cfg.catchup.block_poll_interval_ms,
     seen: extras?.seen,
     readState: extras?.readState,
+    live: new LiveDeliveryLedger(
+      allow.topics(),
+      liveDeliveryBlockers({
+        livePushEnabled: cfg.live_push.enabled,
+        startCatchUp: cfg.catchup.on_start,
+        dedupWindow: extras?.seen !== undefined,
+      }),
+    ),
   };
 }

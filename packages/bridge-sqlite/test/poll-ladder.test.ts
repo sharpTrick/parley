@@ -4,14 +4,12 @@ import { join } from 'node:path';
 import { asHandle, asTopic } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { backoffMs, classifyDbError, ESCALATE_AFTER, SqlitePlugin } from '../src/index.js';
-import { type ExpectedHealth, expectHealth } from './health.js';
 
 /**
- * `subscriptionHealth()` is the programmatic surface the README points a supervisor at, and a
- * supervisor reads more than `state`: a restart decision keys off `consecutiveFailures` and
- * `lastError` too. Every transition therefore grades the WHOLE record — a recovery path that
- * clears the discriminant but leaves the diagnosis behind reports a healthy loop that any
- * `lastError !== undefined` check will keep restarting.
+ * The escalation ladder, graded on the only thing an operator or core can observe from outside the
+ * plugin: whether the loop still DELIVERS. A tick that read nothing delivered nothing, contention
+ * included, so a run of failures past the threshold backs the loop off while it keeps probing, and
+ * only unrecoverable damage stops it for good.
  *
  * Driven on fake timers so each row lands on an exact failure count rather than a raced one.
  */
@@ -19,7 +17,7 @@ import { type ExpectedHealth, expectHealth } from './health.js';
 const T = asTopic('ctx');
 const me = asHandle('alice');
 const INTERVAL_MS = 1000;
-const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-health-')), 'p.db');
+const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-ladder-')), 'p.db');
 
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -50,6 +48,8 @@ interface Loop {
   ticks(n: number): Promise<void>;
   /** Run exactly `n` more ticks, one timer at a time, each of which must hit the fault. */
   faultedTicks(n: number): Promise<void>;
+  /** How many times the loop has read the store, faulted or not. */
+  reads(): number;
 }
 
 let open: SqlitePlugin[] = [];
@@ -77,9 +77,11 @@ async function startLoop(): Promise<Loop> {
   const real = holder.selectAfterStmt;
   let fault: ((nth: number) => Error) | undefined;
   let faulted = 0;
+  let reads = 0;
   holder.selectAfterStmt = {
     // Faulted for THIS topic only, so a second subscription on the same statement stays healthy.
     all: (...a: unknown[]) => {
+      if (a[0] === T) reads++;
       if (fault !== undefined && a[0] === T) throw fault(faulted++);
       return real.all(...a);
     },
@@ -96,6 +98,7 @@ async function startLoop(): Promise<Loop> {
   return {
     plugin,
     delivered,
+    reads: () => reads,
     breakWith: (e) => {
       fault = () => e;
     },
@@ -120,166 +123,142 @@ async function startLoop(): Promise<Loop> {
   };
 }
 
-const TRANSITIONS: Array<{
-  name: string;
-  drive: (loop: Loop) => Promise<void>;
-  expected: ExpectedHealth[];
-}> = [
-  {
-    name: 'a loop that has just been armed',
-    drive: async () => {},
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 0 }],
-  },
+/**
+ * `resumes` is what the ladder promises after the drive: a loop at full cadence delivers the next
+ * message within one poll interval, a backed-off one only after the backoff, and a stopped one
+ * never. Grading all three against the SAME probe is what keeps "backed off" from reading as
+ * "healthy" — the difference between them is entirely a matter of when.
+ */
+const RESUMES = ['at once', 'after the backoff', 'never'] as const;
+type Resumes = (typeof RESUMES)[number];
+
+const PROBE = 'after-the-drive';
+
+/**
+ * Every row posts {@link PROBE} itself, as its last act while still connected: a torn-down plugin
+ * refuses `post`, and a probe the harness planted afterwards would grade the refusal rather than
+ * the loop.
+ */
+const LADDER: Array<{ name: string; drive: (loop: Loop) => Promise<void>; resumes: Resumes }> = [
+  { name: 'a loop that has just been armed', drive: (l) => l.post(PROBE), resumes: 'at once' },
   {
     name: 'a loop that has polled quietly',
-    drive: (l) => l.ticks(5),
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 0 }],
-  },
-  {
-    name: 'a loop that has delivered',
     drive: async (l) => {
-      await l.post('live-message');
-      await l.ticks(1);
-      expect(l.delivered).toEqual(['live-message']);
+      await l.ticks(5);
+      await l.post(PROBE);
     },
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 0 }],
+    resumes: 'at once',
   },
   {
     name: 'a non-lock failure one tick below the escalation threshold',
     drive: async (l) => {
       l.breakWith(IOERR());
       await l.ticks(ESCALATE_AFTER - 1);
+      l.mend();
+      await l.post(PROBE);
     },
-    expected: [
-      { topic: T, state: 'live', consecutiveFailures: ESCALATE_AFTER - 1, lastError: /disk I\/O/ },
-    ],
+    resumes: 'at once',
   },
   {
     name: 'a healable failure at the escalation threshold',
     drive: async (l) => {
       l.breakWith(IOERR());
       await l.ticks(ESCALATE_AFTER);
+      l.mend();
+      await l.post(PROBE);
     },
-    expected: [
-      { topic: T, state: 'degraded', consecutiveFailures: ESCALATE_AFTER, lastError: /disk I\/O/ },
-    ],
+    resumes: 'after the backoff',
   },
   {
-    name: 'a fatal failure at the escalation threshold, and long after it',
+    name: 'a lock burst that carries a run of non-lock failures over the threshold',
+    drive: async (l) => {
+      l.breakWith(IOERR());
+      await l.ticks(ESCALATE_AFTER - 1);
+      l.breakWith(BUSY());
+      await l.ticks(1);
+      l.mend();
+      await l.post(PROBE);
+    },
+    resumes: 'after the backoff',
+  },
+  {
+    name: 'a fatal failure at the escalation threshold',
     drive: async (l) => {
       l.breakWith(CORRUPT());
       await l.ticks(ESCALATE_AFTER);
       l.mend();
-      await l.advance(10 * 60_000);
+      await l.post(PROBE);
     },
-    expected: [
-      { topic: T, state: 'stopped', consecutiveFailures: ESCALATE_AFTER, lastError: /malformed/ },
-    ],
-  },
-  {
-    name: 'a lock-classed tick, which counts but does not clear a burst of non-lock failures',
-    drive: async (l) => {
-      l.breakWith(IOERR());
-      await l.ticks(3);
-      l.breakWith(BUSY());
-      await l.ticks(1);
-    },
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 4, lastError: /is locked/ }],
-  },
-  {
-    name: 'a loop that recovered before escalating',
-    drive: async (l) => {
-      l.breakWith(IOERR());
-      await l.ticks(3);
-      l.mend();
-      await l.ticks(1);
-    },
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 0 }],
-  },
-  {
-    name: 'a loop that recovered after escalating to degraded',
-    drive: async (l) => {
-      l.breakWith(IOERR());
-      await l.ticks(ESCALATE_AFTER);
-      l.mend();
-      await l.advance(backoffMs(INTERVAL_MS, ESCALATE_AFTER));
-      await l.post('after-recovery');
-      await l.ticks(1);
-      expect(l.delivered).toEqual(['after-recovery']);
-    },
-    expected: [{ topic: T, state: 'live', consecutiveFailures: 0 }],
+    resumes: 'never',
   },
   {
     name: 'a healthy loop that was disconnected',
     drive: async (l) => {
       await l.ticks(2);
+      await l.post(PROBE);
       await l.plugin.disconnect();
     },
-    expected: [
-      { topic: T, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
-    ],
+    resumes: 'never',
   },
   {
     name: 'a degraded loop that was disconnected',
     drive: async (l) => {
       l.breakWith(IOERR());
       await l.ticks(ESCALATE_AFTER);
+      l.mend();
+      await l.post(PROBE);
       await l.plugin.disconnect();
     },
-    expected: [
-      {
-        topic: T,
-        state: 'stopped',
-        consecutiveFailures: ESCALATE_AFTER,
-        lastError: /^disconnected$/,
-      },
-    ],
+    resumes: 'never',
   },
 ];
 
-describe('every subscriptionHealth transition reports every field', () => {
-  for (const t of TRANSITIONS) {
-    it(t.name, async () => {
+describe('what the escalation ladder does to delivery', () => {
+  for (const row of LADDER) {
+    it(`${row.name}: resumes ${row.resumes}`, async () => {
       const loop = await startLoop();
-      await t.drive(loop);
-      expectHealth(loop.plugin.subscriptionHealth(T), t.expected);
+      await row.drive(loop);
+
+      await loop.ticks(1);
+      expect(loop.delivered.includes(PROBE)).toBe(row.resumes === 'at once');
+
+      await loop.advance(backoffMs(INTERVAL_MS, ESCALATE_AFTER) + INTERVAL_MS);
+      expect(loop.delivered.includes(PROBE)).toBe(row.resumes !== 'never');
+
+      // A stopped loop is stopped for good, not merely slow: nothing reaches the handler however
+      // long the store has been well again.
+      await loop.advance(10 * 60_000);
+      expect(loop.delivered.includes(PROBE)).toBe(row.resumes !== 'never');
     });
   }
 
-  it('a connected plugin reports nothing for a topic it never subscribed', async () => {
-    const p = new SqlitePlugin();
-    open.push(p);
-    await p.connect({ db_path: dbFile(), poll_interval_ms: INTERVAL_MS });
-    expectHealth(p.subscriptionHealth(T), []);
-    expectHealth(p.subscriptionHealth(), []);
-  });
-
   /**
-   * One failing topic must not be reported against another: the report is per loop, and a
-   * supervisor restarting the bridge on `lastError` would act on a topic that is perfectly live.
+   * One failing topic must not take another down: `subscribe` starts an independent loop per call,
+   * and a store fault scoped to one topic's read leaves the other one delivering at full cadence.
    */
-  it('a failure on one topic leaves the other topic’s record untouched', async () => {
+  it('a failure on one topic leaves the other topic delivering', async () => {
     const loop = await startLoop();
     const other = asTopic('other');
-    await loop.plugin.subscribe(other, () => {});
+    const elsewhere: string[] = [];
+    await loop.plugin.subscribe(other, (m) => elsewhere.push(m.content));
     loop.breakWith(IOERR());
     await loop.ticks(3);
 
-    expectHealth(loop.plugin.subscriptionHealth(T), [
-      { topic: T, state: 'live', consecutiveFailures: 3, lastError: /disk I\/O/ },
-    ]);
-    expectHealth(loop.plugin.subscriptionHealth(other), [
-      { topic: other, state: 'live', consecutiveFailures: 0 },
-    ]);
+    await loop.post('to-the-broken-topic');
+    await loop.plugin.post(other, me, 'to-the-healthy-topic');
+    await loop.ticks(1);
+
+    expect(loop.delivered).toEqual([]);
+    expect(elsewhere).toEqual(['to-the-healthy-topic']);
   });
 });
 
 /**
  * The ladder measures DELIVERY, so the only thing that may clear it is a successful read. Driving a
  * sequence of error classes rather than one class per run is what grades that: any tick whose class
- * resets the counters hands a supervisor a loop reporting `live` with zero failures while it has
- * delivered nothing, and re-arms the "first hit is loud" clause the stderr rate limit rests on, so
- * the limit stops holding for every interleaving that touches it.
+ * resets the counters leaves a loop that has delivered nothing polling at full rate, and re-arms the
+ * "first hit is loud" clause the stderr rate limit rests on, so the limit stops holding for every
+ * interleaving that touches it.
  *
  * Ticks are advanced one timer at a time, so a row lands on an exact failure count even once the
  * backoff has stretched the interval.
@@ -308,14 +287,14 @@ describe('no interleaving of error classes launders the escalation ladder', () =
         const windowMs = Date.now() - startedAt;
 
         expect(loop.delivered).toEqual([]);
-        expectHealth(loop.plugin.subscriptionHealth(T), [
-          {
-            topic: T,
-            state: n >= ESCALATE_AFTER ? 'degraded' : 'live',
-            consecutiveFailures: n,
-            lastError: new RegExp(escapeRegExp(seq.at(n - 1).message)),
-          },
-        ]);
+
+        // Past the threshold the loop is backed off, whatever the interleaving: the message it
+        // could not read is still not delivered a full poll interval after the store is well.
+        loop.mend();
+        await loop.ticks(1);
+        expect(loop.delivered).toEqual(n >= ESCALATE_AFTER ? [] : ['never-read']);
+        await loop.advance(backoffMs(INTERVAL_MS, n) + INTERVAL_MS);
+        expect(loop.delivered).toEqual(['never-read']);
 
         const diags = stderrLines().filter((l) => /poll error/.test(l));
         const classes = Array.from({ length: n }, (_u, i) => classifyDbError(seq.at(i)));
@@ -349,5 +328,27 @@ describe('no interleaving of error classes launders the escalation ladder', () =
 
     expect(Date.now() - recoveredAt).toBeLessThan(DIAG_INTERVAL_MS);
     expect(diags()).toHaveLength(2);
+  });
+
+  /**
+   * Only unrecoverable damage may end the loop, and when it does it says so: everything else keeps
+   * being probed forever, so a topic whose store was briefly unreachable is never dark for good.
+   */
+  const PROBING: Array<[name: string, make: () => Error, probes: boolean]> = [
+    ['a healable failure keeps being probed', IOERR, true],
+    ['unrecoverable damage ends the loop, and says so', CORRUPT, false],
+  ];
+
+  it.each(PROBING)('%s', async (_name, make, probes) => {
+    const loop = await startLoop();
+    loop.breakWith(make());
+    await loop.ticks(ESCALATE_AFTER);
+
+    const before = loop.reads();
+    await loop.advance(backoffMs(INTERVAL_MS, ESCALATE_AFTER) * 3);
+    expect(loop.reads() > before).toBe(probes);
+    expect(stderrLines().some((l) => new RegExp(escapeRegExp('stopped after')).test(l))).toBe(
+      !probes,
+    );
   });
 });

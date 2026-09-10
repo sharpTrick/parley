@@ -233,6 +233,7 @@ Distinct from the six seam methods a backend implements, these are the 3 tools C
 
 - **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?, from?}` → `{messages, nextCursor}`. `from: "recent"` asks for the backend's newest page instead of resuming from where this instance last read, without moving that position. `block_ms` long-polls where the backend's own read primitive takes a wait, and is **refused by name** where it cannot — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
 - **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?}` → `{backendMsgId}`.
+- **`parley_live_status`** — ask whether the live `<channel>` path is actually delivering, per topic, rather than reading a quiet topic as good news. `{}` → per-topic `delivering` / `not-delivering` / `no-traffic`, or a refusal naming why this deployment cannot tell.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.
 
 ### Waiting for a reply (`block_ms`)

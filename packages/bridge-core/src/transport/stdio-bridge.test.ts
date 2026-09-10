@@ -602,6 +602,7 @@ describe('a state file this process cannot write does not stop the bridge starti
 
       expect((await client.listTools()).tools.map((t) => t.name).sort()).toEqual([
         'parley_fetch_recent',
+        'parley_live_status',
         'parley_post',
         'parley_reply',
       ]);

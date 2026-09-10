@@ -21,7 +21,8 @@ const CHANNEL_INSTRUCTIONS_BODY = [
   'with attributes topic, sender, cursor, msg_id (and mentions). To respond, call parley_reply',
   'with the same `topic`. To pull missed history for a topic, call parley_fetch_recent (on',
   'session start for each configured topic, then on demand). To publish or hand off, call',
-  'parley_post.',
+  'parley_post. To check whether the live path is actually delivering — rather than assuming a',
+  'quiet topic — call parley_live_status.',
 ];
 
 /** A transport accepted by `McpServer.connect` (stdio in production, in-memory in tests). */
@@ -63,7 +64,8 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   // Keep tools and the push loop on this ONE `seen` set, so a message pulled via the fetch_recent
   // tool is not later re-pushed — and on this ONE read-state, which is the AGENT's read position:
   // the tool resumes from it and advances it, while on-start catch-up only reads it.
-  registerTools(server, toolDepsFor(plugin, cfg, { seen, readState }));
+  const deps = toolDepsFor(plugin, cfg, { seen, readState });
+  registerTools(server, deps);
 
   await plugin.connect(cfg.backend_config as BackendConfig);
 
@@ -138,6 +140,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
           await startPushLoop(server, plugin, allow, seen, {
             mentionFilter: cfg.live_push.mention_filter,
             identity,
+            live: deps.live,
           });
           abortIfToreDown();
         }

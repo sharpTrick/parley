@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Allowlist } from '../allowlist.js';
+import type { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import type { SeenSet } from '../engine/seen-set.js';
 import type { Handle, Message } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
@@ -10,6 +11,11 @@ export interface PushLoopOptions {
   /** When true, only surface messages mentioning `identity` (DESIGN §7 — a filter flag, not a subscription). */
   mentionFilter: boolean;
   identity: Handle;
+  /**
+   * Records that the live path delivered. Shared with the reconciling read, whose counter is the
+   * other half of the comparison `parley_live_status` answers from.
+   */
+  live: LiveDeliveryLedger;
 }
 
 /**
@@ -17,8 +23,9 @@ export interface PushLoopOptions {
  * (DESIGN §7/§9). The handler is the one place filtering lives:
  *   1. drop anything whose `topic` is not one we subscribed to,
  *   2. dedup on backendMsgId (so a message already pulled via catch-up isn't re-pushed),
- *   3. mention filter — in CORE, not in `subscribe` (the plugin forwards ALL messages),
- *   4. emit as a `<channel>` event (best-effort; the cursor reconciles any drop).
+ *   3. record the delivery, so `parley_live_status` can answer whether this path carries anything,
+ *   4. mention filter — in CORE, not in `subscribe` (the plugin forwards ALL messages),
+ *   5. emit as a `<channel>` event (best-effort; the cursor reconciles any drop).
  *
  * Step 1 is a trust boundary, not a redundancy: `m.topic` is plugin-supplied and lands in the
  * agent's context, while a backend's subscribe primitive can be COARSER than a topic (a NATS
@@ -58,6 +65,9 @@ export async function startPushLoop(
       return;
     }
     if (!seen.firstSeen(m.topic, m.backendMsgId)) return;
+    // Count the message the live path CARRIED, ahead of the filter that decides whether the agent
+    // is shown it: a session nothing mentions is not a session whose push path is dead.
+    opts.live.recordPush(m.topic);
     if (opts.mentionFilter && !m.mentions.includes(opts.identity)) return;
     void emitChannel(server, m).catch(() => {
       // Best-effort: a dropped push is harmless; core reconciles via fetchRecent (§6).

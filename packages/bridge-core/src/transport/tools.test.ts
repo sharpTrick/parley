@@ -40,10 +40,11 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
     ({ client, plugin } = await harness());
   });
 
-  it('advertises fetch_recent, post, and reply', async () => {
+  it('advertises fetch_recent, post, reply, and live_status', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'parley_fetch_recent',
+      'parley_live_status',
       'parley_post',
       'parley_reply',
     ]);
@@ -956,6 +957,7 @@ describe('the block_ms surface', () => {
 describe('every registered tool refuses an argument it did not advertise', () => {
   const argumentsFor: Record<string, Record<string, unknown>> = {
     parley_fetch_recent: { topic: 'ctx' },
+    parley_live_status: {},
     parley_post: { topic: 'ctx', content: 'body' },
     parley_reply: { topic: 'ctx', content: 'body' },
   };

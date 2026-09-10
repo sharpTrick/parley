@@ -10,15 +10,9 @@
  * runtime import cannot see is a type-only export, so those are pinned in TYPE position below,
  * where removing one fails `npm run typecheck:test` instead.
  */
-import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import * as entry from '../src/index.js';
-import type {
-  DbErrorClass,
-  SqliteBackendConfig,
-  SubscriptionHealth,
-  SubscriptionState,
-} from '../src/index.js';
+import type { DbErrorClass, SqliteBackendConfig } from '../src/index.js';
 
 /** Every VALUE the package publishes. A name added or removed here is a release-notes obligation. */
 const PUBLISHED_VALUES = [
@@ -73,30 +67,9 @@ describe('the sqlite package publishes exactly what it says it does', () => {
    * position, so dropping one from the entry fails the package's `typecheck:test` script. A runtime
    * key check cannot reach these at all — they are erased before the module exists.
    */
-  const health = (): SubscriptionHealth => ({
-    topic: asTopic('t'),
-    state: 'live',
-    consecutiveFailures: 0,
-  });
-
   it('publishes every type an external consumer annotates against', () => {
     const cls: DbErrorClass = entry.classifyDbError(new Error('x'));
     const cfg: SqliteBackendConfig = { db_path: ':memory:' };
-    expect([health().state, cls, cfg.db_path].every((v) => v !== undefined)).toBe(true);
-  });
-
-  /**
-   * The MEMBERS of the published union, not just its name. A cast — `'healthy' as
-   * SubscriptionState` — annotates the field with a value the type does not admit, so the pin
-   * above went through with a state the poll loop can never report and would have gone through
-   * with any other. The `Record` is the compile-time half: a member added or removed fails
-   * `typecheck:test`, which is where an external consumer's `switch` would break.
-   */
-  it('publishes every state the poll loop can report, and only those', () => {
-    // The ANNOTATION is the instrument, so this case carries no runtime expect: a state added to
-    // SubscriptionState and not to this literal is a compile error, and one removed from the union
-    // leaves an excess property here. Both expects it used to carry restated the literal.
-    const STATES: Record<SubscriptionState, true> = { live: true, degraded: true, stopped: true };
-    expect(Object.keys(STATES)).not.toEqual([]);
+    expect([cls, cfg.db_path].every((v) => v !== undefined)).toBe(true);
   });
 });

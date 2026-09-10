@@ -62,9 +62,5 @@ it(POISON_RECORD_CLAUSE, async () => {
       await vi.advanceTimersByTimeAsync(INTERVAL_MS);
     },
     delivered: () => delivered.map((m) => m.content),
-    stillHealthy: {
-      report: () => plugin.subscriptionHealth(T),
-      expected: [{ topic: T, state: 'live', consecutiveFailures: 0, lastError: undefined }],
-    },
   });
 });

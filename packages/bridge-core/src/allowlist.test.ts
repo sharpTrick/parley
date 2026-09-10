@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { describe, expect, it } from 'vitest';
 import { Allowlist, allowlistFor, TopicNotAllowedError, UnsafePatternError } from './allowlist.js';
 import { MAX_POST_TOPICS, MAX_TOPIC_LEN, parseConfig } from './config.js';
+import { SeenSet } from './engine/seen-set.js';
 import { MAX_MATCH_INPUT } from './regex-safety.js';
 import { FakePlugin } from './test-support/fake-plugin.js';
 import { registerTools, toolDepsFor } from './transport/tools.js';
@@ -499,6 +500,25 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
       reaches: (h, topic) => ok(h.client, 'parley_fetch_recent', { topic }),
     },
     {
+      // Reports on the SUBSCRIBED topics only. A pattern-only topic has no live subscription to
+      // report on, and naming one here would put a caller-chosen string into an operator's report.
+      label: 'parley_live_status',
+      tool: 'parley_live_status',
+      dimension: 'EXPLICIT',
+      reaches: async (h, topic) => {
+        const answer = (await h.client.callTool({
+          name: 'parley_live_status',
+          arguments: {},
+        })) as { content: Array<{ text: string }> };
+        const report = JSON.parse(answer.content[0]!.text) as {
+          decided: boolean;
+          topics?: Array<{ topic: string }>;
+        };
+        expect(report.decided, 'the report refused, so no row could name any topic').toBe(true);
+        return (report.topics ?? []).some((row) => row.topic === topic);
+      },
+    },
+    {
       label: 'subscribe / catch-up',
       dimension: 'EXPLICIT',
       reaches: (h, topic) => Promise.resolve(h.allow.topics().some((t) => t === topic)),
@@ -515,10 +535,13 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
       identity: { handle: 'me' },
       topics: [EXPLICIT_TOPIC],
       post_topics: ['ctx-.*'],
+      // Enough for `parley_live_status` to answer at all, so its row grades WHICH topics the report
+      // names rather than the refusal every under-configured bridge gives.
+      live_push: { enabled: true },
     });
     const plugin = new FakePlugin();
     await plugin.connect({});
-    const deps = toolDepsFor(plugin, cfg);
+    const deps = toolDepsFor(plugin, cfg, { seen: new SeenSet() });
     const server = new McpServer(
       { name: 'parley', version: '0.0.0' },
       { capabilities: { tools: {} } },

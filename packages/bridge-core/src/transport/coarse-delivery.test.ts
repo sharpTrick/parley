@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
+import { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { fetchRecentBlocking } from '../engine/blocking-fetch.js';
 import { asBackendMsgId, asHandle, asTopic, type Message } from '../message.js';
@@ -60,6 +61,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
       seen,
       blockMaxMs: 60_000,
       blockPollIntervalMs: 20,
+      live: new LiveDeliveryLedger([asTopic(SUBSCRIBED)]),
     };
     registerTools(server, deps);
     const [clientT, serverT] = InMemoryTransport.createLinkedPair();
@@ -82,6 +84,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
           await startPushLoop(server, plugin, allowlist(), new SeenSet(), {
             mentionFilter: false,
             identity: asHandle('alice'),
+            live: new LiveDeliveryLedger([asTopic(SUBSCRIBED)]),
           });
           push(SUBSCRIBED, 1);
           for (const [, t] of FOREIGN_TOPIC_KINDS) push(t, 2);
@@ -142,6 +145,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
           seen,
           blockMaxMs: 60_000,
           blockPollIntervalMs: 20,
+          live: new LiveDeliveryLedger([asTopic(SUBSCRIBED)]),
         };
         registerTools(server, deps);
         const [clientT, serverT] = InMemoryTransport.createLinkedPair();

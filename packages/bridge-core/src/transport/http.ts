@@ -18,6 +18,8 @@ const REACTIVE_INSTRUCTIONS_BODY = [
   'Parley: a shared, topic-organized message backend. To catch up on a topic, call',
   'parley_fetch_recent (on session start for each topic you work in, then on demand). To answer a',
   'message, call parley_reply with the same `topic`. To publish or hand off, call parley_post.',
+  'This root receives no live push at all; parley_live_status says so rather than reporting a',
+  'health it cannot observe.',
 ];
 
 /**

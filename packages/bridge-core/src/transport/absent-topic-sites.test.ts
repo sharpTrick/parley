@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { Allowlist, TopicNotAllowedError, UnsafePatternError } from '../allowlist.js';
 import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
+import { LiveDeliveryLedger } from '../engine/live-delivery.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import * as surface from '../index.js';
@@ -202,7 +203,7 @@ const SITES: Array<[name: string, run: (fail: () => never) => Promise<Outcome>]>
           failingOn('subscribe', fail),
           new Allowlist(['ctx']),
           new SeenSet(),
-          { mentionFilter: false, identity: asHandle('alice') },
+          { mentionFilter: false, identity: asHandle('alice'), live: new LiveDeliveryLedger([]) },
         ),
       ),
   ],

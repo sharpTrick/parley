@@ -9,7 +9,7 @@ channel.
 
 - **Automated** (`test/loopback.test.ts`): an in-process MCP `Client` over `InMemoryTransport`
   stands in for Claude Code. It asserts the server advertises the `claude/channel` capability and
-  the `parley_fetch_recent` / `parley_post` / `parley_reply` tools, receives a
+  the `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_live_status` tools, receives a
   `notifications/claude/channel` event when another participant posts to the same SQLite file,
   replies durably via `parley_reply`, and confirms the fetch-recent/dedup interaction (a message
   pulled via the tool is not later re-pushed by the poll loop). Run it with:

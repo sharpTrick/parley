@@ -91,30 +91,18 @@ about one line a minute per topic, with the first hit after a successful read al
 unrecoverable damage (a corrupt file, a dropped table) stops the loop.
 
 Being quiet is not being healthy: a tick that read nothing delivered nothing, contention included,
-so every failing tick raises `consecutiveFailures` whatever its class, only a successful read clears
-it, and a run of them past the threshold **backs the loop off exponentially (to 30 s, or to
-`poll_interval_ms` when that is longer) while it keeps probing**, so the topic resumes delivering by
-itself — backing off never polls a failing store more often than a healthy one. A subscription
-failing every read can therefore never report `live` with zero failures. An **embedder** — code that
-constructs `SqlitePlugin` itself — can read that state programmatically:
+so every failing tick counts whatever its class, only a successful read clears the count, and a run
+of them past the threshold **backs the loop off exponentially (to 30 s, or to `poll_interval_ms`
+when that is longer) while it keeps probing**, so the topic resumes delivering by itself — backing
+off never polls a failing store more often than a healthy one. A subscription failing every read
+therefore delivers nothing and keeps saying so, rather than going quiet.
 
-```ts
-plugin.subscriptionHealth();
-// [{ topic: 'ctx', state: 'live' | 'degraded' | 'stopped', consecutiveFailures, lastError }]
-```
-
-There is one record per `subscribe()` call, in the order the loops were started — `subscribe()` on a
-topic already subscribed runs a second, independent loop, and reports a second record, so a
-supervisor can never read one loop's `live` for another loop that has stopped.
-
-After `disconnect()` every topic reads `stopped` rather than keeping its last live state, so a
-supervisor polling this cannot mistake a torn-down plugin for a healthy one. `connect()` refuses to
-run twice on one instance — a second one would orphan the running poll loops against the old store —
-so re-pointing an embedded plugin means `disconnect()` first, and the health map starts empty again.
-
-Under the shipped `parley-sqlite` CLI there is no route for it: the seam has no plugin-specific
-method, so **stderr is the only signal a deployed bridge emits** — capture it. Surfacing subscription
-health above the seam needs a core-owned path and is not something this plugin can add alone.
+Whether the live path is actually delivering is a question core answers, for every backend, through
+the `parley_live_status` tool — it compares what push carried against what the next
+`parley_fetch_recent` had to reconcile, so a poll loop that has stopped shows up as
+`not-delivering` in the session rather than only on a stderr stream an MCP stdio host discards.
+This plugin's own stderr lines remain the record of WHY: which topic, which error, and whether the
+loop backed off or gave up.
 
 The retention prune reports failures the same way (quiet for lock contention, a rate-limited
 stderr line otherwise), so a retention policy the process cannot enforce is never silent.

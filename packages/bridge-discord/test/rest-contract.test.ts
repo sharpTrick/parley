@@ -3,6 +3,7 @@ import {
   asCursor,
   asHandle,
   asTopic,
+  LiveDeliveryLedger,
   NoSuchTopicError,
   SeenSet,
   startPushLoop,
@@ -1144,6 +1145,7 @@ describe('Discord REST contract', () => {
             startPushLoop(target, p, new Allowlist([first, second, bad]), new SeenSet(), {
               mentionFilter: false,
               identity: asHandle('me'),
+              live: new LiveDeliveryLedger([first, second, bad].map(asTopic)),
             }),
             'one mis-mapped topic failed the whole attach',
           ).resolves.toBeUndefined();

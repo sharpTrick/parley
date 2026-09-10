@@ -6,14 +6,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openDriver, type SqlDriver } from '../src/driver.js';
 import { POLL_BATCH, SqlitePlugin } from '../src/index.js';
 import { SCHEMA, SQL } from '../src/schema.js';
-import { type ExpectedHealth, expectHealth } from './health.js';
-
 /**
  * `connect`/`disconnect` are the entire lifecycle the seam declares, and an embedder — or a future
  * core reconnect path — will call them in orders the happy path never does. Every such order has to
  * either fail loudly or fully re-establish: a half-applied connect leaves poll loops delivering into
- * a store nobody reads, and `subscriptionHealth()` is what a supervisor decides to restart on, so a
- * loop that cannot deliver must never be reported as one that can.
+ * a store nobody reads, and a torn-down one must never deliver again.
  */
 
 const T = asTopic('ctx');
@@ -214,11 +211,6 @@ describe('a lifecycle call in an unexpected order fails loudly or fully re-estab
         await new Promise((r) => setTimeout(r, 60));
         expect(got).not.toContain('probe');
       }
-
-      // The health report is only worth reading if it cannot claim a loop that just failed to
-      // deliver: nothing may say 'live' unless a post really did reach a handler.
-      const live = p.subscriptionHealth().filter((h) => h.state === 'live');
-      expect(live.length > 0).toBe(order.loopDelivers);
     });
   }
 });
@@ -286,7 +278,6 @@ describe('a connect() that fails after opening the store leaves nothing behind',
 
     expect(await attempt(() => p.post(T, me, 'orphan'))).toMatch(/not connected/);
     expect(await attempt(() => p.fetchRecent({ topic: T }))).toMatch(/not connected/);
-    expect(p.subscriptionHealth()).toEqual([]);
 
     fault.throwOnCall = 0;
     expect(await attempt(() => p.connect(cfg(dbFile())))).toBeUndefined();
@@ -512,7 +503,6 @@ describe('a lifecycle call re-entered from inside a handler decides that loop\u2
             } else {
               expect(contents).toEqual(armed(at));
             }
-            expect(p.subscriptionHealth().some((h) => h.state === 'live')).toBe(r.survives);
           } finally {
             vi.useRealTimers();
           }
@@ -522,52 +512,53 @@ describe('a lifecycle call re-entered from inside a handler decides that loop\u2
   }
 });
 
-describe('subscriptionHealth never reports a loop that cannot deliver', () => {
-  it('every live loop reads as stopped after disconnect, and stays that way', async () => {
+/**
+ * The teardown promise, graded where a supervisor feels it: a loop that has stopped must stop
+ * DELIVERING, and one that survives must keep delivering. `subscribe()` starts an independent loop
+ * per call — including a second on a topic already subscribed — so "the loops are gone" has to hold
+ * for every one of them, not for whichever the last call left behind.
+ */
+describe('a torn-down loop never delivers again, and a surviving one always does', () => {
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 60));
+
+  it('every live loop stops delivering after disconnect, and stays stopped', async () => {
+    const path = dbFile();
     const p = tracked();
-    await p.connect(cfg(dbFile()));
+    await p.connect(cfg(path));
     const got: string[] = [];
-    await p.subscribe(T, (m) => got.push(m.content));
-    await p.subscribe(asTopic('other'), () => {});
-    await p.post(T, me, 'while-live');
-    await vi.waitFor(() => expect(got).toEqual(['while-live']), { timeout: 2000, interval: 5 });
+    const elsewhere: string[] = [];
     const other = asTopic('other');
-    expectHealth(p.subscriptionHealth(), [
-      { topic: T, state: 'live', consecutiveFailures: 0 },
-      { topic: other, state: 'live', consecutiveFailures: 0 },
-    ]);
+    await p.subscribe(T, (m) => got.push(m.content));
+    await p.subscribe(other, (m) => elsewhere.push(m.content));
+    await p.post(T, me, 'while-live');
+    await p.post(other, me, 'while-live-elsewhere');
+    await vi.waitFor(() => expect(got).toEqual(['while-live']), { timeout: 2000, interval: 5 });
+    await vi.waitFor(() => expect(elsewhere).toEqual(['while-live-elsewhere']), {
+      timeout: 2000,
+      interval: 5,
+    });
 
     await p.disconnect();
 
-    const torndown: ExpectedHealth[] = [
-      { topic: T, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
-      { topic: other, state: 'stopped', consecutiveFailures: 0, lastError: /^disconnected$/ },
-    ];
-    expectHealth(p.subscriptionHealth(), torndown);
-    await new Promise((r) => setTimeout(r, 60));
-    expectHealth(p.subscriptionHealth(), torndown);
+    // A peer keeps writing to the same file, so a loop that survived teardown has rows to deliver.
+    const peer = tracked();
+    await peer.connect(cfg(path));
+    await peer.post(T, me, 'after-teardown');
+    await peer.post(other, me, 'after-teardown-elsewhere');
+    await settle();
+    expect(got).toEqual(['while-live']);
+    expect(elsewhere).toEqual(['while-live-elsewhere']);
+    await settle();
+    expect([...got, ...elsewhere]).toHaveLength(2);
   });
 
-  /**
-   * `subscribe()` starts an independent loop per call, including on a topic already subscribed. A
-   * report keyed by topic would collapse those into one record, so a supervisor could read a
-   * surviving loop's `live` for a sibling that has permanently stopped.
-   */
   for (const loops of [1, 2, 3]) {
-    it(`${loops} loop(s) on one topic report ${loops} record(s), and every one of them delivers`, async () => {
+    it(`${loops} independent loop(s) on one topic each deliver, and disconnect stops all of them`, async () => {
+      const path = dbFile();
       const p = tracked();
-      await p.connect(cfg(dbFile()));
+      await p.connect(cfg(path));
       const sinks = Array.from({ length: loops }, () => [] as string[]);
       for (const sink of sinks) await p.subscribe(T, (m) => sink.push(m.content));
-
-      const live = (state: 'live' | 'stopped'): ExpectedHealth[] =>
-        Array.from({ length: loops }, () => ({
-          topic: T,
-          state,
-          consecutiveFailures: 0,
-          ...(state === 'stopped' ? { lastError: /^disconnected$/ } : {}),
-        }));
-      expectHealth(p.subscriptionHealth(T), live('live'));
 
       await p.post(T, me, 'fan-out');
       await vi.waitFor(
@@ -576,27 +567,34 @@ describe('subscriptionHealth never reports a loop that cannot deliver', () => {
       );
 
       await p.disconnect();
-      expectHealth(p.subscriptionHealth(T), live('stopped'));
+      const peer = tracked();
+      await peer.connect(cfg(path));
+      await peer.post(T, me, 'after-teardown');
+      await settle();
+      expect(sinks).toEqual(Array.from({ length: loops }, () => ['fan-out']));
     });
   }
 
-  it('a reconnect reports nothing from the previous generation until it subscribes again', async () => {
+  it('a reconnect delivers to the new subscription only, never to the previous generation', async () => {
     const path = dbFile();
     const p = tracked();
+    const first: string[] = [];
     await p.connect(cfg(path));
-    await p.subscribe(T, () => {});
+    await p.subscribe(T, (m) => first.push(m.content));
     await p.disconnect();
 
     await p.connect(cfg(path));
-    expectHealth(p.subscriptionHealth(), []);
+    await p.post(T, me, 'between-generations');
+    await settle();
+    expect(first).toEqual([]);
 
-    const got: string[] = [];
-    await p.subscribe(T, (m) => got.push(m.content));
+    const second: string[] = [];
+    await p.subscribe(T, (m) => second.push(m.content));
     await p.post(T, me, 'second-generation');
-    await vi.waitFor(() => expect(got).toEqual(['second-generation']), {
+    await vi.waitFor(() => expect(second).toEqual(['second-generation']), {
       timeout: 2000,
       interval: 5,
     });
-    expectHealth(p.subscriptionHealth(), [{ topic: T, state: 'live', consecutiveFailures: 0 }]);
+    expect(first).toEqual([]);
   });
 });

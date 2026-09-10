@@ -12,23 +12,9 @@ import type { MessageRow } from './schema.js';
  */
 const BACKOFF_CEILING_MS = 30_000;
 
-/**
- * Live state of one topic's poll loop. `degraded` means the loop is still probing on a backed-off
- * interval and will self-heal; `stopped` means it will never deliver again without a reconnect.
- */
-export type SubscriptionState = 'live' | 'degraded' | 'stopped';
-
-export interface SubscriptionHealth {
-  topic: Topic;
-  state: SubscriptionState;
-  consecutiveFailures: number;
-  lastError?: string;
-}
-
-/** One poll loop per subscribed topic, and the health an operator reads them through. */
+/** One poll loop per subscribed topic. */
 export abstract class SqlitePoller extends SqliteRetention {
   protected readonly cancellers: Array<() => void> = [];
-  protected readonly health: SubscriptionHealth[] = [];
 
   /**
    * Live path = a per-topic poll loop (DESIGN §9, polling-only). `SELECT WHERE id > :lastSeen ASC`
@@ -47,8 +33,6 @@ export abstract class SqlitePoller extends SqliteRetention {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let diagQuietUntil = 0;
-    const health: SubscriptionHealth = { topic, state: 'live', consecutiveFailures: 0 };
-    this.health.push(health);
 
     const tick = (): void => {
       if (this.tornDown()) return;
@@ -59,33 +43,29 @@ export abstract class SqlitePoller extends SqliteRetention {
         for (const row of rows) {
           // Keep these re-checks around EVERY handler call, so that a handler which tears the
           // plugin down re-entrantly stops the loop at that row: the rest of the batch is already
-          // in memory, and the bookkeeping below would report a torn-down loop as live.
+          // in memory, and every row past teardown is delivered out of a store nobody reads.
           if (this.orphaned(generation)) return;
           lastSeen = row.id;
           safeDeliver(handler, () => rowToMessage(row, storeId));
         }
-        // Keep this check, so that a loop torn down on the batch's final row neither reports
-        // itself live below nor re-arms: `disconnect()` has already emptied the canceller list,
-        // so a timer installed past this point answers to nothing and holds the event loop open
-        // for a whole poll interval. It is the only guard on the reschedule — nothing between
-        // here and there can re-enter the lifecycle.
+        // Keep this check, so that a loop torn down on the batch's final row does not re-arm:
+        // `disconnect()` has already emptied the canceller list, so a timer installed past this
+        // point answers to nothing and holds the event loop open for a whole poll interval. It is
+        // the only guard on the reschedule — nothing between here and there can re-enter the
+        // lifecycle.
         if (this.orphaned(generation)) return;
         // Keep the immediate reschedule on a full batch, so that POLL_BATCH bounds per-tick work
         // rather than capping throughput at one batch per poll interval.
         if (rows.length === POLL_BATCH) delay = 0;
         failures = 0;
         diagQuietUntil = 0;
-        health.state = 'live';
-        health.consecutiveFailures = 0;
-        health.lastError = undefined;
       } catch (e) {
         const cls = classifyDbError(e);
         // Keep a lock-classed tick counted like every other failure — quiet only on stderr — so
-        // that a loop failing 100% of its reads on contention cannot report `live` forever: WAL +
-        // busy_timeout make lock the one class not worth a line, not a tick that read anything.
+        // that a loop failing 100% of its reads on contention cannot poll at full cadence forever:
+        // WAL + busy_timeout make lock the one class not worth a line, not a tick that read
+        // anything.
         failures++;
-        health.consecutiveFailures = failures;
-        health.lastError = errMessage(e);
         if (cls !== 'lock') {
           const now = Date.now();
           if (now > diagQuietUntil) {
@@ -97,7 +77,6 @@ export abstract class SqlitePoller extends SqliteRetention {
         }
         if (failures >= ESCALATE_AFTER) {
           if (cls === 'fatal') {
-            health.state = 'stopped';
             process.stderr.write(
               `parley-sqlite: poll loop for topic "${topic}" stopped after ${failures} ` +
                 `consecutive unrecoverable failures; live push is down for this topic\n`,
@@ -105,9 +84,8 @@ export abstract class SqlitePoller extends SqliteRetention {
             return; // do NOT reschedule
           }
           // Keep probing here, however long it takes: subscribe()'s promise has already
-          // resolved and core has no other signal, so stopping is silent, permanent loss of
-          // live push for a topic whose DB was only temporarily unreachable.
-          health.state = 'degraded';
+          // resolved, so stopping is permanent loss of live push for a topic whose DB was only
+          // temporarily unreachable.
           delay = backoffMs(this.pollIntervalMs, failures);
         }
       }
@@ -118,15 +96,6 @@ export abstract class SqlitePoller extends SqliteRetention {
       if (timer !== undefined) clearTimeout(timer);
     });
     tick();
-  }
-
-  /**
-   * Programmatic view of every poll loop this plugin has started — the path an operator or a
-   * health check reads, since stderr is routinely discarded by an MCP stdio host.
-   */
-  subscriptionHealth(topic?: Topic): SubscriptionHealth[] {
-    const all = this.health.map((h) => ({ ...h }));
-    return topic === undefined ? all : all.filter((h) => h.topic === topic);
   }
 }
 

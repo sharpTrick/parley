@@ -94,6 +94,16 @@ export const TOOL_TEXT = {
   post:
     'Publish a message into a topic on the durable backend so humans and other instances see it. ' +
     'Use this for handoffs and output. Returns { backendMsgId }.',
+  live_status:
+    'Report whether the live <channel> push path is actually DELIVERING, per subscribed topic. ' +
+    '"delivering" = messages have reached you through push since this bridge armed. ' +
+    '"not-delivering" = every message you have been handed on that topic came back from ' +
+    'parley_fetch_recent and none from push, so the live path is dead: nothing will reach you ' +
+    'until you call parley_fetch_recent, and you should say so rather than assume the topic is ' +
+    'quiet. "no-traffic" = nothing has arrived either way yet, so there is nothing to conclude. ' +
+    'A bridge configured so that it cannot tell those apart answers { decided: false } with the ' +
+    'reasons instead of guessing — it never reports health it did not observe. ' +
+    'Returns { decided, topics } or { decided, blockedBy }.',
   reply:
     'Reply into the topic a <channel> message arrived from. Pass the same `topic`. The reply is ' +
     'written durably to the backend so it survives restart and appears in the next catch-up — the ' +
@@ -252,9 +262,24 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const stored = readState.get(t);
         if (resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
       }
-      for (const m of kept) deps.seen?.markSeen(t, m.backendMsgId);
+      for (const m of kept) {
+        // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
+        // thing that distinguishes a dead live path: a message reaching the agent that push never
+        // delivered. Past `markSeen` every message looks delivered.
+        if (deps.seen?.has(t, m.backendMsgId) === false) deps.live.recordReconciled(t);
+        deps.seen?.markSeen(t, m.backendMsgId);
+      }
       return textResult({ messages: kept, nextCursor });
     },
+  );
+
+  server.registerTool(
+    'parley_live_status',
+    {
+      description: TOOL_TEXT.live_status,
+      inputSchema: z.object({}).strict(),
+    },
+    () => textResult(deps.live.report()),
   );
 
   server.registerTool(
