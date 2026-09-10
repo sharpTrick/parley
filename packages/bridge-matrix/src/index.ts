@@ -7,7 +7,7 @@ import {
 import { delay } from '@sharptrick/parley-net-util';
 import {
   configRisks, DEFAULT_HOMESERVER_URL, DEFAULT_PASSWORD, DEFAULT_SERVER_NAME,
-  type MatrixBackendConfig, syncDeadlineMs, validateConfig,
+  describeRisk, type MatrixBackendConfig, syncDeadlineMs, validateConfig,
 } from './config.js';
 import { emptyWindowCursor, requireLimit } from './cursor.js';
 import {
@@ -62,7 +62,8 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     this.sharedLocalpart = cfg.shared_room;
     this.stopped = false;
 
-    for (const risk of configRisks(cfg)) console.warn(`[parley-matrix] SECURITY: ${risk}`);
+    for (const risk of configRisks(cfg))
+      console.warn(`[parley-matrix] SECURITY: ${describeRisk(risk)}`);
 
     const path = '/_matrix/client/v3/login';
     const res = await this.http('POST', path, {

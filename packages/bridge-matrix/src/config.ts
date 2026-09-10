@@ -186,43 +186,78 @@ export function validateConfig(cfg: MatrixBackendConfig): void {
 }
 
 /**
- * Every config shape that widens this backend's trust boundary, phrased for the operator's stderr.
- * A risk documented only in the README is one an operator who copied a fixture config never sees.
- * A warning rather than a load error, because each is legitimate for a rate-limited deployment.
+ * Every `backend_config` key whose value is spent as a credential. Keep {@link configRisks} naming
+ * THIS list rather than the keys it happens to know about, so that a secret added to
+ * {@link MatrixBackendConfig} joins the plaintext-endpoint risk by existing rather than by being
+ * remembered.
  */
-export function configRisks(cfg: MatrixBackendConfig): string[] {
-  const risks: string[] = [];
-  const plaintext = plaintextRemoteOrigin(cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL);
-  if (plaintext !== undefined) {
-    risks.push(
-      `backend_config.homeserver_url ${plaintext} is plaintext http:// to a non-loopback host, so ` +
-        'the m.login.password POST carries backend_config.password across the network in the ' +
+export const SECRET_CONFIG_KEYS = ['password'] as const satisfies
+  readonly (keyof MatrixBackendConfig)[];
+export type SecretConfigKey = (typeof SECRET_CONFIG_KEYS)[number];
+
+/**
+ * A config shape that widens this backend's trust boundary, as the FACT rather than as the sentence
+ * an operator reads: which key opens the boundary, and what about that key's value opens it.
+ */
+export type ConfigRisk =
+  | { key: 'homeserver_url'; plaintextOrigin: string; exposes: readonly SecretConfigKey[] }
+  | { key: 'password'; sharedDefault: string }
+  | { key: 'shared_room'; room: string; isolatedOnlyBy: string }
+  | { key: 'room_preset'; preset: 'public_chat' };
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export function describeRisk(risk: ConfigRisk): string {
+  switch (risk.key) {
+    case 'homeserver_url':
+      return (
+        `backend_config.${risk.key} ${risk.plaintextOrigin} is plaintext http:// to a non-loopback ` +
+        'host, so the m.login.password POST carries ' +
+        `${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} across the network in the ` +
         'clear, and the access token it returns rides every later request the same way. Use ' +
-        'https:// for any remote homeserver.',
-    );
+        'https:// for any remote homeserver.'
+      );
+    case 'password':
+      return (
+        `backend_config.${risk.key} is the built-in default ('${risk.sharedDefault}'), which every ` +
+        'copy of this repo ships. Set it to a real secret; a network-reachable homeserver ' +
+        'provisioned with this password is world-readable/injectable.'
+      );
+    case 'shared_room':
+      return (
+        `backend_config.${risk.key} (${JSON.stringify(risk.room)}) folds EVERY topic into one ` +
+        `Matrix room, isolated only by the member-forgeable '${risk.isolatedOnlyBy}' event tag: ` +
+        'any member of that room can post a message tagged with any other topic. Leave ' +
+        'shared_room unset in production so each topic gets its own room.'
+      );
+    case 'room_preset':
+      return (
+        `backend_config.${risk.key} '${risk.preset}' makes every room this bridge creates joinable ` +
+        'by any account on the homeserver (and, under federation, beyond) via its guessable alias ' +
+        "— which admits readers of the topic's history and injectors of live agent events. Use the " +
+        "default 'private_chat' with backend_config.invite unless the room is deliberately open."
+      );
+  }
+}
+
+/**
+ * Every config shape that widens this backend's trust boundary, which `connect()` warns about. A
+ * risk documented only in the README is one an operator who copied a fixture config never sees. A
+ * warning rather than a load error, because each is legitimate for a rate-limited deployment.
+ */
+export function configRisks(cfg: MatrixBackendConfig): ConfigRisk[] {
+  const risks: ConfigRisk[] = [];
+  const plaintextOrigin = plaintextRemoteOrigin(cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL);
+  if (plaintextOrigin !== undefined) {
+    risks.push({ key: 'homeserver_url', plaintextOrigin, exposes: SECRET_CONFIG_KEYS });
   }
   if (cfg.password === undefined || cfg.password === DEFAULT_PASSWORD) {
-    risks.push(
-      `connecting with the built-in default password ('${DEFAULT_PASSWORD}'). Set ` +
-        'backend_config.password to a real secret; a network-reachable homeserver provisioned ' +
-        'with this password is world-readable/injectable.',
-    );
+    risks.push({ key: 'password', sharedDefault: DEFAULT_PASSWORD });
   }
   if (cfg.shared_room !== undefined) {
-    risks.push(
-      `backend_config.shared_room (${JSON.stringify(cfg.shared_room)}) folds EVERY topic into one ` +
-        `Matrix room, isolated only by the member-forgeable '${TOPIC_KEY}' event tag: any member ` +
-        'of that room can post a message tagged with any other topic. Leave shared_room unset in ' +
-        'production so each topic gets its own room.',
-    );
+    risks.push({ key: 'shared_room', room: cfg.shared_room, isolatedOnlyBy: TOPIC_KEY });
   }
   if (cfg.room_preset === 'public_chat') {
-    risks.push(
-      "backend_config.room_preset 'public_chat' makes every room this bridge creates joinable by " +
-        'any account on the homeserver (and, under federation, beyond) via its guessable alias — ' +
-        "which admits readers of the topic's history and injectors of live agent events. Use the " +
-        "default 'private_chat' with backend_config.invite unless the room is deliberately open.",
-    );
+    risks.push({ key: 'room_preset', preset: 'public_chat' });
   }
   return risks;
 }
