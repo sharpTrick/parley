@@ -37,8 +37,6 @@ and stayed past. An agent that passes a stale cursor of its own sees the window 
 does not move where the session resumes from at all. A single-writer deployment — one bridge, one
 process — has no such window at all: everything after the subscribe is its own or arrives later.
 
-`packages/bridge-sqlite/test/push-gap-reconciliation.test.ts` executes both halves.
-
 ### Cursors carry the store's identity
 
 Core's read-state outlives the database, so a `since` cursor can name a store that no longer
@@ -231,8 +229,7 @@ The driver prefers the mature native **`better-sqlite3`**, falling back to Node'
 toolchain to build one skips it and carries on instead of aborting) or because it stopped loading
 against this Node (an ABI mismatch after a major upgrade). Both are synchronous and support the
 same PRAGMAs; the plugin code
-above the driver doesn't care which one is active. `test/driver-parity.test.ts` grades **both**
-drivers on one set of assertions — pragma read-back, at-rest mode, insert-result shape and a full
+above the driver doesn't care which one is active. Both drivers are graded on one set of assertions — pragma read-back, at-rest mode, insert-result shape and a full
 seam round-trip — with the fallback forced, so that parity is a checked claim rather than a
 statement about the driver that happened to be installed. `node:sqlite` needs Node ≥ 22.5.
 
@@ -274,10 +271,9 @@ including the `concurrentPost` check: forked OS processes (`src/concurrent-write
 same file while the plugin's own `post()` writes into it, so the shipped write path is one of the
 contending processes rather than a spectator.
 
-`test/driver-parity.test.ts` grades the pragma read-back: it reads every one back off a live
-connection, on both drivers, so silently dropping one turns a test red.
-`test/multi-process.test.ts` grades what those pragmas buy, through observable consequences rather
-than through the source that sets them — the `-wal` sidecar appearing on disk, a contended write
+Every pragma is read back off a live connection, on both drivers, so silently dropping one turns a
+test red, and what those pragmas buy is graded through observable consequences rather than through
+the source that sets them — the `-wal` sidecar appearing on disk, a contended write
 retrying for the full `busy_timeout` window, `post()` waiting out a lock another OS process holds,
 and the live poll loop seeing every row other OS processes commit. It also compares the DDL produced
 by every creator of the `messages` table — the plugin and the forked writer fixture — and fails on

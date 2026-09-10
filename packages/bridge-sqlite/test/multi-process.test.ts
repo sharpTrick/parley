@@ -43,8 +43,8 @@ afterEach(async () => {
 });
 
 /**
- * Every pragma the driver sets buys a property, and what the README has to say about each is graded
- * in test/readme-claims.test.ts. What is graded here is the consequence itself, observable on disk.
+ * Every pragma the driver sets buys a property. What is graded here is the consequence itself,
+ * observable on disk, rather than the line of source that sets the pragma.
  */
 describe('driver pragmas are observable, not just set', () => {
   it('WAL is live on disk: a write materializes the -wal sidecar', () => {

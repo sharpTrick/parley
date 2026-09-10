@@ -79,9 +79,8 @@ describe('retentionCutoff resolves a window to a boundary in the past', () => {
  * row — the one decision this backend makes on a timestamp the schema calls informational. So
  * retention and the cursor disagree by construction, and the disagreement is observable: a skewed
  * peer's row is deleted while rows above AND below it in cursor order survive. Graded here because
- * it is a documented loss model, not an accident — pruning by a rowid watermark instead would turn
- * these red, which is exactly when the README paragraph in test/readme-claims.test.ts would need
- * rewriting.
+ * it is a documented loss model, not an accident. Proof it can fail: prune by a rowid watermark
+ * instead of by `ts` and these red.
  */
 describe('retention judges a row by the poster’s clock, not by its cursor position', () => {
   const WINDOW_DAYS = 1 / 24;
