@@ -265,7 +265,7 @@ export interface ConfigRisk {
 /** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
 export const describeRisk = (risk: ConfigRisk): string =>
   `backend_config.${risk.key} ${risk.origin} is plaintext http:// to a non-loopback host, so ` +
-  `every call to it carries ${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} ` +
+  `the calls this bridge sends there carry ${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} ` +
   'across the network in the clear. Use https:// for any remote endpoint.';
 
 /**
