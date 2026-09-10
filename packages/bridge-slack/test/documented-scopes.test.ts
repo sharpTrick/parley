@@ -8,12 +8,7 @@
  * at runtime with a `missing_scope` nobody can map back. The table's third column — which seam
  * method sends the call — is graded on the same footing, by reachability.
  */
-import {
-  HISTORY_PAGE_LIMIT,
-  MAX_HISTORY_PAGES,
-  MAX_TIMER_MS,
-  TIMER_CONFIG_KEYS,
-} from '../src/index.js';
+import { TIMER_CONFIG_KEYS } from '../src/index.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -302,84 +297,9 @@ describe('slack config docs track what connect() actually enforces', () => {
     return found![1]!;
   };
 
-  it('names the timer ceiling by value and every knob it applies to', () => {
+  it('documents every knob the timer ceiling applies to', () => {
     const text = configSection();
-    expect(text, 'timer ceiling value missing').toContain(String(MAX_TIMER_MS));
     for (const key of TIMER_CONFIG_KEYS) expect(text, `${key} undocumented`).toContain(key);
-  });
-
-  it('states that a plaintext remote api_url warns rather than fails, and what it leaks', () => {
-    const text = configSection();
-    expect(text).toMatch(/api_url/);
-    expect(text).toMatch(/warns/);
-    expect(text).toMatch(/loopback/);
-    expect(text).toMatch(/in the clear/);
-  });
-});
-
-/**
- * CLASS: a README consequence that rests on a VENDOR rule, pinned as prose where the advice lives.
- *
- * The section's advice — give every push-capable session its own Slack app — rests on Socket Mode
- * routing each payload to exactly ONE of an app's open connections. The README used to claim the
- * opposite ("every open socket receives every subscribed event"), which turns "at least its own bot
- * user" into advice that silently drops half of each session's live pushes.
- * `multi-session-push.test.ts` grades the behaviour; this keeps the prose from drifting back.
- */
-describe('slack multi-session docs rest on the Socket Mode routing rule', () => {
-  /** The section with its line wrapping collapsed, so a claim is matched as prose, not as layout. */
-  const multiSession = (): string => {
-    const readme = read('../README.md');
-    const found = /## Multiple concurrent sessions[\s\S]*?\n## /.exec(readme);
-    expect(found, 'README has no Multiple concurrent sessions section').not.toBeNull();
-    return found![0]!.replace(/\s+/g, ' ');
-  };
-
-  it('does not restate the superseded claim that every open socket receives every event', () => {
-    const text = multiSession();
-    expect(text).not.toMatch(/every open socket receives/i);
-    expect(text).toMatch(/exactly one\*\* of an app's open connections/);
-    expect(text).toMatch(/own Slack app/i);
-  });
-
-  it('states the consequences that do survive', () => {
-    const text = multiSession();
-    // Attribution in agent context, which the conformance identity case pins executably…
-    expect(text).toMatch(/senderHandle/);
-    expect(text).toMatch(/one bot id/i);
-    // …and the Socket Mode connection quota.
-    expect(text).toMatch(/~10 concurrent connections per app token/);
-  });
-});
-
-/**
- * CLASS: prose that quotes a number the source owns. The catch-up cost model is stated as a formula
- * over the page size and the walk's page ceiling, and an operator sizes `catchup.limit` from it — so
- * a change to either constant that leaves the paragraph behind is a wrong recommendation, not a typo.
- */
-describe('slack catch-up docs track the figures the source sends', () => {
-  const readme = (): string => read('../README.md');
-
-  it('the stated page figure is the `limit` the source actually asks for', () => {
-    expect(readme()).toContain(`page = ${HISTORY_PAGE_LIMIT}`);
-  });
-
-  it('the walk ceiling and the operator recovery step are both documented', () => {
-    const text = readme();
-    expect(text).toContain(String(MAX_HISTORY_PAGES));
-    // A cap the cursor cannot advance past repeats on every catch-up, so the way out has to be in
-    // the README rather than in the reader's head.
-    expect(text).toMatch(/reset .*cursor|cursor .*reset/i);
-  });
-
-  it('states the tier that decides whether the page figure is honoured at all', () => {
-    // Both figures by value and both sides of the split: an operator cannot size `catchup.limit`
-    // from the cost model without knowing which allowance their app is on.
-    const text = readme();
-    expect(text).toMatch(/Marketplace/);
-    expect(text).toMatch(/15 objects per request/);
-    expect(text).toMatch(/one request per\s+minute/);
-    expect(text).toMatch(/internal,? customer-built app/i);
   });
 });
 

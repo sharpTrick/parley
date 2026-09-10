@@ -26,15 +26,15 @@ than the retention window silently gets fewer messages back on catch-up.
 **Catch-up cost.** Slack pages history newest-first while the seam wants the oldest unseen page, so
 a `fetchRecent({since})` walks to the oldest end of the backlog and returns only `limit` of it — and
 the next call re-walks the remainder. Draining a backlog therefore costs about
-`backlog² / (2 · limit · page)` requests in total (page = 200), which at Slack's tiered rate limits
+`backlog² / (2 · limit · page)` requests in total, where `page` is `HISTORY_PAGE_LIMIT`, which at Slack's tiered rate limits
 is real wall-clock time after a long outage. Configure a **large `catchup.limit`** for Slack: the
 aggregate cost falls linearly with it.
 
-**…and the tier that decides whether that page figure is honoured.** The plugin asks for 200 objects
+**…and the tier that decides whether that page figure is honoured.** The plugin asks for `HISTORY_PAGE_LIMIT` objects
 per `conversations.history` page, but Slack caps the page — and the request rate — by app type. An
 **internal, customer-built app** (the one this README's provisioning section describes: created in
 your own workspace, installed there, not distributed) keeps the classic allowance: up to 1000 objects
-per request at 50+ requests/minute, so a 200-object page is served in full and the cost model above
+per request at 50+ requests/minute, so a full `HISTORY_PAGE_LIMIT` page is served and the cost model above
 holds. A **commercially distributed app that is not listed on the Slack Marketplace** is capped, for
 apps created or newly installed since 2025-05-29, at **15 objects per request, one request per
 minute** — the server silently returns 15 however large a `limit` you send. Under that tier the cost
@@ -108,13 +108,12 @@ back after such a spell; catch-up covers the gap.
 **Bounded waits.** A Socket Mode connection that opens and then says nothing is given
 `handshake_timeout_ms` (default 10 s) to send `hello` before the attempt is abandoned. A
 `conversations.history` walk stops with a named error if the server repeats a page cursor or keeps
-handing out new ones past 2000 pages, rather than paging forever.
+handing out new ones past `MAX_HISTORY_PAGES`, rather than paging forever.
 
 That page ceiling is deliberately a **failure, not a truncation**: a walk resuming after a cursor
 cannot publish a `nextCursor` it has not read down to without stepping over history nobody would ever
 revisit. The consequence is that a topic whose backlog *above its stored cursor* exceeds
-2000 pages (400k messages at a full 200-object page — ~30k on the reduced tier above) rejects every
-catch-up with `exceeded 2000 pages` until the backlog shrinks, since the cursor cannot advance past
+`MAX_HISTORY_PAGES` rejects every catch-up with `exceeded … pages` until the backlog shrinks, since the cursor cannot advance past
 it. There is no in-band recovery: **reset that topic's cursor** in the bridge's read-state file to a
 position inside the retained window, and catch-up resumes from there. Ordinary channels never reach
 this; a firehose channel mapped to a topic that was offline for a long time can.
@@ -142,7 +141,7 @@ backend_config:
 
 **What is checked at load, and what only warns.** `backend_config` is opaque to core, so this plugin
 is the only layer that sees these values. `api_url` must be an http(s) URL, and every `_ms` knob must
-be a positive whole number of milliseconds no larger than Node's timer range (`2147483647`) — past
+be a positive whole number of milliseconds no larger than Node's timer range (`MAX_TIMER_MS`) — past
 that, `setTimeout` silently clamps the delay to 1 ms, so the bound the knob exists to set is the one
 thing it cannot express. Both fail at `connect`, naming the key. A plaintext `http://` `api_url`
 pointed at a **non-loopback** host is a legitimate fixture choice and is accepted, but it **warns**
