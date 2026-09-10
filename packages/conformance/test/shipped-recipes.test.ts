@@ -133,6 +133,11 @@ describe('a docker recipe this repository ships is not insecure by default', () 
         recipe.command,
         'host networking publishes every port the container listens on, whatever -p says',
       ).not.toMatch(/--net(?:work)?[= ]host\b/);
+      expect(
+        recipe.command,
+        'publish-all maps every EXPOSEd port to a random host port on every interface, which no ' +
+          '-p rule above can see',
+      ).not.toMatch(/(?:^|\s)(?:-P|--publish-all)(?:\s|$)/);
     },
   );
 
