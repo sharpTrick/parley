@@ -1,4 +1,4 @@
-import { asTopic, type Topic } from '@sharptrick/parley-core';
+import { asTopic, DEFAULT_HASH_LEN, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { legalStreamName, legalSubject, SUBJECT_ILLEGAL, STREAM_ILLEGAL } from './helpers.js';
@@ -81,5 +81,29 @@ describe('nats topic fold — every illegal character composes a legal name', ()
       }
     }
     expect(collisions).toEqual([]);
+  });
+});
+
+/**
+ * The four shapes the fold produces, one per rule it applies: a legal topic passed through, a
+ * legal-but-dotted one folded and disambiguated, one whose `/` a stream name cannot carry but a
+ * subject can, and one with a space. `DEFAULT_HASH_LEN` is read from core, so narrowing the suffix
+ * moves these rows rather than leaving them grading the old width.
+ */
+describe('nats topic fold — the shape each rule produces', () => {
+  const asPattern = (shape: string): RegExp =>
+    new RegExp(
+      `^${shape.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('<sha1>', `[0-9a-f]{${DEFAULT_HASH_LEN}}`)}$`,
+    );
+
+  it.each([
+    ['a legal topic, passed through', 'deploys', 'parley.deploys', 'PARLEY_deploys'],
+    ['a dot, legal in a subject and not in a stream name', 'team.chat', 'parley.team_chat-<sha1>', 'PARLEY_team_chat-<sha1>'],
+    ['a slash, legal in a subject only', 'ops/oncall', 'parley.ops/oncall', 'PARLEY_ops_oncall-<sha1>'],
+    ['a space, legal in neither', 'red team', 'parley.red_team-<sha1>', 'PARLEY_red_team-<sha1>'],
+  ])('%s', (_label, topic, subject, stream) => {
+    const actual = names(asTopic(topic));
+    expect(actual.subject).toMatch(asPattern(subject));
+    expect(actual.stream).toMatch(asPattern(stream));
   });
 });
