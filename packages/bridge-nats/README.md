@@ -180,7 +180,8 @@ Runnable multi-config examples (two Code sessions + a remote/chat config, all sh
 Use the **official `nats` Docker image** (not authored here); JetStream is a single flag:
 
 ```bash
-docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
+docker run -d --name parley-nats -p 127.0.0.1:4222:4222 nats:2.10-alpine \
+  -js --user parley --pass "$NATS_PASSWORD"
 ```
 
 (or the maintainer dev harness: `examples/dev-compose/`.)
@@ -204,8 +205,9 @@ Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to 
 ## Conformance
 
 ```bash
-docker run -d --name parley-nats -p 4222:4222 nats:2.10-alpine -js
-npm test   # the shared @sharptrick/parley-conformance suite runs green against NATS
+docker run -d --name parley-nats -p 127.0.0.1:4222:4222 nats:2.10-alpine \
+  -js --user parley --pass "$NATS_PASSWORD"
+PARLEY_NATS_SERVERS="nats://parley:$NATS_PASSWORD@127.0.0.1:4222" npm test   # the shared @sharptrick/parley-conformance suite
 ```
 
 `PARLEY_NATS_SERVERS` overrides the servers; the suite skips itself if no server is reachable.

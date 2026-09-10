@@ -183,7 +183,7 @@ into the model's context, so the driver's full text goes to stderr for the opera
 Use the **official `postgres` Docker image** (not authored here):
 
 ```bash
-docker run -d --name parley-postgres -p 5432:5432 \
+docker run -d --name parley-postgres -p 127.0.0.1:5432:5432 \
   -e POSTGRES_USER=parley -e POSTGRES_PASSWORD="$(openssl rand -hex 16)" -e POSTGRES_DB=parley \
   postgres:16-alpine
 ```
