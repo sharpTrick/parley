@@ -82,9 +82,10 @@ export {
  * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend conforms
  * when it holds FOUR things: a stable-unique backendMsgId; monotonic, in-order, exclusive-`since`
  * cursor delivery; a live path that delivers only a subset of the post-subscribe tail; and a live
- * path that delivers at all. The first two alone are not conformance — a plugin registering no
- * listener satisfies both and fails 10 of these cases. Write once here; run against every backend
- * via {@link BackendFactory}.
+ * path that delivers at all. The first two alone are not conformance: stub `subscribe` out to
+ * register no listener and only the SUBSET clause still passes — the delivery floors, the
+ * quiet-topic floor, topic isolation, every handler-fault row and disconnect all red. Write once
+ * here; run against every backend via {@link BackendFactory}.
  */
 export function runConformanceSuite(name: string, factory: BackendFactory): void {
   describe(`seam conformance: ${name}`, () => {
