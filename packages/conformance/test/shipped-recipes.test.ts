@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { relative } from 'node:path';
-import { filesUnder, workspaceRoot } from '@sharptrick/parley-net-util/testing';
+import { derivedRows, filesUnder, workspaceRoot } from '@sharptrick/parley-net-util/testing';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -17,7 +17,9 @@ import { describe, expect, it } from 'vitest';
  * document set is the walk, so a README added tomorrow is covered the day it lands.
  *
  * Proof it can fail: drop `127.0.0.1:` from any recipe's `-p` and the exposure rows red; drop
- * `--requirepass` from the redis recipe and the credential rows red.
+ * `--requirepass` from the redis recipe and the credential rows red; blind the extractor, wholly
+ * or to one recipe per document, and `derivedRows` reds on the count its second walk disagrees
+ * with rather than quietly registering fewer rows.
  */
 
 const REPO = workspaceRoot();
@@ -105,21 +107,21 @@ const publishedPorts = (command: string): string[] =>
 
 const LOOPBACK_SCOPED = /^(?:127\.0\.0\.1|localhost|\[::1\]):/;
 
-const recipes = shippedRecipes();
+/** The same fenced text counted a FLAT way, so an extractor that stops seeing a line is not the
+ * thing that decides how many recipes there are. */
+const mentionCount = (): number =>
+  filesUnder(REPO, ['.md'])
+    .flatMap((file) => fencedBlocks(readFileSync(file, 'utf8')))
+    .reduce((n, block) => n + [...block.matchAll(/docker run/g)].length, 0);
 
 describe('a docker recipe this repository ships is not insecure by default', () => {
-  it('finds the recipes, and finds every one the documents hold', () => {
-    expect(recipes.length, 'no shipped recipe found at all, so every row below is empty')
-      .toBeGreaterThan(0);
-    // Counted a second way — a flat scan of the same fenced text — so an extractor that quietly
-    // stopped seeing a line fails here instead of shrinking the table it feeds.
-    const mentioned = filesUnder(REPO, ['.md'])
-      .flatMap((file) => fencedBlocks(readFileSync(file, 'utf8')))
-      .reduce((n, block) => n + [...block.matchAll(/docker run/g)].length, 0);
-    expect(recipes.length).toBe(mentioned);
-  });
+  const rows = derivedRows(
+    'every docker recipe a shipped document holds',
+    () => shippedRecipes().map((r): [string, Recipe] => [`${r.doc}: ${r.command}`, r]),
+    { floor: 3, witness: ['packages/bridge-redis/README.md'], size: mentionCount },
+  );
 
-  it.each(recipes.map((r): [string, Recipe] => [`${r.doc}: ${r.command}`, r]))(
+  it.each(rows)(
     'publishes nothing past loopback — %s',
     (_label, recipe) => {
       for (const spec of publishedPorts(recipe.command)) {
@@ -134,7 +136,7 @@ describe('a docker recipe this repository ships is not insecure by default', () 
     },
   );
 
-  it.each(recipes.map((r): [string, Recipe] => [`${r.doc}: ${r.command}`, r]))(
+  it.each(rows)(
     'starts a server that demands a credential — %s',
     (_label, recipe) => {
       const parsed = parseRecipe(recipe.command);
@@ -155,7 +157,7 @@ describe('a docker recipe this repository ships is not insecure by default', () 
     },
   );
 
-  it.each(recipes.map((r): [string, Recipe] => [`${r.doc}: ${r.command}`, r]))(
+  it.each(rows)(
     'names no literal secret — %s',
     (_label, recipe) => {
       const literal =
