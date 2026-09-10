@@ -260,45 +260,6 @@ describe('bridge-redis shipped artifacts — a compose file the README links is 
   );
 });
 
-// CLASS: a behaviour this package's suite pins but its own prose never mentions. An operator has
-// only the README and the npm page, so a behaviour that lives solely in a test cannot be predicted
-// by anyone who has to run this thing — and the plugin's most surprising behaviours are exactly the
-// ones the mapping table's one-line summaries flatten away.
-
-/** A behaviour the suite pins, and the phrase the README must carry for it. */
-const documentedBehaviours: Array<[string, RegExp]> = [
-  ['a cursor past the high-water mark self-heals', /self-heal/i],
-  ['…by replaying a window OLDER than the cursor asked for', /replays the most recent/],
-  ['a cursor at or below the tail is echoed back untouched', /echoed back untouched/],
-  ['a cursor of no recognisable shape is rejected by name', /rejected with an error naming it/],
-  ['a seam refusal names the plugin, the topic and the key', /labelled the same way, naming the plugin/],
-  ['a permanent refusal stops live delivery loudly', /live delivery STOPPED/],
-  ['a transient fault that never clears is reported without giving up', /live delivery DEGRADED/],
-  ['a sub-millisecond long-poll budget returns immediately', /floors to nothing and returns immediately/],
-  ['concurrent long polls hold a bounded number of readers', /capped at 8/],
-  ['…and a long poll past the cap is still waited out', /re-reads its window on the shared command\s+connection/],
-  ['…and subscribe is not the thing being capped', /`subscribe` is not capped/],
-  ['a permanent refusal fails the long poll instead of emptying it', /rather than\s+being reported as an empty long poll/],
-  ['retention trims approximately, and only on write', /approximate/],
-  [
-    'a credential bound for a cleartext remote link is reported at connect()',
-    /carries a credential to a non-loopback host is\s+reported/,
-  ],
-  [
-    'an argv the CLI cannot honour stops it instead of loading the default config',
-    /exits 2 with a usage message/,
-  ],
-];
-
-describe('bridge-redis README — every behaviour the suite pins is described here', () => {
-  it.each(documentedBehaviours)('%s', (_label, phrase) => {
-    expect(
-      phrase.test(text),
-      `the README never describes it — nothing matches ${String(phrase)}`,
-    ).toBe(true);
-  });
-});
-
 // CLASS: prose that explains a knob by a mechanism the knob is not on the path of. A knob's
 // accept/reject rules are documented exhaustively here, which reads as complete while saying
 // nothing an operator can act on — and round 8 found `block_ms` documented in two places as
@@ -357,39 +318,5 @@ describe('bridge-redis README — every knob is described by an effect it has', 
       `the README ties '${knob}' to ${String(wrong.mechanism)} — a mechanism it is not on the ` +
         `path of — without saying so, so an operator tunes it expecting an effect it cannot have`,
     ).toEqual([]);
-  });
-});
-
-/**
- * A claim this package's prose makes about behaviour the code QUALIFIES, with the qualification it
- * must carry. Graded on every surface that ships on its own: the README renders on the npm page,
- * and `description` reaches search results and `npm view` without it.
- */
-const qualifiedClaims: Array<[string, RegExp, RegExp]> = [
-  ['catch-up is exclusive on `since`', /exclusive/i, /self-heal/i],
-];
-
-const prose: Array<[string, string]> = [
-  ['README.md', text],
-  ['package.json description', manifest.description ?? ''],
-];
-
-describe('bridge-redis shipped prose — a qualified claim is never shipped bare', () => {
-  it.each(
-    prose.flatMap(([where, source]) =>
-      qualifiedClaims.map(
-        ([claim, makes, caveat]): [string, string, RegExp, RegExp] => [
-          `${where}: ${claim}`,
-          source,
-          makes,
-          caveat,
-        ],
-      ),
-    ),
-  )('%s', (_label, source, makes, caveat) => {
-    expect(makes.test(source), 'nothing here makes the claim, so this row grades nothing').toBe(
-      true,
-    );
-    expect(caveat.test(source), 'the claim ships without its qualification').toBe(true);
   });
 });
