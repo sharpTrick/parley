@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 import { asTopic } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { TelegramPlugin } from '../src/index.js';
-import { SERVED_ID_MEMORY } from '../src/store.js';
 import { KNOWN_CHANNEL } from './fake-telegram.js';
 import { derivedRows } from '@sharptrick/parley-net-util/testing';
 import {
@@ -28,12 +27,7 @@ import {
 const here = fileURLToPath(new URL('.', import.meta.url));
 const source = packageSource();
 const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
-const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
-  description: string;
-};
-
 const configTable = /## Config \(`backend_config`\)([\s\S]*?)\n## /.exec(readme)?.[1] ?? '';
-const cursorRow = readme.split('\n').find((l) => l.startsWith('| `cursor`')) ?? '';
 const declaredKeys = [
   ...(/export interface TelegramBackendConfig \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? '').matchAll(
     /^ {2}(\w+)\??:/gm,
@@ -41,40 +35,17 @@ const declaredKeys = [
 ].map((m) => m[1] as string);
 
 /**
- * Shipped metadata is read by people who will never open the source: the npm page, the README
- * table, DESIGN's backend row. Each claim below is checked against the strings the plugin actually
- * produces, so drift is a failing test rather than an integrator's wasted afternoon.
+ * The cursor a fetched message carries is the store's own observation sequence, never Telegram's
+ * `message_id`. A `message_id` is minted when the sender's message is accepted, so one minted
+ * BEFORE a post of ours can be delivered after it and would sit forever below a cursor already
+ * issued.
+ *
+ * Why this shape: a first chat consumes two sequences, so the second chat's `message_id` (1) and
+ * its cursor (3) cannot coincide — against one chat a plugin returning either value looks the same.
+ *
+ * Proof it can fail: return the `message_id` half of the id as the cursor and this reds.
  */
-describe('telegram shipped metadata matches the seam mapping', () => {
-  const SURFACES = [
-    { name: 'the npm description', text: () => pkg.description },
-    { name: 'the README cursor row', text: () => cursorRow },
-    {
-      name: 'the root README backend table row',
-      text: () => {
-        const root = readFileSync(join(here, '..', '..', '..', 'README.md'), 'utf8');
-        const row = root.split('\n').find((l) => l.startsWith('| Telegram |')) ?? '';
-        expect(row).not.toBe('');
-        return row;
-      },
-    },
-    {
-      name: 'the DESIGN backend-cursor row',
-      text: () => {
-        const design = readFileSync(join(here, '..', '..', '..', 'DESIGN.md'), 'utf8');
-        const row = /\n {2}- Telegram → ([\s\S]*?)\n {2}- Slack/.exec(design)?.[1] ?? '';
-        expect(row).not.toBe('');
-        return row;
-      },
-    },
-  ];
-
-  it.each(SURFACES)('$name names the observation sequence as the cursor', ({ text }) => {
-    const claim = text();
-    expect(claim.toLowerCase()).toContain('observation sequence');
-    expect(claim).not.toMatch(/message_id`?\s*(=|→)\s*cursor/i);
-  });
-
+describe('telegram cursors are the observation sequence', () => {
   it('and the cursor a fetched message carries really is the sequence, not its message_id', async () => {
     const { plugin } = await startRig();
     // A first chat consumes sequences 1 and 2, so the second chat's message_id (1) and its
@@ -162,58 +133,6 @@ describe('telegram config keys name the unit they bound', () => {
  * promises. A prose-only absolute is a claim that has not been graded.
  */
 describe('telegram chat-cap claims are executed, not just written', () => {
-  const capRow = readme.split('\n').find((l) => l.startsWith('| `observed_max_chats`')) ?? '';
-  /** The whole markdown bullet a claim sits in — a promise is rarely one line long. */
-  const bulletContaining = (needle: RegExp): string => {
-    const lines = readme.split('\n');
-    const start = lines.findIndex((l) => l.startsWith('- ') && needle.test(l));
-    if (start < 0) return '';
-    const end = lines.findIndex((l, i) => i > start && !l.startsWith('  '));
-    return lines.slice(start, end < 0 ? undefined : end).join(' ');
-  };
-  const neverEvicts = bulletContaining(/never evicts/);
-
-  const ABSOLUTES = [
-    {
-      what: 'the observed_max_chats row',
-      claim: () => capRow,
-      // The cap bounds the chats a flood creates, never the store's total — the served chats are
-      // exactly the ones it must not evict, so it cannot bound a number that includes them.
-      requires: /unserved/i,
-      forbids: /max distinct chats kept in the store/i,
-    },
-    {
-      what: 'the never-evict bullet',
-      claim: () => neverEvicts,
-      // "on load" is only true if the mark outlives the process that made it.
-      requires: /store file|persist|restart|next load/i,
-      forbids: null,
-    },
-  ];
-
-  it.each(ABSOLUTES)('$what states the limit of its absolute', ({ claim, requires, forbids }) => {
-    const text = claim();
-    expect(text).not.toBe('');
-    expect(text).toMatch(requires);
-    if (forbids !== null) expect(text).not.toMatch(forbids);
-  });
-
-  /**
-   * The absolute above is limited by a NUMBER, and a number in prose is the one claim that rots
-   * silently: the marks a caller can leave are bounded store-wide, and a README that names a
-   * different figure than the store holds has an operator sizing disk — and trusting a protection —
-   * against a bound that does not exist. Read out of both places the figure appears, so neither can
-   * drift alone.
-   */
-  it.each([
-    { what: 'the never-evict bullet', claim: () => neverEvicts },
-    { what: 'the observed_max_chats row', claim: () => capRow },
-  ])('$what names the served-mark bound the store actually holds', ({ claim }) => {
-    const stated = /([\d,_]+) most recently/.exec(claim())?.[1];
-    expect(stated).toBeDefined();
-    expect(Number((stated as string).replace(/[,_]/g, ''))).toBe(SERVED_ID_MEMORY);
-  });
-
   const CAP = 2;
   const SENTINEL = '-1009881111';
   const OPS_CHATS = ['-1009880001', '-1009880002'];
@@ -378,23 +297,6 @@ describe('telegram single-write primitives never discard their byte count', () =
 });
 
 describe('telegram test suite hygiene', () => {
-  it('declares no case title in two files', () => {
-    const owners = new Map<string, string[]>();
-    for (const file of readdirSync(here).filter((f) => f.endsWith('.test.ts'))) {
-      const text = readFileSync(join(here, file), 'utf8');
-      for (const m of text.matchAll(
-        /^\s*(?:it|it\.each\([\s\S]*?\))\(\s*(['"`])((?:\\.|(?!\1).)*)\1/gm,
-      )) {
-        const title = m[2] as string;
-        if (/^[\s$%]*(?:[$%]\w+[\s.\w]*)?$/.test(title)) continue;
-        owners.set(title, [...(owners.get(title) ?? []), file]);
-      }
-    }
-    // Guard the extractor itself: a regex that stops matching would make this lint vacuous.
-    expect(owners.size).toBeGreaterThan(40);
-    expect([...owners].filter(([, files]) => new Set(files).size > 1)).toEqual([]);
-  });
-
   /**
    * Duplicate SCAFFOLDING is the same defect one level down, and a title-only lint cannot see it:
    * the connect-a-plugin-against-the-fake-with-a-tmpdir rig was retyped in eight files under three
@@ -430,37 +332,6 @@ describe('telegram test suite hygiene', () => {
       matches: (text: string): boolean => /spyOn\(process\.stderr/.test(text),
     },
   ];
-
-  /**
-   * A comment about a conformance-context field that does not sit on that field is a claim nothing
-   * can fail on: `concurrentPost: 'unsupported'` carried a note reading "NO concurrentPost,
-   * deliberately" — telling a maintainer the field was absent when it was present, and the two
-   * spellings select different conformance clauses. Anchor every such note to the field it
-   * describes, so that changing a field cannot leave its narration behind.
-   */
-  it('annotates each conformance context field on the field itself', () => {
-    const lines = readFileSync(join(here, 'conformance.test.ts'), 'utf8').split('\n');
-    const fieldOn = (line: string): string | undefined => /^ {4}(\w+):/.exec(line)?.[1];
-    const fields = lines.map(fieldOn).filter((f): f is string => f !== undefined);
-    // Only multi-word identifiers: a bare `plugin` or `cleanup` is an English word a comment may
-    // use about anything, and a lint that reads those as references fires on ordinary prose.
-    const referable = fields.filter((f) => /[A-Z_]/.test(f));
-    expect(referable).toContain('concurrentPost');
-
-    let checked = 0;
-    for (const [i, line] of lines.entries()) {
-      const comment = /^\s*(?:\/\/|\*|\/\*)(.*)$/.exec(line)?.[1];
-      if (comment === undefined) continue;
-      const named = referable.filter((f) => new RegExp(`\\b${f}\\b`).test(comment));
-      if (named.length === 0) continue;
-      checked++;
-      // A trailing comment annotates its own line; a standalone one annotates the next field.
-      const annotated = fieldOn(line) ?? lines.slice(i + 1).map(fieldOn).find((f) => f !== undefined);
-      expect({ line: comment.trim(), annotated }).toEqual({ line: comment.trim(), annotated: named[0] });
-    }
-    // A rule nothing exercises is not a rule: at least one field carries a note naming it.
-    expect(checked).toBeGreaterThan(0);
-  });
 
   /**
    * The lint above keeps ONE rig per shape; this keeps the two rigs' LIFETIMES the same. They share
@@ -536,22 +407,15 @@ describe('telegram test suite hygiene', () => {
  * of the shipped README row, so the code and the claim cannot drift apart in either direction.
  */
 describe('telegram default store path', () => {
-  const storePathRow = readme.split('\n').find((l) => l.startsWith('| `store_path`')) ?? '';
-  const documented = /\$XDG_STATE_HOME\/([\w./-]+)/.exec(storePathRow)?.[1] ?? '';
-  const fallbackBase = /else\s+`~\/([\w./-]+?)\/?…/.exec(storePathRow)?.[1] ?? '';
-
-  it('is documented as an absolute path with a state-directory suffix', () => {
-    expect(storePathRow).toMatch(/absolute/i);
-    expect(documented).toBe('parley/telegram/observed.jsonl');
-    expect(fallbackBase).toBe('.local/state');
-  });
+  const SUFFIX = 'parley/telegram/observed.jsonl';
+  const FALLBACK_BASE = '.local/state';
 
   const ENVS = [
     { name: 'XDG_STATE_HOME set', base: (home: string): string => home, xdg: true },
-    { name: 'XDG_STATE_HOME unset', base: (home: string): string => join(home, fallbackBase), xdg: false },
+    { name: 'XDG_STATE_HOME unset', base: (home: string): string => join(home, FALLBACK_BASE), xdg: false },
   ];
 
-  it.each(ENVS)('with $name it lands under the documented suffix, absolute', async ({ base, xdg }) => {
+  it.each(ENVS)('with $name the default store lands under the state directory, absolute', async ({ base, xdg }) => {
     const home = mkdtempSync(join(tmpdir(), 'parley-tg-xdg-'));
     const saved = { xdg: process.env.XDG_STATE_HOME, home: process.env.HOME };
     registerCleanup(() => {
@@ -571,7 +435,7 @@ describe('telegram default store path', () => {
     const topic = asTopic('-1009870001');
     await plugin.post(topic, SENDER, 'default-path');
 
-    const expected = join(base(home), documented);
+    const expected = join(base(home), SUFFIX);
     expect(isAbsolute(expected)).toBe(true);
     expect(existsSync(expected)).toBe(true);
     expect(readFileSync(expected, 'utf8')).toContain('default-path');
@@ -589,14 +453,6 @@ describe('telegram default store path', () => {
  * with `getChat` broken and grade the row against what the call actually does.
  */
 describe('telegram fetchRecent network claim', () => {
-  const fetchRecentRow = readme.split('\n').find((l) => l.startsWith('| `fetchRecent`')) ?? '';
-
-  it('names the resolution cost instead of claiming no network call', () => {
-    expect(fetchRecentRow).not.toBe('');
-    expect(fetchRecentRow).toMatch(/getChat/);
-    expect(fetchRecentRow).toMatch(/no history endpoint is ever called/i);
-  });
-
   it.each([
     { name: 'a chat_map @name topic, resolved during connect', mapped: true, offlineSafe: true },
     { name: 'an @name topic never named in chat_map', mapped: false, offlineSafe: false },

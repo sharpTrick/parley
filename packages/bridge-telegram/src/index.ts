@@ -38,6 +38,7 @@ import {
 } from './wire.js';
 
 export type { TelegramBackendConfig } from './config.js';
+export { SERVED_ID_MEMORY } from './store.js';
 
 /**
  * Telegram Bot API backend (DESIGN §6/§9) — spoken to via the raw HTTP API with the global

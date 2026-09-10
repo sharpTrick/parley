@@ -67,7 +67,7 @@ everything delivered by `getUpdates`. Consequences:
   name are chosen by the caller, so the marks they leave are held to a store-wide **1000**, newest
   named last.
 - The chat cap **never evicts a chat this bridge serves** — one a `chat_map` entry resolves to,
-  or one of the **1000 most recently** named by a seam call — on load or at runtime. A new unserved
+  or one of the most recently named by a seam call (`SERVED_ID_MEMORY` of them) — on load or at runtime. A new unserved
   chat displaces the least recently active *unserved* chat instead, so a bot added to a flood of
   groups cannot crowd out your own topics or starve them of admission. That protection is **written
   into the store file**, so a chat a seam call named in one run is still protected at the next load,
@@ -132,7 +132,7 @@ store's dedup makes the replay harmless.
 | `chat_map`       | _(empty)_                  | Parley topic → chat id (numeric or `@channelusername`). Unmapped topics are used as the chat id literal. |
 | `observed_retention_per_chat` | `10000`       | Newest-N observed records kept **per chat**, enforced on load *and* on every append; the file is compacted when records are evicted. Bounds how deep `fetchRecent` can replay — see **History limitations**. A positive integer: an out-of-domain value is a load error rather than a silent fall back to the default. |
 | `observed_retention_per_topic` | _(unset)_   | Deprecated spelling of `observed_retention_per_chat` — the bound is per chat, and `chat_map` can give one chat two topic names. Still honoured; the new key wins when both are set. |
-| `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or one of the 1000 most recently named by a seam call — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
+| `observed_max_chats` | `1000`                 | Max **unserved** chats kept in the store; a positive integer, validated like the retention bound above. Chats this bridge serves (a `chat_map` entry, or one of the most recently named by a seam call, `SERVED_ID_MEMORY` of them — a mark that is persisted with the store) are never evicted and are retained *on top of* this cap, so it bounds the chats anyone-can-add-the-bot traffic creates, not the store's total. Unserved chats displace each other least-recently-active first once the cap is reached. |
 
 Every key is checked before anything is dialled, and an **unknown key is a load error** naming
 the accepted set — a misspelled `chat_maps` would otherwise be dropped in silence, leaving
