@@ -79,12 +79,12 @@ a fallback — whichever of the two states the longer wait is the one waited, so
 
 | what the 429 carries | what the call does |
 | -------------------- | ------------------ |
-| no usable hint       | waits the shared default of **500 ms**. Nothing here clamps a wait. |
+| no usable hint       | waits net-util's shared `DEFAULT_BACKOFF_MS`. Nothing here clamps a wait. |
 | a stated hint        | waits it **in full**, however long Discord asked for. Retrying sooner than the vendor asked is what turns a rate limit into a ban. |
 | both a header and a body hint | waits **the longer of the two**, in either order. |
-| a hint longer than the call's remaining budget (**30000 ms**) | the call **fails** with an error naming both numbers instead of sleeping past its budget. Nothing is retried. |
+| a hint longer than the call's remaining budget (`DEFAULT_DEADLINE_MS`) | the call **fails** with an error naming both numbers instead of sleeping past its budget. Nothing is retried. |
 
-Discord's *global* rate limits routinely ask for longer than 30000 ms. When one lands, the tool
+Discord's *global* rate limits routinely ask for longer than that budget. When one lands, the tool
 call comes back as an error in the model's context rather than parking the session — this plugin
 does not expose a per-call deadline override, so the operator fix is to reduce the load on the bot
 token (fewer concurrent bridge instances sharing it, or a token per session) rather than to wait

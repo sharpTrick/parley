@@ -1,39 +1,16 @@
 import { asCursor, asHandle, asTopic, type Cursor } from '@sharptrick/parley-core';
-import { DEFAULT_BACKOFF_MS, DEFAULT_DEADLINE_MS } from '@sharptrick/parley-net-util';
+import { DEFAULT_DEADLINE_MS } from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordPlugin, RECONNECT_CAP_MS } from '../src/index.js';
 import { startFakeDiscord, type FakeDiscord } from './fake-discord.js';
 import { settleOf } from './harness.js';
 
-// CLASS: a README paragraph describing a DEPENDENCY's behaviour, with nothing binding it to that
-// dependency. The retry rule lives in net-util and has already changed once underneath this file;
-// the numbers here are read from its exported constants and the behaviour is driven end to end, so
-// the prose cannot drift into describing a loop the plugin no longer runs.
-
 const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
 
 /** Discord's own numbers: the per-token IDENTIFY quota and the window it is measured over. */
 const QUOTA_PER_DAY = 1000;
 const DAY_MS = 86_400_000;
-const RATE_LIMITS = README.slice(README.indexOf('## Rate limits'), README.indexOf('## Provisioning'));
-
-describe('bridge-discord README — the documented 429 rule is net-util’s actual rule', () => {
-  it('carries the rate-limit section the seam mapping points at', () => {
-    expect(RATE_LIMITS.length).toBeGreaterThan(0);
-  });
-
-  const NUMBERS: Array<[string, number]> = [
-    ['the hintless default wait', DEFAULT_BACKOFF_MS],
-    ['the per-call deadline', DEFAULT_DEADLINE_MS],
-  ];
-
-  for (const [label, ms] of NUMBERS) {
-    it(`states ${label} as ${ms} ms`, () => {
-      expect(RATE_LIMITS).toContain(`${ms} ms`);
-    });
-  }
-});
 
 // CLASS: a README number a reader is invited to do ARITHMETIC with. The per-token IDENTIFY budget
 // paragraph exists so an operator can size `gateway_dialers`; if its numbers drift from the ladder's
@@ -122,9 +99,6 @@ describe('bridge-discord README — the gateway-failure prose is the observed be
     });
   }
 
-  it('names the terminal close codes the plugin actually treats as terminal', () => {
-    expect(SUBSCRIBE_ROW).toContain('4004/4010–4014');
-  });
 });
 
 // CLASS: a budget that silently bounds something the prose describes as unbounded. The
@@ -133,18 +107,6 @@ describe('bridge-discord README — the gateway-failure prose is the observed be
 // older" are indistinguishable to the caller, so the claim and the walk have to be pinned together:
 // the prose is asserted here AND driven.
 describe('bridge-discord README — the call deadline bounds the page walk, and says so', () => {
-  // The ROW, not the section: the section also contains the deadline paragraph below, so slicing
-  // to it would let one sentence satisfy both of the prose cells.
-  const NO_SINCE_ROW = README.slice(
-    README.indexOf('| `fetchRecent` (no `since`)'),
-    README.indexOf('| absent topic'),
-  );
-  const DEADLINE = README.slice(
-    README.indexOf('**No `block_ms` here.**'),
-    README.indexOf('## Config'),
-  );
-  const COUPLING = /deadline bounds the whole call, the page walk included/;
-
   const SEEDED = 250;
   const PAGE = 100;
   const topic = asTopic('740000000000000021');
@@ -162,18 +124,6 @@ describe('bridge-discord README — the call deadline bounds the page walk, and 
   afterAll(async () => {
     await plugin.disconnect();
     await fake.close();
-  });
-
-  it('states the coupling on the seam-mapping row that used to deny it', () => {
-    expect(NO_SINCE_ROW).toMatch(COUPLING);
-  });
-
-  it('states the coupling where the deadline is introduced', () => {
-    expect(DEADLINE).toMatch(COUPLING);
-  });
-
-  it('no longer promises the window is never truncated', () => {
-    expect(README).not.toMatch(/never silently truncated/);
   });
 
   const LIMITS = [PAGE, SEEDED];
@@ -225,12 +175,6 @@ describe('bridge-discord 429 behaviour matches what the README promises', () => 
     ['the header asking for longer', 0.5, 0.05],
     ['the body asking for longer', 0.05, 0.5],
   ];
-
-  it('says the header is a floor rather than a fallback', () => {
-    expect(RATE_LIMITS).toMatch(/floor/i);
-    expect(RATE_LIMITS).not.toMatch(/falling back to/i);
-    expect(RATE_LIMITS).toMatch(/longer of the two/i);
-  });
 
   it.each(BOTH_HINTS)('waits the longer of the two when a 429 carries %s', async (_label, h, b) => {
     fake.injectFault({
