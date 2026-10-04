@@ -176,6 +176,20 @@
    "unresolvable": 6,
    "selfInducedPct": 83,
    "note": "First round with unresolvable entries (6): findings anchored at line numbers past the end of the file at the round's base — a critic citing a line in a file it had mutated, or a stale anchor. Recorded rather than silently dropped; they are excluded from the graded denominator."
+  },
+  {
+   "round": 21,
+   "base": "88f0daf",
+   "findings": 188,
+   "graded": 171,
+   "selfInduced": 155,
+   "preExisting": 16,
+   "unresolvable": 17,
+   "selfInducedPct": 91,
+   "blocking": 23,
+   "blockingSelfInduced": 21,
+   "blockingPreExisting": 2,
+   "note": "Base carries the Sept 2-9 simplification (removals, decompositions, test deletions), so blame charges moved lines to the experiment and this is a ceiling. 17 unresolvable anchors excluded. The blocking denominator (23) is the oracle's graded subset of the round's 28 confirmed blocking findings."
   }
  ],
  "comparison": {
