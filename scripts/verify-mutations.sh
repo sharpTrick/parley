@@ -33,6 +33,11 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   exit 1
 fi
 
+# One log per run: concurrent replays from sibling worktrees shared a fixed path, so one run's
+# `expectFail` grep could read another run's output.
+log=$(mktemp "${TMPDIR:-/tmp}/verify-mutations.XXXXXX")
+trap 'rm -f "$log"' EXIT
+
 total=0; bad=0
 count=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$manifest")
 
@@ -77,11 +82,11 @@ PY
   # a file hang rather than fail — restoring bridge-telegram's blocking store open leaves a squatted
   # FIFO cell blocked forever in readFileSync, which is the defect, not a flake. Keep the narrowing
   # OPT-IN and named, so that a manifest cannot quietly shrink what a mutation is graded against.
-  if npx vitest run "$test" ${only:+-t "$only"} >/tmp/mutrun.log 2>&1; then
+  if npx vitest run "$test" ${only:+-t "$only"} >"$log" 2>&1; then
     echo "   FAIL — the suite stayed GREEN under the mutation. This test does not grade the defect."
     bad=$((bad + 1))
   else
-    if [ -n "$expectFail" ] && ! grep -qF "$expectFail" /tmp/mutrun.log; then
+    if [ -n "$expectFail" ] && ! grep -qF "$expectFail" "$log"; then
       echo "   FAIL — it went red, but not on '$expectFail'. Something else broke; the named guard is unproven."
       bad=$((bad + 1))
     else
