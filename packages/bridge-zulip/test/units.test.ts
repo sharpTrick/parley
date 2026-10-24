@@ -142,6 +142,44 @@ describe('every server rewrite is graded against the whole whitespace code space
   }
 });
 
+/**
+ * CLASS: every server-rewrite guard costs time linear in the input it is handed. Core caps neither a
+ * body's length nor a configured topic's before the plugin grades it, and the process is
+ * single-threaded, so one call that backtracks over a long run of the very characters the guard
+ * strips stalls every session the bridge serves. The run is taken from {@link CANDIDATE_PADDINGS},
+ * so that a guard whose class quantifies ANY spelling of whitespace is exercised on it, and is placed
+ * where a `+$` pattern backtracks: it stops short of the end. Restore a `+$` regex in either guard
+ * and these red.
+ */
+describe('every server-rewrite guard runs in linear time over a long whitespace run', () => {
+  const RUN = 100_000;
+  const BUDGET_MS = 250;
+  const SHAPES: Array<{ name: string; build: (run: string) => string }> = [
+    { name: 'that stops one character short of the end', build: (run) => `${run}x` },
+    { name: 'between two other characters', build: (run) => `x${run}x` },
+  ];
+  const elapsedMs = (call: () => unknown): number => {
+    const started = performance.now();
+    // Every input here is over both length limits, so each call must reach a verdict and refuse.
+    expect(call).toThrow();
+    return performance.now() - started;
+  };
+
+  for (const pad of CANDIDATE_PADDINGS) {
+    for (const shape of SHAPES) {
+      it(`a body whose ${padName(pad)} run ${shape.name} is graded within budget`, () => {
+        const body = shape.build(pad.repeat(RUN));
+        expect(elapsedMs(() => requireSendableBody(body))).toBeLessThan(BUDGET_MS);
+      });
+
+      it(`a topic whose ${padName(pad)} run ${shape.name} is graded within budget`, () => {
+        const topic = asTopic(shape.build(pad.repeat(RUN)));
+        expect(elapsedMs(() => requireWireTopic(topic))).toBeLessThan(BUDGET_MS);
+      });
+    }
+  }
+});
+
 describe('a server record becomes a Message only when its id can carry the cursor', () => {
   const UNUSABLE: Array<{ name: string; record: unknown }> = [
     { name: 'a missing record', record: undefined },

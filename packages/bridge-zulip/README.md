@@ -16,7 +16,7 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | `connect(config)`         | No session to establish — Zulip auth is per-request HTTP Basic (`email:api_key`), so `connect` issues no request: it validates and captures config. A **malformed** value — a `site_url` that is not a bare absolute http(s) URL, an empty `email`/`api_key`/`stream`, an unusable `events_timeout_ms` — is a `connect()` error naming the key. What cannot be checked without asking the server — a well-formed URL pointing at the wrong host, a well-formed but wrong `api_key` — surfaces on the first call (401, or a transport error). Calling it again over a live connection disconnects that one first (its queues are deleted against the site it was made with); a rejected config leaves the live connection running. |
 | topic → stream + topic    | ONE configured Zulip **stream** (default `parley`) carries all Parley traffic; each Parley topic is a Zulip **topic** within it. |
 | `post`                    | `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) with `{ type: "stream", to: <stream>, topic, content }` → returns the new message `id`. |
-| `backendMsgId` = `cursor` | The Zulip **message `id`** — a globally monotonic integer (hence per-topic monotonic); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
+| `backendMsgId` = `cursor` | The Zulip **message `id`** — a global integer, allocated in increasing order (hence per-topic increasing) but not made visible in that order (see [below](#a-window-catch-up-cannot-close-ids-commit-out-of-order)); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
 | `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&include_anchor=true&num_before=N` → the most recent window, ascending. Zulip resolves `newest` to a sentinel larger than any message id, so no row can be the anchor and `include_anchor` decides nothing on this read; it is sent explicitly all the same, because it is the value that stays correct if that ever changes. Zulip caps a request at 5000 messages, so a larger `limit` is paginated transparently rather than returned as a 400. |
 | `fetchRecent` (`since`)   | `anchor=<since>&include_anchor=false&num_before=0&num_after=N` — the anchor itself is excluded, so `since` is strictly **exclusive** server-side. Zulip returns ascending by id; no client-side reordering. |
 | `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. A message that reaches the server while no queue of ours exists — before `register` lands, or between a garbage-collected queue and its replacement — reaches no queue at all: live push is a **subset** of the post-subscribe tail (the seam's contract), and that window is left to the next `parley_fetch_recent`. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and resumes; a `register` mints an *empty* queue and reports `last_event_id: -1`, so the replacement can never re-serve what the dead one already delivered. A duplicate is still forbidden, and the loop holds that with a last-delivered-id watermark: an event whose id it cannot ack leaves the queue position where it was, and the server re-serves the message behind it on every poll until the fault clears. `disconnect()` aborts in-flight polls and best-effort deletes the queues. Only a body the server actually sent counts as evidence the queue is alive — our own cap ends a healthy idle poll and a black-holed one identically — so the poll issued after a cap asks for the queue as it stands (`dont_block=true`). Progress is measured by the ACK, not by bytes: a poll that asked to park and came back with nothing — or with events whose ids leave the ack where it was, so the very same answer is served again — is a wake that never came, and is backed off and named on stderr rather than re-issued forever. |
@@ -75,10 +75,23 @@ as something else:
 Zulip topics are **mutable namespaces** — admins (and, under the default org policy, members) can
 move or rename messages between topics after the fact. Message **ids and cursors survive a move**
 (they are global, not per-topic), but topic *membership* can drift: a moved message silently
-leaves one Parley topic's history and appears in another's. Practically: dedup and ordering are
-rock-solid; topic isolation is only as strong as your server's
+leaves one Parley topic's history and appears in another's. Practically: dedup is exact; topic
+isolation is only as strong as your server's
 [message-move policy](https://zulip.com/help/restrict-moving-messages). For a dedicated Parley
 stream with only bots posting, this never happens on its own.
+
+## A window catch-up cannot close: ids commit out of order
+
+Zulip draws a message's id from a Postgres sequence when `do_send_messages`
+(`zerver/actions/message_send.py`) inserts it, then writes every recipient's `UserMessage` row and
+only then commits; the `message` event goes out on commit. Two sends in flight at once can therefore
+become visible in the reverse of their id order. A `fetchRecent` landing between those two commits
+returns the higher id and a cursor past the lower one, so no later `since` read returns the lower one,
+and live push — which delivers in cursor order — drops it too. A read without `since` still returns
+it while it is inside the window asked for. It takes two sends in flight at once — two bridges, a
+person and a bridge, or overlapping `post` calls; sends issued one after another cannot produce it,
+because `post` returns only after its send has committed. The server exposes no commit-ordered position to resume from, so this is left
+open rather than narrowed by a timing guess. Not measured: this repo has no live Zulip.
 
 ## Config (`backend_config`)
 

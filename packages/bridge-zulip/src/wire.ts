@@ -43,7 +43,7 @@ const MAX_TOPIC_NAME_LENGTH = 60;
  * it off `String#trim`, so that U+FEFF — which JS trims and the server keeps — is not refused as a
  * rewrite the server never makes.
  */
-const SERVER_STRIPPED_TOPIC_EDGE = /^\p{White_Space}+|\p{White_Space}+$/gu;
+const SERVER_STRIPPED_TOPIC_EDGE = /^\p{White_Space}$/u;
 
 /**
  * The trailing whitespace a send loses off a BODY, which is a DIFFERENT set: `normalize_body` calls
@@ -52,7 +52,24 @@ const SERVER_STRIPPED_TOPIC_EDGE = /^\p{White_Space}+|\p{White_Space}+$/gu;
  * four separators, nor U+0085 (which this strip takes and `\s` does not), nor U+FEFF (which `\s`
  * takes and no server strip does) is graded against the wrong rewrite.
  */
-const SERVER_STRIPPED_BODY_TAIL = /[\p{White_Space}\u001c-\u001f]+$/u;
+const SERVER_STRIPPED_BODY_TAIL = /^[\p{White_Space}\u001c-\u001f]$/u;
+
+/**
+ * Where the run of `strips` characters that ends `s` begins. A backward scan rather than a `+$`
+ * regex, which V8 backtracks quadratically over a long run that stops short of the end. Every
+ * character either set holds is one UTF-16 unit, so stepping by unit is exact.
+ */
+function strippedTailStart(s: string, strips: RegExp): number {
+  let end = s.length;
+  while (end > 0 && strips.test(s[end - 1]!)) end--;
+  return end;
+}
+
+function strippedHeadEnd(s: string, strips: RegExp): number {
+  let start = 0;
+  while (start < s.length && strips.test(s[start]!)) start++;
+  return start;
+}
 
 /** `settings.MAX_MESSAGE_LENGTH`: `normalize_body` truncates a longer body on send. */
 const MAX_MESSAGE_LENGTH = 10_000;
@@ -139,7 +156,8 @@ export const readRetryAfter = bodyRetryAfter<{ 'retry-after'?: number }>(
  * topic is. Measured in code points, which is what Python's `len` counts.
  */
 export function requireSendableBody(content: string): string {
-  const rewritten = content.replace(SERVER_STRIPPED_BODY_TAIL, '').replace(/^\n+/, '');
+  const tail = strippedTailStart(content, SERVER_STRIPPED_BODY_TAIL);
+  const rewritten = content.slice(0, tail).replace(/^\n+/, '');
   if (rewritten === '') {
     throw new Error(
       'Zulip rejects an empty message body (Zulip strips trailing whitespace and leading newlines ' +
@@ -150,10 +168,7 @@ export function requireSendableBody(content: string): string {
     throw new Error('Zulip rejects a message body containing a NUL (U+0000). Remove it.');
   }
   if (rewritten !== content) {
-    const edge =
-      content.replace(SERVER_STRIPPED_BODY_TAIL, '') === content
-        ? 'leading newlines'
-        : 'trailing whitespace';
+    const edge = tail === content.length ? 'leading newlines' : 'trailing whitespace';
     throw new Error(
       `Zulip rewrites a message body on send: it strips ${edge}, so this message would be stored ` +
         'altered and read back as something else. Trim it before posting.',
@@ -181,7 +196,10 @@ export function requireSendableBody(content: string): string {
  */
 export function requireWireTopic(topic: Topic): string {
   const wire = topic.toLowerCase();
-  const stripped = wire.replace(SERVER_STRIPPED_TOPIC_EDGE, '');
+  const stripped = wire.slice(
+    strippedHeadEnd(wire, SERVER_STRIPPED_TOPIC_EDGE),
+    strippedTailStart(wire, SERVER_STRIPPED_TOPIC_EDGE),
+  );
   if (stripped !== wire) {
     throw new Error(
       `Zulip strips whitespace off a topic on send, so topic ${JSON.stringify(topic)} would be ` +
