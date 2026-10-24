@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fetch.js';
+import { liveEraStart } from '../engine/live-boundary.js';
 import { asBackendMsgId, asCursor, type BackendMsgId } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
 import type { FetchRecentArgs } from '../seam.js';
@@ -97,10 +98,11 @@ export const TOOL_TEXT = {
   live_status:
     'Report whether the live <channel> push path is actually DELIVERING, per subscribed topic. ' +
     '"delivering" = messages have reached you through push since this bridge armed. ' +
-    '"not-delivering" = every message you have been handed on that topic came back from ' +
-    'parley_fetch_recent and none from push, so the live path is dead: nothing will reach you ' +
-    'until you call parley_fetch_recent, and you should say so rather than assume the topic is ' +
-    'quiet. "no-traffic" = nothing has arrived either way yet, so there is nothing to conclude. ' +
+    '"not-delivering" = messages that arrived since this bridge armed have reached you only ' +
+    'through parley_fetch_recent and none through push, so the live path is dead: nothing will ' +
+    'reach you until you call parley_fetch_recent, and you should say so rather than assume the ' +
+    'topic is quiet. "no-traffic" = nothing that arrived since this bridge armed has reached you ' +
+    'either way yet (a backlog from before it does not count), so there is nothing to conclude. ' +
     'A bridge configured so that it cannot tell those apart answers { decided: false } with the ' +
     'reasons instead of guessing — it never reports health it did not observe. ' +
     'Returns { decided, topics } or { decided, blockedBy }.',
@@ -262,12 +264,18 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const stored = readState.get(t);
         if (resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
       }
-      for (const m of kept) {
-        // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
-        // thing that distinguishes a dead live path: a message reaching the agent that push never
-        // delivered. Past `markSeen` every message looks delivered.
-        if (deps.seen?.has(t, m.backendMsgId) === false) deps.live.recordReconciled(t);
-        deps.seen?.markSeen(t, m.backendMsgId);
+      const seen = deps.seen;
+      if (seen !== undefined) {
+        // Only the post-subscribe tail is push's to deliver: a backlog this boot inherited reaches
+        // the agent through here unseen whether or not the live path works.
+        const liveFrom = liveEraStart(seen, t, args.since, kept, nextCursor);
+        kept.forEach((m, i) => {
+          // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
+          // thing that distinguishes a dead live path: a message reaching the agent that push never
+          // delivered. Past `markSeen` every message looks delivered.
+          if (i >= liveFrom && !seen.has(t, m.backendMsgId)) deps.live.recordReconciled(t);
+          seen.markSeen(t, m.backendMsgId);
+        });
       }
       return textResult({ messages: kept, nextCursor });
     },

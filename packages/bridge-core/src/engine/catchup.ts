@@ -1,6 +1,7 @@
 import type { Cursor, Message, Topic } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin } from '../seam.js';
+import { markLiveBoundary } from './live-boundary.js';
 import type { ReadStateStore } from './read-state.js';
 import type { SeenSet } from './seen-set.js';
 
@@ -64,6 +65,8 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   let since = marker ?? position;
   let warmedTo = marker;
   let total = 0;
+  let newest: Message | undefined;
+  let atHead: Cursor | undefined;
 
   // Only this topic's ids: a coarser-than-topic history read hands back foreign messages, and
   // recording their ids here would suppress a later live push on THIS topic that collides with one.
@@ -73,6 +76,7 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
   const warmFrom = (messages: readonly Message[]): number => {
     const own = messages.filter((m) => m.topic === topic);
     for (const m of own) seen.markSeen(topic, m.backendMsgId);
+    newest = own.at(-1) ?? newest;
     return own.length;
   };
 
@@ -91,6 +95,7 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
         if (!isNoSuchTopicError(err)) throw err;
       }
     }
+    markLiveBoundary(seen, topic, newest?.backendMsgId, atHead);
     return drained;
   };
 
@@ -134,7 +139,11 @@ export async function catchUpTopic(args: CatchUpArgs): Promise<number> {
     // backend whose history API caps a page below `limit` (Discord's 100, Telegram, Matrix
     // /messages) cannot strand everything past its cap. `nextCursor === since` is the separate
     // brake for a page that made no cursor progress at all.
-    if (messages.length === 0 || nextCursor === since) return finish(total, true);
+    if (messages.length === 0) {
+      atHead = since;
+      return finish(total, true);
+    }
+    if (nextCursor === since) return finish(total, true);
     since = nextCursor;
   }
 

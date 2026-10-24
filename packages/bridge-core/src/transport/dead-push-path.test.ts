@@ -6,7 +6,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../config.js';
 import type { LiveDeliveryReport, TopicLiveDelivery } from '../engine/live-delivery.js';
-import { asHandle, asTopic } from '../message.js';
+import { asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
+import type { FetchRecentArgs, FetchRecentResult, MessageHandler } from '../seam.js';
 import { connectedFake, DeadListenerPlugin, FakePlugin } from '../test-support/fake-plugin.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { buildReactiveServer } from './http.js';
@@ -35,14 +36,17 @@ interface Session {
   shutdown(): Promise<void>;
 }
 
-type Cfg = { livePush?: boolean; onStart?: boolean };
+type Cfg = { livePush?: boolean; onStart?: boolean; statePath?: string; catchUpLimit?: number };
+
+const freshStatePath = (): string =>
+  join(mkdtempSync(join(tmpdir(), 'parley-live-status-')), 'read-state.json');
 
 async function session(plugin: FakePlugin, opts: Cfg = {}): Promise<Session> {
   const cfg = parseConfig({
     identity: { handle: String(ME) },
     topics: [TOPIC],
-    state_path: join(mkdtempSync(join(tmpdir(), 'parley-live-status-')), 'read-state.json'),
-    catchup: { on_start: opts.onStart ?? true },
+    state_path: opts.statePath ?? freshStatePath(),
+    catchup: { on_start: opts.onStart ?? true, limit: opts.catchUpLimit ?? 100 },
     live_push: { enabled: opts.livePush ?? true },
   });
   const bridge = await buildBridge(plugin, cfg);
@@ -147,6 +151,150 @@ describe('a live path that delivers nothing is distinguishable from one that del
     } finally {
       await bridge.shutdown();
     }
+  });
+});
+
+/**
+ * A healthy push whose delivery lands AFTER the agent's pull has already handed the message over: a
+ * polling backend's ordinary lag, held here until the test releases it so the order is not a race.
+ */
+class LaggingPushPlugin extends FakePlugin {
+  private readonly held: Array<() => void> = [];
+
+  override async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    await super.subscribe(topic, (m: Message) => this.held.push(() => handler(m)));
+  }
+
+  release(): number {
+    const due = this.held.splice(0);
+    for (const deliver of due) deliver();
+    return due.length;
+  }
+}
+
+type Page = { messages: Array<{ content: string }>; nextCursor?: string };
+
+/** The documented catch-up loop. Returns everything it was handed. */
+async function catchUpAsAnAgentWould(s: Session): Promise<string[]> {
+  const got: string[] = [];
+  let since: string | undefined;
+  for (let page = 0; page < 50; page++) {
+    const answer = (await call(s, 'parley_fetch_recent', {
+      topic: TOPIC,
+      ...(since !== undefined ? { since } : {}),
+    })) as Page;
+    got.push(...answer.messages.map((m) => m.content));
+    if (answer.nextCursor === undefined || answer.nextCursor === since) break;
+    since = answer.nextCursor;
+  }
+  return got;
+}
+
+/**
+ * A dead live path over a backend that mints a fresh cursor for every page it returns, as a sync
+ * token does: the cursor the agent pages with never byte-equals one catch-up was handed for the
+ * same position.
+ */
+class FreshCursorDeadPlugin extends DeadListenerPlugin {
+  private minted = 0;
+
+  override async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const since = args.since === undefined ? undefined : asCursor(String(args.since).split('#')[0]!);
+    const result = await super.fetchRecent({ ...args, since });
+    if (result.messages.length === 0) return { ...result, nextCursor: args.since };
+    return { ...result, nextCursor: asCursor(`${result.nextCursor}#${++this.minted}`) };
+  }
+}
+
+/**
+ * The verdict is about the post-subscribe tail (seam.ts clause 3), so it has to hold whatever this
+ * boot inherited: a backlog the agent reads through `parley_fetch_recent` predates the subscription,
+ * and push owes it nothing. Each state below reaches that backlog by a different route past what
+ * on-start catch-up warmed — and the last reaches nothing new at all, so the post-subscribe read
+ * cannot lean on passing the backlog to be recognised.
+ */
+describe('the verdict is about the post-subscribe tail, whatever backlog the boot inherited', () => {
+  const BACKLOG = ['old-0', 'old-1', 'old-2', 'old-3', 'old-4'];
+
+  const postWhileDown = async (plugin: FakePlugin, contents: readonly string[]): Promise<void> => {
+    await plugin.connect({});
+    for (const c of contents) await plugin.post(T, PEER, c);
+    await plugin.disconnect();
+  };
+
+  type Boot = { cfg: Cfg; handedEarlier: string[] };
+  const BOOTS: Array<[name: string, prepare: (p: FakePlugin, statePath: string) => Promise<Boot>]> = [
+    ['a fresh, empty topic', async () => ({ cfg: {}, handedEarlier: [] })],
+    [
+      'a cold boot whose backlog is deeper than catchup.limit',
+      async (p) => {
+        await postWhileDown(p, BACKLOG);
+        return { cfg: { catchUpLimit: 2 }, handedEarlier: [] };
+      },
+    ],
+    [
+      'a restart past a marker the agent never read up to, with more arriving while down',
+      async (p, statePath) => {
+        await postWhileDown(p, BACKLOG.slice(0, 3));
+        await (await session(p, { statePath })).shutdown();
+        await postWhileDown(p, ['while-down']);
+        return { cfg: {}, handedEarlier: [] };
+      },
+    ],
+    [
+      'a restart after the agent read everything, with nothing arriving while down',
+      async (p, statePath) => {
+        await postWhileDown(p, BACKLOG.slice(0, 3));
+        const first = await session(p, { statePath });
+        const handedEarlier = await catchUpAsAnAgentWould(first);
+        await first.shutdown();
+        return { cfg: {}, handedEarlier };
+      },
+    ],
+  ];
+
+  const PUSHES: Array<[name: string, make: () => FakePlugin, expected: string]> = [
+    ['push lands before the pull', () => new FakePlugin(), 'delivering'],
+    ['push lands after the pull', () => new LaggingPushPlugin(), 'delivering'],
+    ['push never lands', () => new DeadListenerPlugin(), 'not-delivering'],
+  ];
+
+  for (const [boot, prepare] of BOOTS) {
+    for (const [push, make, expected] of PUSHES) {
+      it(`${boot}; ${push}: no-traffic until post-subscribe traffic, then ${expected}`, async () => {
+        const plugin = make();
+        const statePath = freshStatePath();
+        const { cfg, handedEarlier } = await prepare(plugin, statePath);
+        const s = await track(session(plugin, { ...cfg, statePath }));
+
+        const handed = [...handedEarlier, ...(await catchUpAsAnAgentWould(s))];
+        // Precondition: whatever the boot inherited really reached the agent through the
+        // reconciling read, so `no-traffic` below is not about a backlog nobody read.
+        expect(new Set(handed)).toEqual(new Set(plugin.recorded(T).map((m) => m.content)));
+        expect(rowFor(await liveStatus(s)).status).toBe('no-traffic');
+
+        await plugin.post(T, PEER, 'after-arming');
+        const page = (await call(s, 'parley_fetch_recent', { topic: TOPIC })) as Page;
+        expect(page.messages.map((m) => m.content)).toEqual(['after-arming']);
+        if (plugin instanceof LaggingPushPlugin) expect(plugin.release()).toBe(1);
+
+        expect(rowFor(await liveStatus(s)).status).toBe(expected);
+      });
+    }
+  }
+
+  it('a backend minting a fresh cursor per read is still recognised once the agent passes the backlog', async () => {
+    const plugin = new FreshCursorDeadPlugin();
+    await postWhileDown(plugin, BACKLOG);
+    const s = await track(session(plugin, { catchUpLimit: 2 }));
+
+    expect(await catchUpAsAnAgentWould(s)).toEqual(BACKLOG);
+    expect(rowFor(await liveStatus(s)).status).toBe('no-traffic');
+
+    await plugin.post(T, PEER, 'after-arming');
+    const page = (await call(s, 'parley_fetch_recent', { topic: TOPIC })) as Page;
+    expect(page.messages.map((m) => m.content)).toEqual(['after-arming']);
+    expect(rowFor(await liveStatus(s)).status).toBe('not-delivering');
   });
 });
 

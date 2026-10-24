@@ -1,20 +1,13 @@
 import type { Topic } from '../message.js';
 
-/**
- * What this bridge has observed about one topic's live path since the subscription was armed.
- * `not-delivering` is the alarm: every message the agent has been handed on that topic arrived
- * through the reconciling read and none through push, which is what a plugin that registered no
- * listener looks like from above the seam (seam.ts clause 3 — "one whose live path delivers nothing
- * at all is not [conformant]").
- */
+/** What this bridge has observed about one topic's live path since the subscription was armed. */
 export type LiveDeliveryStatus = 'delivering' | 'not-delivering' | 'no-traffic';
 
 export interface TopicLiveDelivery {
   topic: Topic;
   status: LiveDeliveryStatus;
-  /** Messages this topic's push handler accepted (past the trust check and the dedup gate). */
+  /** Messages this topic's push handler accepted (past the trust check). */
   pushed: number;
-  /** Messages `parley_fetch_recent` handed the agent that push had not already delivered. */
   reconciled: number;
 }
 

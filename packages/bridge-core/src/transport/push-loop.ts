@@ -22,8 +22,8 @@ export interface PushLoopOptions {
  * Wire the live path: subscribe a SINGLE backend-agnostic handler to every allowed topic
  * (DESIGN §7/§9). The handler is the one place filtering lives:
  *   1. drop anything whose `topic` is not one we subscribed to,
- *   2. dedup on backendMsgId (so a message already pulled via catch-up isn't re-pushed),
- *   3. record the delivery, so `parley_live_status` can answer whether this path carries anything,
+ *   2. record the delivery, so `parley_live_status` can answer whether this path carries anything,
+ *   3. dedup on backendMsgId (so a message already pulled via catch-up isn't re-pushed),
  *   4. mention filter — in CORE, not in `subscribe` (the plugin forwards ALL messages),
  *   5. emit as a `<channel>` event (best-effort; the cursor reconciles any drop).
  *
@@ -64,10 +64,10 @@ export async function startPushLoop(
       }
       return;
     }
-    if (!seen.firstSeen(m.topic, m.backendMsgId)) return;
-    // Count the message the live path CARRIED, ahead of the filter that decides whether the agent
-    // is shown it: a session nothing mentions is not a session whose push path is dead.
+    // Count the message the live path CARRIED, ahead of both gates that decide whether the agent
+    // is shown it: a pull that reached it first, and a mention nobody made, are not a dead push path.
     opts.live.recordPush(m.topic);
+    if (!seen.firstSeen(m.topic, m.backendMsgId)) return;
     if (opts.mentionFilter && !m.mentions.includes(opts.identity)) return;
     void emitChannel(server, m).catch(() => {
       // Best-effort: a dropped push is harmless; core reconciles via fetchRecent (§6).
