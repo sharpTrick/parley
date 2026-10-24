@@ -278,6 +278,8 @@ describe('telegram getUpdates acknowledgement', () => {
         });
       }
       if (misbehaviour.kind === 'edited') {
+        // An upstream honouring the loop's `allowed_updates` never serves these at all.
+        fake.ignoreAllowedUpdates(true);
         for (let i = 0; i < 5; i++) fake.injectRawUpdate({ edited_message: { message_id: i } });
       }
 
@@ -362,5 +364,53 @@ describe('telegram getUpdates acknowledgement', () => {
       expect(Math.max(...offsets.map(Number))).toBeGreaterThan(0);
     },
     20_000,
+  );
+});
+
+/**
+ * Telegram keeps a token's `allowed_updates` filter across polls: one that omits the parameter is
+ * served whatever the LAST client to set it asked for. A token an earlier tool or framework left
+ * restricted therefore starves a loop that relies on the default — every poll answers `[]`, nothing
+ * fails, and nothing is ever ingested. One row per filter a token can arrive with, for each update
+ * kind the loop reads a message out of.
+ */
+describe('telegram getUpdates allowed_updates', () => {
+  const INHERITED_FILTERS = [
+    { name: 'none', kinds: undefined },
+    { name: 'callback_query only', kinds: ['callback_query'] },
+    { name: 'edited_message only', kinds: ['edited_message'] },
+    { name: 'the empty default', kinds: [] },
+  ];
+  const KINDS = ['message', 'channel_post'] as const;
+  const CELLS = INHERITED_FILTERS.flatMap((filter) => KINDS.map((kind) => ({ filter, kind })));
+
+  it.each(CELLS)(
+    'ingests a $kind on a token left with the filter $filter.name',
+    async ({ filter, kind }) => {
+      const fake = await startFake();
+      fake.seedAllowedUpdates(filter.kinds);
+      const from = { id: 9, is_bot: false, username: 'alice' };
+      fake.injectRaw('-1009500002', { from, text: 'probe' }, kind);
+      // The fake has to model the stickiness, or every row passes for a client that never states a
+      // filter: a poll that omits the parameter is served what the seeded filter admits, and no more.
+      const omitting = await fetch(`${fake.url}/bot${fake.token}/getUpdates?timeout=0`);
+      const served = ((await omitting.json()) as { result: unknown[] }).result;
+      const admits = filter.kinds === undefined || filter.kinds.length === 0;
+      expect(served).toHaveLength(admits ? 1 : 0);
+
+      const plugin = await connectFresh(fake);
+      const chat = '-1009500001';
+      const topic = asTopic(chat);
+      await plugin.subscribe(topic, () => undefined);
+      fake.injectRaw(chat, { from, text: 'inherited' }, kind);
+      await vi.waitFor(
+        async () =>
+          expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toContain(
+            'inherited',
+          ),
+        { timeout: 5000, interval: 20 },
+      );
+    },
+    15_000,
   );
 });

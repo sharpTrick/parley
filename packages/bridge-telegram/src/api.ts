@@ -1,8 +1,37 @@
-import { fetchWithRetry } from '@sharptrick/parley-net-util';
+import {
+  fetchWithRetry,
+  MAX_BODY_WAIT_MS,
+  retryAfterFromHeader,
+  statusOf,
+} from '@sharptrick/parley-net-util';
 import { readRetryAfter, unwrapEnvelope } from './wire.js';
 
 /** Wall-clock ceiling on one non-poll call, matching net-util's own per-call deadline. */
 const REQUEST_BUDGET_MS = 30_000;
+
+/** The wait the last 429 behind a rejected {@link BotApi.call} stated, keyed by that rejection. */
+const STATED_WAITS = new WeakMap<Error, number>();
+
+/**
+ * Milliseconds the last 429 behind `err` asked for, or undefined when it stated none. net-util ends
+ * a call whose stated wait does not fit the call's deadline instead of waiting it out, so a caller
+ * that retries the call itself — the poll loop — has to honour the wait from here.
+ */
+export function statedWaitOf(err: unknown): number | undefined {
+  return err instanceof Error ? STATED_WAITS.get(err) : undefined;
+}
+
+/** The longer of a 429's header and body waits, each read as net-util reads it, or undefined. */
+function statedWait(res: Response, body: number | undefined): number | undefined {
+  const usable = (ms: number | undefined): ms is number =>
+    ms !== undefined && Number.isFinite(ms) && ms > 0;
+  const header = retryAfterFromHeader(res);
+  const waits = [
+    usable(header) ? header : undefined,
+    usable(body) && body <= MAX_BODY_WAIT_MS ? body : undefined,
+  ].filter((ms): ms is number => ms !== undefined);
+  return waits.length === 0 ? undefined : Math.max(...waits);
+}
 
 /**
  * One connection's worth of Bot API: the base URL, the token, the in-flight requests to abort on
@@ -75,6 +104,7 @@ export class BotApi {
     const abortable = opts?.abortOnDisconnect === true;
     const controller = new AbortController();
     if (abortable) this.controllers.add(controller);
+    let stated: number | undefined;
     try {
       const res = await fetchWithRetry(
         url,
@@ -88,7 +118,11 @@ export class BotApi {
           label,
           // Stop retrying once disconnected — don't keep hammering the API post-teardown.
           isStopped: () => this.stopped,
-          retryAfterOf: readRetryAfter,
+          retryAfterOf: async (res) => {
+            const body = await readRetryAfter(res);
+            stated = statedWait(res, body);
+            return body;
+          },
           deadlineMs: opts?.budgetMs ?? REQUEST_BUDGET_MS,
         },
       );
@@ -96,7 +130,10 @@ export class BotApi {
     } catch (err) {
       // Rewrite in place rather than rethrowing a new Error, so that HttpStatusError survives and
       // the poll loop's `statusOf` still reads the status it branches on.
-      if (err instanceof Error) err.message = this.redact(err.message);
+      if (err instanceof Error) {
+        err.message = this.redact(err.message);
+        if (stated !== undefined && statusOf(err) === 429) STATED_WAITS.set(err, stated);
+      }
       throw err;
     } finally {
       this.controllers.delete(controller);

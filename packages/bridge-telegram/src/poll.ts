@@ -1,5 +1,5 @@
 import { delay, statusOf } from '@sharptrick/parley-net-util';
-import type { BotApi } from './api.js';
+import { type BotApi, statedWaitOf } from './api.js';
 import { describe, type Diagnostics } from './diagnostics.js';
 import { canonicalChatKey, requireMessage, type TgMessage, type TgUpdate } from './wire.js';
 
@@ -8,6 +8,32 @@ const FATAL_POLL_STATUSES = [401, 403, 404];
 
 /** Floor on how fast {@link pollUpdates} may re-poll after an answer that acked nothing. */
 const MIN_IDLE_POLL_MS = 250;
+
+/**
+ * The update kinds {@link pollUpdates} reads a message out of, in the order it reads them. Sent as
+ * `allowed_updates` on every poll, because Telegram keeps the LAST filter any client set on the token
+ * when a poll omits it: a token an earlier tool restricted to `callback_query` would otherwise never
+ * be served a message, and the bridge would ingest nothing without an error to say so.
+ */
+const UPDATE_KINDS = ['message', 'channel_post'] as const;
+const ALLOWED_UPDATES = encodeURIComponent(JSON.stringify(UPDATE_KINDS));
+
+/** First and longest wait after a getUpdates 429 that stated no wait of its own; doubles between. */
+const UNHINTED_429_MS = 1_000;
+const MAX_UNHINTED_429_MS = 60_000;
+/** How often a {@link waitWhileCurrent} re-reads `isCurrent()` — the most a disconnect waits on it. */
+const CURRENT_CHECK_MS = 25;
+
+/**
+ * Wait `ms`, cut short once `isCurrent()` goes false. A stated flood wait can run to minutes, and a
+ * disconnect must neither be held for it nor leave a timer that long keeping the process alive.
+ */
+async function waitWhileCurrent(ms: number, isCurrent: () => boolean): Promise<void> {
+  const until = Date.now() + ms;
+  while (isCurrent() && Date.now() < until) {
+    await delay(Math.min(CURRENT_CHECK_MS, until - Date.now()));
+  }
+}
 
 /**
  * The ONE shared `getUpdates` long-poll loop — Telegram allows exactly one consumer per bot token
@@ -32,6 +58,7 @@ export async function pollUpdates(opts: {
 }): Promise<void> {
   const { api, timeoutS, diagnostics, isCurrent, deliver } = opts;
   let offset = 0;
+  let unhinted = UNHINTED_429_MS;
   while (isCurrent()) {
     let updates: unknown[];
     const startedAt = Date.now();
@@ -40,10 +67,11 @@ export async function pollUpdates(opts: {
       // connection accepted and never answered (idle NAT drop, hung proxy) cannot park the
       // single ingestion loop for the lifetime of the process.
       const budgetMs = timeoutS * 1000 + Math.max(2_000, timeoutS * 400);
-      const result = await api.call('GET', `/getUpdates?timeout=${timeoutS}&offset=${offset}`, {
-        budgetMs,
-        abortOnDisconnect: true,
-      });
+      const result = await api.call(
+        'GET',
+        `/getUpdates?timeout=${timeoutS}&offset=${offset}&allowed_updates=${ALLOWED_UPDATES}`,
+        { budgetMs, abortOnDisconnect: true },
+      );
       if (!Array.isArray(result)) {
         throw new Error('Telegram GET /getUpdates → result: not an array of updates');
       }
@@ -62,9 +90,17 @@ export async function pollUpdates(opts: {
       // Telegram's own description says which — it rides along in the error text.
       const conflict = status === 409;
       diagnostics.report(`getUpdates failed, retrying: ${describe(err)}`, 'poll-failure');
+      if (status === 429) {
+        // Never re-poll sooner than Telegram asked; with no stated wait, back off further each time.
+        const stated = statedWaitOf(err);
+        await waitWhileCurrent(stated ?? unhinted, isCurrent);
+        if (stated === undefined) unhinted = Math.min(unhinted * 2, MAX_UNHINTED_429_MS);
+        continue;
+      }
       await delay(conflict ? 3000 : 500);
       continue;
     }
+    unhinted = UNHINTED_429_MS;
     if (!isCurrent()) break;
     const ackedBefore = offset;
     for (const element of updates) {
@@ -76,7 +112,7 @@ export async function pollUpdates(opts: {
         continue;
       }
       const u = element as TgUpdate;
-      const msg = u.message ?? u.channel_post;
+      const msg = UPDATE_KINDS.map((kind) => u[kind]).find((m) => m !== undefined);
       const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
       let carried: { chatId: string; message: TgMessage } | undefined;
       if (msg !== undefined) {

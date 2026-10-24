@@ -10,12 +10,13 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
-import { dirname } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { describe, Diagnostics, note } from './diagnostics.js';
 
 /** Mode for everything the store creates — the plaintext of every message the bridge has seen. */
@@ -191,6 +192,31 @@ function processExists(pid: number): boolean {
   }
 }
 
+/** Every claim path a {@link StoreLock} in this process currently holds, by {@link claimKey}. */
+const HELD = new Set<string>();
+
+/**
+ * One spelling per claim path, so that a second store in this process reaching the same file
+ * through a symlinked or relative directory still finds the first one's entry in {@link HELD}.
+ */
+function claimKey(path: string): string {
+  try {
+    return join(realpathSync(dirname(path)), basename(path));
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Whether the process a claim-protocol file names still holds it. A file naming THIS process is
+ * held only while a {@link StoreLock} here holds it: asking the kernel would always answer yes, so a
+ * bridge restarted under its old pid — PID 1 in a container on a persistent volume — would refuse
+ * its own crashed run's leftover forever.
+ */
+function holderAlive(pid: number, path: string): boolean {
+  return pid === process.pid ? HELD.has(claimKey(path)) : processExists(pid);
+}
+
 /**
  * This process's exclusive claim on a store file, held through a `<path>.lock` sibling. Two bridges
  * on one observed-message store hand the SAME cursor to two different messages and each one's
@@ -204,6 +230,8 @@ export class StoreLock {
   private readonly stealPath: string;
   /** Set once {@link claim} succeeded, so {@link release} can never unlink another process's claim. */
   private held = false;
+  /** The {@link HELD} entry this lock registered while it holds the claim. */
+  private heldKey: string | undefined;
 
   constructor(private readonly storePath: string) {
     const siblings = siblingPaths(storePath);
@@ -215,7 +243,7 @@ export class StoreLock {
   claim(): void {
     if (this.tryClaim()) return;
     const holder = lockHolder(this.path);
-    if ((holder === undefined || !processExists(holder)) && this.replaceStale()) return;
+    if ((holder === undefined || !holderAlive(holder, this.path)) && this.replaceStale()) return;
     throw new Error(
       `ObservedStore: '${this.storePath}' is already claimed by process ` +
         `${holder === undefined ? 'unknown' : String(holder)} through '${this.path}'. Two ` +
@@ -229,6 +257,8 @@ export class StoreLock {
   release(): void {
     if (!this.held) return;
     this.held = false;
+    if (this.heldKey !== undefined) HELD.delete(this.heldKey);
+    this.heldKey = undefined;
     try {
       unlinkSync(this.path);
     } catch {
@@ -248,7 +278,7 @@ export class StoreLock {
     try {
       if (this.tryClaim()) return true;
       const holder = lockHolder(this.path);
-      if (holder !== undefined && processExists(holder)) return false;
+      if (holder !== undefined && holderAlive(holder, this.path)) return false;
       // Publish only the token THIS process wrote. Renaming a sibling's token would install a pid
       // that holds nothing over the claim, so that the store would read as held by a live process
       // forever and no later start could ever take it over.
@@ -259,7 +289,7 @@ export class StoreLock {
         return false;
       }
       renamed = true;
-      this.held = true;
+      this.hold();
       return true;
     } finally {
       if (!renamed) this.dropBreak();
@@ -278,14 +308,14 @@ export class StoreLock {
   private takeBreak(): boolean {
     if (this.createBreak()) return true;
     const holder = lockHolder(this.breakPath);
-    if (holder !== undefined && processExists(holder)) return false;
+    if (holder !== undefined && holderAlive(holder, this.breakPath)) return false;
     try {
       renameSync(this.breakPath, this.stealPath);
     } catch {
       return false;
     }
     const stolen = lockHolder(this.stealPath);
-    if (stolen !== undefined && processExists(stolen)) {
+    if (stolen !== undefined && holderAlive(stolen, this.breakPath)) {
       // It was replaced between the read and the rename. Put the SAME file back under the shared
       // name and stand down, so that a live take-over is not cut off by one that came to bury a
       // corpse.
@@ -338,8 +368,15 @@ export class StoreLock {
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
       throw err;
     }
-    this.held = true;
+    this.hold();
     return true;
+  }
+
+  /** Mark the claim held, here and in {@link HELD}. */
+  private hold(): void {
+    this.held = true;
+    this.heldKey = claimKey(this.path);
+    HELD.add(this.heldKey);
   }
 }
 

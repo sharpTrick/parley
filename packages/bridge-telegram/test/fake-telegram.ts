@@ -23,6 +23,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *    fake cannot order ({@link FakeTelegram.injectMalformedUpdate}) is neither confirmed nor
  *    skipped, so it is re-served on every poll — the shape a rewriting middlebox produces, and the
  *    only one under which a client's acknowledgement guard has anything to do.
+ *  - `getUpdates` serves only the update kinds the token's `allowed_updates` filter admits, and a
+ *    poll that omits the parameter keeps the filter the LAST client set, as the real API does
+ *    ({@link FakeTelegram.seedAllowedUpdates}).
  *  - `sendMessage` does NOT enqueue the bot's own message as an update — mirrors real
  *    Telegram (a bot never sees its own sends via getUpdates), which forces the plugin's
  *    record-own-post-from-the-response path.
@@ -96,6 +99,18 @@ export interface FakeTelegram {
    * progress in it, which the empty-answer shape cannot reproduce.
    */
   ignoreOffset(on: boolean): void;
+  /**
+   * Set the `allowed_updates` filter the token carries before this test's client polls — what an
+   * earlier tool or framework left on it. Telegram keeps it until a poll states another, so a client
+   * that never sends the parameter is served only what that earlier client asked for. `undefined`
+   * and `[]` are Telegram's default: every kind but the chat-member and reaction ones.
+   */
+  seedAllowedUpdates(kinds: string[] | undefined): void;
+  /**
+   * Serve every update kind whatever filter was set — a proxy or a local Bot API server that does
+   * not implement `allowed_updates`. The only way a client still receives kinds it did not ask for.
+   */
+  ignoreAllowedUpdates(on: boolean): void;
   /**
    * Answer every call to `method` with HTTP 200 and exactly this body. A 2xx says nothing about
    * success on this API — `ok` does — so a middlebox, a captive portal or a non-conforming local
@@ -237,6 +252,9 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const malformed = new Map<string, string>();
   let longPollHonoured = true;
   let offsetHonoured = true;
+  /** The token's sticky `allowed_updates` filter — see {@link FakeTelegram.seedAllowedUpdates}. */
+  let allowedUpdates: string[] | undefined;
+  let allowedHonoured = true;
   const holds = new Map<string, { promise: Promise<void>; release(): void }>();
   /** Responses deliberately left hanging — closed on shutdown so the process can exit. */
   const stalled = new Set<ServerResponse>();
@@ -261,8 +279,25 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
   const orderable = (u: TgUpdate): boolean =>
     Number.isSafeInteger(u.update_id) && u.update_id >= 0;
 
+  /**
+   * Whether the token's filter admits `u`. An update's kind is the field it carries besides
+   * `update_id`; one carrying none has nothing to filter on and is served.
+   */
+  const admitted = (u: TgUpdate): boolean => {
+    if (!allowedHonoured) return true;
+    const kind = Object.keys(u).find((key) => key !== 'update_id');
+    if (kind === undefined) return true;
+    if (allowedUpdates === undefined || allowedUpdates.length === 0) {
+      return !DEFAULT_EXCLUDED_KINDS.includes(kind);
+    }
+    return allowedUpdates.includes(kind);
+  };
+
   const pending = (offset: number): TgUpdate[] =>
-    offsetHonoured ? updates.filter((u) => !orderable(u) || u.update_id >= offset) : [...updates];
+    (offsetHonoured
+      ? updates.filter((u) => !orderable(u) || u.update_id >= offset)
+      : [...updates]
+    ).filter(admitted);
 
   /**
    * Real Telegram treats a poll at `offset` as confirmation of everything below it and DELETES
@@ -404,6 +439,8 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
         offsetsSeen.push(String(url.searchParams.get('offset') ?? body.offset ?? ''));
         const offset = Number(url.searchParams.get('offset') ?? body.offset ?? 0);
         const timeoutS = Number(url.searchParams.get('timeout') ?? body.timeout ?? 0);
+        const stated = statedAllowedUpdates(url.searchParams.get('allowed_updates') ?? body.allowed_updates);
+        if (stated !== undefined) allowedUpdates = stated;
         confirm(offset);
         const ready = pending(offset);
         if (ready.length > 0 || timeoutS <= 0 || !longPollHonoured) {
@@ -531,6 +568,14 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
       if (on) for (const poll of [...parked]) answerPoll(poll);
     },
 
+    seedAllowedUpdates(kinds: string[] | undefined): void {
+      allowedUpdates = kinds === undefined ? undefined : [...kinds];
+    },
+
+    ignoreAllowedUpdates(on: boolean): void {
+      allowedHonoured = !on;
+    },
+
     ignoreOffset(on: boolean): void {
       offsetHonoured = !on;
       if (on) for (const poll of [...parked]) answerPoll(poll);
@@ -577,6 +622,25 @@ export async function startFakeTelegram(): Promise<FakeTelegram> {
     },
   };
   return fake;
+}
+
+/** What Telegram serves when no `allowed_updates` filter is set, or an empty one is. */
+const DEFAULT_EXCLUDED_KINDS = ['chat_member', 'message_reaction', 'message_reaction_count'];
+
+/**
+ * The `allowed_updates` a poll stated — a JSON-serialized array in a query string, an array in a
+ * JSON body — or `undefined` when it stated none, which leaves the token's filter as it was.
+ */
+function statedAllowedUpdates(raw: unknown): string[] | undefined {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  return Array.isArray(value) && value.every((k) => typeof k === 'string') ? value : undefined;
 }
 
 /** Collect and JSON-parse a request body (empty object for GETs / empty bodies). */
