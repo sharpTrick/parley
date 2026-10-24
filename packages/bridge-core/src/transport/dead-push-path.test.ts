@@ -201,7 +201,7 @@ class FreshCursorDeadPlugin extends DeadListenerPlugin {
   override async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const since = args.since === undefined ? undefined : asCursor(String(args.since).split('#')[0]!);
     const result = await super.fetchRecent({ ...args, since });
-    if (result.messages.length === 0) return { ...result, nextCursor: args.since };
+    if (result.messages.length === 0) return { ...result, nextCursor: args.since ?? result.nextCursor };
     return { ...result, nextCursor: asCursor(`${result.nextCursor}#${++this.minted}`) };
   }
 }
