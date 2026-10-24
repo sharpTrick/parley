@@ -193,8 +193,9 @@ what it leaves out is returned by the next `fetchRecent`. A backend whose delive
 cover a burst is conformant; one whose live path delivers nothing at all is not, and the shared
 suite grades both bounds (`only the post-subscribe tail`, and `does not fall behind a quiet topic`).
 
-Three consequences a deployment feels. Documented, not closed: each is a window a particular
-backend's live path cannot cover, and the list holds the ones that have been written down.
+Consequences a deployment feels. Documented, not closed: each is a window a particular backend's
+live path cannot cover — the last one catch-up cannot cover either — and the list holds the ones
+that have been written down.
 
 - **SQLite.** `subscribe` starts at the topic's tail as it stands when it is called. Core runs
   catch-up to completion and arms the live loop afterwards, so in a **multi-writer** deployment a
@@ -211,6 +212,13 @@ backend's live path cannot cover, and the list holds the ones that have been wri
   that reaches the server while no queue of ours exists reaches no queue at all. That window is
   left to the next `parley_fetch_recent` (bridge-zulip/README.md). Not measured: this repo has no
   live Zulip, and the only oracle is the package's own fake.
+- **Zulip, catch-up too.** Zulip allocates a message id at INSERT inside `do_send_messages`'
+  transaction and commits later, so two sends in flight at once can commit in reverse id order. A
+  `since` read landing between the two commits returns the higher id and a cursor past the lower
+  one: no later `since` read returns the lower one, and live push, in cursor order, drops it too.
+  This breaks `fetchRecent`'s completeness, not just the live path's, and the plugin cannot close
+  it — Zulip exposes no commit-ordered position (bridge-zulip/README.md). Read from Zulip's server
+  source, not measured.
 
 The same logical message can still arrive twice — once via live push, once via `fetchRecent`, which
 is now the ORDINARY path rather than a reconnect edge case. To make this deterministic:
@@ -227,7 +235,8 @@ is now the ORDINARY path rather than a reconnect edge case. To make this determi
   - XMPP → MAM archive id.
   - NATS → JetStream sequence number.
   - Postgres → `BIGSERIAL` seq (per-topic advisory lock keeps seq order == commit order).
-  - Zulip → message id (globally monotonic integer).
+  - Zulip → message id (a global integer allocated in increasing order, but not committed in that
+    order — see the window above).
   - Discord → message snowflake (per-channel strictly increasing).
   - Telegram → the **local observation sequence** stamped by the observed-message store, NOT
     Telegram's per-chat `message_id` (which is minted when the sender's message is accepted, so
