@@ -1,5 +1,5 @@
 import { buildMessage, type Message, type Topic } from '@sharptrick/parley-core';
-import { bodyRetryAfter } from '@sharptrick/parley-net-util';
+import { bodyRetryAfter, sanitizeBody } from '@sharptrick/parley-net-util';
 
 /** Custom event-content key tagging the logical Parley topic (shared-room isolation + provenance). */
 export const TOPIC_KEY = 'app.parley.topic';
@@ -72,8 +72,8 @@ export const membershipLossOf = (sync: SyncResponse, roomId: string): string | u
 export const adoptedString = (raw: unknown, field: string, call: string): string => {
   if (typeof raw === 'string' && raw !== '') return raw;
   throw new Error(
-    `[parley-matrix] ${call} answered 200 but its ${field} was ` +
-      `${JSON.stringify(raw) ?? typeof raw} where a non-empty string was required; this is not a ` +
+    `[parley-matrix] ${sanitizeBody(call)} answered 200 but its ${field} was ` +
+      `${sanitizeBody(JSON.stringify(raw) ?? typeof raw)} where a non-empty string was required; this is not a ` +
       'Matrix homeserver, or a proxy or captive portal answered for it.',
   );
 };

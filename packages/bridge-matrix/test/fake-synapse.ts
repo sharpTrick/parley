@@ -101,6 +101,14 @@ export class FakeSynapse {
    */
   loginBody?: unknown;
   /**
+   * Called with each `POST /v3/login`'s 1-based arrival ordinal BEFORE {@link loginOutcome} is
+   * read; the login stays in flight until the returned promise settles. Keep it, so that a second
+   * `connect()` or a `disconnect()` can land INSIDE a login, and the outcome that login answers
+   * with can be chosen after they have.
+   */
+  holdLogin: (ordinal: number) => Promise<void> | undefined = () => undefined;
+  private logins = 0;
+  /**
    * This account's membership in the room an INCREMENTAL `/sync` reads. Anything but `join` answers
    * 200 with the room under `rooms.leave` — the shape a kick, a ban or a self-leave actually takes,
    * and one no HTTP status and no malformed body can produce. `rejoined` carries the room under
@@ -347,6 +355,7 @@ export class FakeSynapse {
     this.onRequest(method, path);
 
     if (path.endsWith('/v3/login')) {
+      await this.holdLogin(++this.logins);
       if (this.loginOutcome === 'network') throw new Error('fake network reset');
       if (this.loginOutcome !== 200) {
         return jsonRes({ errcode: 'M_FORBIDDEN', error: 'injected' }, this.loginOutcome);

@@ -47,7 +47,7 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
     // Keep the validation ahead of the stand-down, so that a refused config leaves a working
     // connection running instead of tearing it down on the way to a load error.
     validateConfig(cfg);
-    this.generation++;
+    const generation = ++this.generation;
     // Keep the credential cleared BEFORE `baseUrl` moves, so that homeserver A's bearer token can
     // never reach homeserver B — neither on the login request nor on the seam calls that follow a
     // login which failed.
@@ -75,6 +75,14 @@ export class MatrixPlugin extends MatrixTimeline implements BackendPlugin {
       },
     });
     const json = (await res.json()) as Record<string, unknown> | null;
+    // Keep this ahead of the adoption, so that a login answering after a `disconnect()` or a later
+    // `connect()` cannot install its credential over theirs — against whatever host they moved to.
+    if (this.isStale(generation)) {
+      throw new Error(
+        '[parley-matrix] connect() was superseded by a disconnect() or a later connect() while its ' +
+          'login was in flight; the plugin keeps the state that later call left it in.',
+      );
+    }
     // Keep the credential adopted only through the guard, so that a 200 carrying none leaves this
     // `connect()` REJECTED rather than resolved: the `standDown()` above has already cleared the
     // token, and a resolved connect with no token is a plugin whose every later seam call fails

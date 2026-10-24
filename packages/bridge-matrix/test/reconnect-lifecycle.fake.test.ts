@@ -486,6 +486,150 @@ describe('connect() resets the credential it is replacing', () => {
 });
 
 /**
+ * CLASS: a lifecycle call that lands while a `connect()`'s login is still in flight. The login's
+ * answer belongs to a generation that has ended, so adopting it installs a credential nobody now
+ * asked for — one host's token bound to the next host's URL, or a live plugin after the
+ * `disconnect()` that stopped it. Parameterized over WHERE the later call lands relative to the login
+ * and over how each login answers, because the later call's own outcome decides what a stale
+ * adoption would overwrite. The sequential row is what stops the table passing on a plugin that
+ * refuses every connect.
+ */
+type LoginOutcome = 200 | 401 | 'network';
+const OVERLAP_OUTCOMES: LoginOutcome[] = [200, 401, 'network'];
+
+const gate = (): { open: () => void; wait: Promise<void> } => {
+  let open!: () => void;
+  const wait = new Promise<void>((r) => {
+    open = r;
+  });
+  return { open, wait };
+};
+
+const outcomeOf = (call: Promise<unknown>): Promise<'resolved' | Error> =>
+  call.then(
+    () => 'resolved' as const,
+    (err: unknown) => err as Error,
+  );
+
+const loginsArrived = async (n: number): Promise<void> =>
+  vi.waitFor(() => expect(loginAuthorizations().length).toBe(n), { timeout: 4000, interval: 5 });
+
+/** Every request that bore a credential some OTHER host minted. */
+const crossedCredentials = (): string[] =>
+  fake.requestUrls
+    .map((u, i) => ({ u, auth: fake.requestAuth[i] }))
+    .filter(({ u, auth }) => auth !== undefined && auth !== bearerFor(u.host))
+    .map(({ u, auth }) => `${u.host}${u.pathname} auth=${String(auth)}`);
+
+interface Overlapped {
+  first: 'resolved' | Error;
+  /** Absent where the later call is a `disconnect()`. */
+  second?: 'resolved' | Error;
+}
+
+const OVERLAPS: Record<
+  string,
+  {
+    superseded: boolean;
+    run: (p: MatrixPlugin, first: LoginOutcome, second: LoginOutcome, url: string) => Promise<Overlapped>;
+  }
+> = {
+  sequential: {
+    superseded: false,
+    run: async (p, first, second, url) => {
+      fake.loginOutcome = first;
+      const one = await outcomeOf(p.connect(fakeConfig()));
+      fake.loginOutcome = second;
+      return { first: one, second: await outcomeOf(p.connect(fakeConfig({ homeserverUrl: url }))) };
+    },
+  },
+  'a second connect() lands during the first login, which answers last': {
+    superseded: true,
+    run: async (p, first, second, url) => {
+      const held = gate();
+      fake.holdLogin = (n) => (n === 1 ? held.wait : undefined);
+      const one = outcomeOf(p.connect(fakeConfig()));
+      await loginsArrived(1);
+      fake.loginOutcome = second;
+      const two = await outcomeOf(p.connect(fakeConfig({ homeserverUrl: url })));
+      fake.loginOutcome = first;
+      held.open();
+      return { first: await one, second: two };
+    },
+  },
+  'a second connect() lands during the first login, which answers first': {
+    superseded: true,
+    run: async (p, first, second, url) => {
+      const heldOne = gate();
+      const heldTwo = gate();
+      fake.holdLogin = (n) => (n === 1 ? heldOne.wait : n === 2 ? heldTwo.wait : undefined);
+      const one = outcomeOf(p.connect(fakeConfig()));
+      await loginsArrived(1);
+      const two = outcomeOf(p.connect(fakeConfig({ homeserverUrl: url })));
+      await loginsArrived(2);
+      fake.loginOutcome = first;
+      heldOne.open();
+      const firstSettled = await one;
+      fake.loginOutcome = second;
+      heldTwo.open();
+      return { first: firstSettled, second: await two };
+    },
+  },
+  'disconnect() lands during the login': {
+    superseded: true,
+    run: async (p, first, _second, url) => {
+      const held = gate();
+      fake.holdLogin = (n) => (n === 1 ? held.wait : undefined);
+      const one = outcomeOf(p.connect(fakeConfig({ homeserverUrl: url })));
+      await loginsArrived(1);
+      await p.disconnect();
+      fake.loginOutcome = first;
+      held.open();
+      return { first: await one };
+    },
+  },
+};
+
+describe('a login answering after a later lifecycle call installs nothing', () => {
+  for (const [overlapName, overlap] of Object.entries(OVERLAPS)) {
+    for (const [targetName, url] of Object.entries(TARGETS)) {
+      for (const first of OVERLAP_OUTCOMES) {
+        const seconds = overlapName.startsWith('disconnect') ? [undefined] : OVERLAP_OUTCOMES;
+        for (const second of seconds) {
+          const name = `${overlapName} / to ${targetName} / first login ${first}${second === undefined ? '' : ` / second login ${second}`}`;
+          it(name, async () => {
+            const p = new MatrixPlugin();
+            const settled = await overlap.run(p, first, second ?? 200, url);
+
+            if (overlap.superseded) {
+              expect(settled.first, 'a superseded connect() resolved').toBeInstanceOf(Error);
+            } else {
+              expect(settled.first === 'resolved').toBe(first === 200);
+            }
+            if (second !== undefined) expect(settled.second === 'resolved').toBe(second === 200);
+
+            await settle(50); // let a request already on the wire at the last transition be recorded.
+            const mark = fake.requestAuth.length;
+            if (second === 200) {
+              await p.post(TOPIC, WRITER, 'work');
+              await p.fetchRecent({ topic: TOPIC, limit: 10 });
+              expect([...new Set(fake.requestAuth.slice(mark))]).toEqual([
+                bearerFor(new URL(url).host),
+              ]);
+            } else {
+              await expect(p.post(TOPIC, WRITER, 'secret work')).rejects.toThrow(/parley-matrix/);
+              expect(fake.requestAuth.slice(mark)).toEqual([]);
+            }
+            expect(crossedCredentials()).toEqual([]);
+            await p.disconnect();
+          }, 30_000);
+        }
+      }
+    }
+  }
+});
+
+/**
  * CLASS: a request this plugin puts on the wire WITHOUT the credential of the generation that made
  * it. `disconnect()` drops the token and a rejected `connect()` never obtains one, but the seam is
  * still callable in both states — and a call that merely omits its `Authorization` header is served

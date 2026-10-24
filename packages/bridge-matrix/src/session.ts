@@ -1,5 +1,5 @@
 import type { Topic } from '@sharptrick/parley-core';
-import { fetchWithRetry } from '@sharptrick/parley-net-util';
+import { fetchWithRetry, sanitizeBody } from '@sharptrick/parley-net-util';
 import { aliasOf, boundedLocalpart } from './alias.js';
 import {
   DEFAULT_HOMESERVER_URL,
@@ -185,8 +185,10 @@ export abstract class MatrixSession {
       await this.adoptRoom(raced, alias);
       return raced;
     }
-    const body = await res.text();
-    throw new Error(`createRoom failed (${res.status}) and alias unresolved: ${body}`);
+    throw new Error(
+      `[parley-matrix] createRoom failed (${res.status}) and alias unresolved: ` +
+        sanitizeBody(await res.text()),
+    );
   }
 
   private async lookupAlias(alias: string): Promise<string | undefined> {
@@ -203,6 +205,11 @@ export abstract class MatrixSession {
   /** Join rules an adopted room may carry: those the `preset` this config asks for would produce. */
   private get acceptedJoinRules(): string[] {
     return this.roomPreset === 'public_chat' ? ['invite', 'public'] : ['invite'];
+  }
+
+  /** This account as a message names it: the homeserver's MXID for it once logged in. */
+  private get selfName(): string {
+    return this.userId === undefined ? this.user : sanitizeBody(this.userId);
   }
 
   /** Accounts whose room this config is willing to use: this one, and the peers it invites. */
@@ -222,9 +229,9 @@ export abstract class MatrixSession {
     const { creator, joinRule } = await this.roomProvenance(roomId);
     if (creator === undefined || !this.trustedCreators.includes(creator)) {
       throw new Error(
-        `[parley-matrix] refusing the existing room ${alias} (${roomId}): it was created by ` +
-          `${creator ?? 'an account the homeserver would not name'}, which is neither ` +
-          `${this.userId ?? this.user} nor ` +
+        `[parley-matrix] refusing the existing room ${alias} (${sanitizeBody(roomId)}): it was ` +
+          `created by ${sanitizeBody(creator ?? 'an account the homeserver would not name')}, ` +
+          `which is neither ${this.selfName} nor ` +
           'any MXID in backend_config.invite. The alias is deterministic, so any account can claim ' +
           'it before this bridge does. Add that MXID to backend_config.invite if it is a peer of ' +
           'yours; otherwise retire the room or use a different topic.',
@@ -232,11 +239,11 @@ export abstract class MatrixSession {
     }
     if (joinRule === undefined || !this.acceptedJoinRules.includes(joinRule)) {
       throw new Error(
-        `[parley-matrix] refusing the existing room ${alias} (${roomId}): its join rule is ` +
-          `${joinRule ?? 'unreadable'}, and backend_config.room_preset ${this.roomPreset} accepts ` +
-          `only ${this.acceptedJoinRules.join(', ')}. Anyone who can join reads this topic's ` +
-          'history and writes into the agent session. Fix the room, or set room_preset to the one ' +
-          'that matches it.',
+        `[parley-matrix] refusing the existing room ${alias} (${sanitizeBody(roomId)}): its join ` +
+          `rule is ${sanitizeBody(joinRule ?? 'unreadable')}, and backend_config.room_preset ` +
+          `${this.roomPreset} accepts only ${this.acceptedJoinRules.join(', ')}. Anyone who can ` +
+          "join reads this topic's history and writes into the agent session. Fix the room, or " +
+          'set room_preset to the one that matches it.',
       );
     }
   }
@@ -283,8 +290,8 @@ export abstract class MatrixSession {
     );
     if (res.status === 403) {
       throw new Error(
-        `Matrix join refused (403) for ${alias} (${roomId}) as ` +
-          `${this.userId ?? this.user}: the room admits only invited members. Add this account to ` +
+        `Matrix join refused (403) for ${alias} (${sanitizeBody(roomId)}) as ` +
+          `${this.selfName}: the room admits only invited members. Add this account to ` +
           "the creating config's backend_config.invite, or have a member of the room invite it.",
       );
     }
