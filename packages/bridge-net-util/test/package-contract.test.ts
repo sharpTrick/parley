@@ -261,13 +261,7 @@ describe('every export earns its place', () => {
     FetchWithRetryOptions:
       'the options type of this package\'s one exported call — a consumer that names the type of ' +
       'the object it builds needs it, and a backend that spreads a literal at the call site does not',
-    MAX_BODY_WAIT_MS:
-      'the ceiling this loop applies to a body-stated wait before adopting it — a figure a ' +
-      'consumer diagnosing an ignored hint has to be able to name, not override',
     MAX_RESPONSE_BYTES: 'the documented default of FetchWithRetryOptions.maxBodyBytes',
-    retryAfterFromHeader:
-      'the RFC 9110 header parse, both forms — the FLOOR every `bodyRetryAfter` hook is built on ' +
-      'and the whole answer for a vendor that states no body hint',
     STOP_POLL_MS: 'the documented bound on how long disconnect waits on a backoff',
   };
 
