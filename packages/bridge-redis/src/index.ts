@@ -212,19 +212,22 @@ export class RedisPlugin implements BackendPlugin {
         entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
       }
     }
-    if (since !== undefined && entries.length === 0) {
-      // Native long-poll: the XRANGE was empty and the caller granted a budget → wait up to
-      // `blockMs` for entries strictly after `since`. A Stream entry id IS the cursor, so XREAD
+    // A window read with no `since` (never given, or dropped by the heal) came back empty only
+    // because the stream holds nothing, so everything that lands next sorts after `0-0`.
+    const after = since ?? '0-0';
+    if (entries.length === 0) {
+      // Native long-poll: the window was empty and the caller granted a budget → wait up to
+      // `blockMs` for entries strictly after `after`. A Stream entry id IS the cursor, so XREAD
       // returns exactly the entries a repeated exclusive XRANGE would. Gate on the FLOORED budget:
       // a sub-ms hint (0.5) passes `> 0` yet floors to 0, and `XREAD BLOCK 0` blocks FOREVER.
       const block = Math.floor(args.blockMs ?? 0);
       if (block > 0) {
-        entries = await this.blockingRead(key, since, block, limit);
+        entries = await this.blockingRead(key, after, block, limit);
       }
     }
     const messages = entries.map((e) => rowToMessage(args.topic, e.id, e.message));
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : asCursor(since ?? '0-0');
+    const nextCursor = last !== undefined ? last.cursor : asCursor(after);
     return { messages, nextCursor };
   }
 

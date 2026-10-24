@@ -9,7 +9,6 @@ import {
   isRedisUp,
   REDIS_URL,
   wipe,
-  withPlugin,
 } from './support.js';
 
 const freshTopic = (): Topic => mintTopic('live-conn');
@@ -173,37 +172,93 @@ async function intoSettledOutage({ proxy, plugin, prefix, topic }: ProxyRig): Pr
 // -------------------------------------------------------------------------------------------
 // CLASS: a message that lands in the gap between the catch-up query and the moment the waiter is
 // armed is lost. The conformance long-poll case posts well after the fetch has registered, so it
-// can never discriminate; every row here starts the post WITHOUT awaiting the fetch, so the write
+// can never discriminate; the 0–3ms rows start the post WITHOUT awaiting the fetch, so the write
 // lands while the reader is still opening its connection — the arm-after-the-re-query defect.
+//
+// Crossed with the ARM that serves the wait, because a long poll past MAX_BLOCKING_READERS is
+// served by re-reading rather than by a reader of its own, and every delivery property owed on one
+// arm is owed on the other: woken by the post rather than by the budget, and strictly after `since`.
 // -------------------------------------------------------------------------------------------
 
 describe.skipIf(!redisUp)('redis failure modes — the long-poll query-to-wait gap', () => {
-  // Only delays SHORTER than a reader handshake belong here. A longer one lands after the waiter
-  // has registered, where the shipped conformance long-poll case already pins delivery, so it would
-  // pass against the very defect this block exists to catch.
-  it.each([0, 1, 2, 3])('delivers a post issued %ims into the long-poll', async (delayMs) =>
-    withPlugin({ block_ms: 500 }, async ({ plugin }) => {
-      const t = freshTopic();
+  const BUDGET = 5000;
+
+  /** How a row puts its long poll on an arm: the readers it is owed, and what releases the arm. */
+  interface Arm {
+    readersOwed: number;
+    enter: (rig: ProxyRig) => Promise<() => Promise<void>>;
+  }
+
+  const arms: Array<[string, Arm]> = [
+    ['a dedicated reader', { readersOwed: 1, enter: async () => async () => undefined }],
+    [
+      'the polled arm past the reader cap',
+      {
+        readersOwed: 0,
+        // Park every reader the cap allows on ANOTHER topic, so the post under test wakes none of
+        // them and the slots stay taken for the whole row.
+        enter: async ({ proxy, plugin }) => {
+          const other = freshTopic();
+          await plugin.post(other, asHandle('w'), 'seed');
+          const tail = (await plugin.fetchRecent({ topic: other })).nextCursor;
+          const baseline = proxy.live();
+          const parked = Array.from({ length: MAX_BLOCKING_READERS }, () =>
+            plugin.fetchRecent({ topic: other, since: tail, blockMs: 2 * BUDGET }),
+          );
+          await expect
+            .poll(() => proxy.live() - baseline, { timeout: 5000, interval: 10 })
+            .toBe(MAX_BLOCKING_READERS);
+          return async () => {
+            await plugin.disconnect();
+            await Promise.all(parked);
+          };
+        },
+      },
+    ],
+  ];
+
+  const rows = arms.flatMap(([armLabel, arm]) =>
+    [0, 1, 2, 3, 50].map((delayMs) => [delayMs, armLabel, arm] as [number, string, Arm]),
+  );
+
+  it.each(rows)('delivers a post issued %ims into a long poll on %s', async (delayMs, _a, arm) =>
+    withProxiedPlugin(async (rig) => {
+      const { proxy, plugin, prefix, topic: t } = rig;
+      await plugin.connect({ url: proxy.url, key_prefix: prefix, block_ms: 500 });
       await plugin.post(t, asHandle('w'), 'seed');
       const since = (await plugin.fetchRecent({ topic: t })).nextCursor;
+      const release = await arm.enter(rig);
+      try {
+        const openedBefore = proxy.accepted();
+        const started = Date.now();
+        const waiting = plugin.fetchRecent({ topic: t, since, blockMs: BUDGET });
+        const posted = new Promise<void>((r) => setTimeout(r, delayMs)).then(() =>
+          plugin.post(t, asHandle('w'), 'fresh'),
+        );
 
-      const waiting = plugin.fetchRecent({ topic: t, since, blockMs: 5000 });
-      const posted = new Promise<void>((r) => setTimeout(r, delayMs)).then(() =>
-        plugin.post(t, asHandle('w'), 'fresh'),
-      );
+        const page = await waiting;
+        const elapsed = Date.now() - started;
+        await posted;
+        expect(
+          proxy.accepted() - openedBefore,
+          'the long poll was not served by the arm this row names',
+        ).toBe(arm.readersOwed);
+        expect(
+          page.messages.map((m) => m.content),
+          'the post landed in the query-to-wait gap and was never delivered',
+        ).toEqual(['fresh']);
+        expect(page.nextCursor).not.toBe(since);
+        expect(elapsed, 'the long poll was woken by its budget running out').toBeLessThan(
+          BUDGET / 2,
+        );
 
-      const page = await waiting;
-      await posted;
-      expect(
-        page.messages.map((m) => m.content),
-        'the post landed in the query-to-wait gap and was never delivered',
-      ).toEqual(['fresh']);
-      expect(page.nextCursor).not.toBe(since);
-
-      // …and the returned cursor is the one the next catch-up must resume from: re-fetching with
-      // it returns nothing, so no message was skipped over on the way to it either.
-      const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
-      expect(after.messages).toEqual([]);
+        // …and the returned cursor is the one the next catch-up must resume from: re-fetching with
+        // it returns nothing, so no message was skipped over on the way to it either.
+        const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
+        expect(after.messages).toEqual([]);
+      } finally {
+        await release();
+      }
     }));
 
   // CLASS: the sub-millisecond long-poll budget. `blockMs` is typed `number`, so 0.5 clears `> 0`

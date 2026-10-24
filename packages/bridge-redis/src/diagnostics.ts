@@ -73,6 +73,27 @@ function credentialSpellings(url: string): string[] {
 export const fromCaller = (text: string): string => sanitizeBody(text);
 
 /**
+ * How much of a credential's opening a run of server text must match to be struck out when the whole
+ * credential is not there. An exact-match sweep is not enough: Redis cuts its `with args beginning
+ * with:` echo at 128 bytes, so a long credential comes back as a PREFIX of itself.
+ */
+const ECHOED_PREFIX_CHARS = 8;
+
+/** `text` with every run that matches the opening of `credential`, however far it extends, struck out. */
+function strikeCredential(text: string, credential: string): string {
+  const opening = credential.slice(0, ECHOED_PREFIX_CHARS);
+  let out = '';
+  let from = 0;
+  for (let at = text.indexOf(opening); at !== -1; at = text.indexOf(opening, from)) {
+    let end = at + opening.length;
+    while (end - at < credential.length && text[end] === credential[end - at]) end++;
+    out += `${text.slice(from, at)}<redacted>`;
+    from = end;
+  }
+  return out + text.slice(from);
+}
+
+/**
  * Server-supplied text, made safe to put in an `Error` (which core renders into model context) or
  * in a log line: this connection's own password struck out, then bounded and stripped of the
  * control and format characters a hostile reply would forge line structure with. Keep it on every
@@ -83,7 +104,7 @@ export const fromCaller = (text: string): string => sanitizeBody(text);
 export function fromServer(url: string, text: string): string {
   let redacted = text;
   for (const spelling of credentialSpellings(url)) {
-    redacted = redacted.split(spelling).join('<redacted>');
+    redacted = strikeCredential(redacted, spelling);
   }
   return sanitizeBody(redacted);
 }

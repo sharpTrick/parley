@@ -47,8 +47,22 @@ const NEVER_A_REDIS_URL: Array<[string, unknown]> = [
   ['a scheme with no host', 'redis://'],
 ];
 
+/**
+ * URLs `new URL` accepts that node-redis' own parser then refuses — it percent-decodes the userinfo —
+ * or that it accepts and the server then refuses as a database: each one fails only once `open()`
+ * has already torn the live connection down.
+ */
+const NEVER_A_CLIENT_URL: Array<[string, unknown]> = [
+  ['a bad percent-escape in the password', 'redis://:50%zz@redis.invalid:6379'],
+  ['a bad percent-escape in the username', 'redis://us%er:pw@redis.invalid:6379'],
+  ['a trailing percent sign in the password', 'redis://:pass%@redis.invalid:6379'],
+  ['a non-numeric database path', 'redis://redis.invalid:6379/notadb'],
+  ['a fractional database path', 'redis://redis.invalid:6379/1.5'],
+  ['a negative database path', 'redis://redis.invalid:6379/-1'],
+];
+
 const rejectedByShape: Record<string, Array<[string, unknown]>> = {
-  url: [...NEVER_A_STRING, ...NEVER_A_REDIS_URL],
+  url: [...NEVER_A_STRING, ...NEVER_A_REDIS_URL, ...NEVER_A_CLIENT_URL],
   key_prefix: NEVER_A_STRING,
   retention_days: [
     ...NEVER_A_KNOB,

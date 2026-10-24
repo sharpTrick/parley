@@ -3,6 +3,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { asCursor, asTopic, loadConfig } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
+import { createClient } from 'redis';
 import { PERMANENT_CODES, serverRefusal } from '../src/client.js';
 import { CONFIG_KEYS, createRedisClient, RedisPlugin } from '../src/index.js';
 import { RENDER_LEAK_SENTINEL, rejectedByKnob, rejectedRows } from './config-fixtures.js';
@@ -142,6 +143,52 @@ describe('redis failure modes — backend_config validation', () => {
       failure?.message ?? '',
       'the refusal carries text the caller wrote, not this plugin',
     ).not.toContain(RENDER_LEAK_SENTINEL);
+    await plugin.disconnect().catch(() => undefined);
+  });
+
+  // The validator has to refuse every URL node-redis' own parser refuses, because one it lets
+  // through is refused only by the client `open()` builds after the live connection is torn down.
+  // Graded against that parser rather than a list of its rules, so a rule it gains reddens here.
+  const userinfos = [
+    '',
+    'user@',
+    ':pw@',
+    'user:pw@',
+    '%@',
+    ':%@',
+    ':%zz@',
+    'us%er:pw@',
+    ':%4@',
+    ':%C3@',
+    ':%C3%A4@',
+    '%E2%82:pw@',
+    'user:%%@',
+  ];
+  const paths = ['', '/', '/0', '/15', '/notadb', '/1.5', '/-1', '/0x1', '/%31', '//1', '/1/2'];
+  const clientRefuses = (url: string): boolean => {
+    try {
+      createClient({ url });
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  const refusedByClient = derivedRows(
+    'URLs node-redis refuses to parse',
+    () =>
+      userinfos
+        .flatMap((userinfo) => paths.map((path) => `redis://${userinfo}redis.invalid:6379${path}`))
+        .filter(clientRefuses),
+    { floor: 10, witness: [':%zz@', '/notadb'] },
+  );
+
+  it.each(refusedByClient)('connect() refuses %s before node-redis has to', async (url) => {
+    const plugin = new RedisPlugin();
+    const failure = await plugin.connect({ url }).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(failure?.message ?? '<accepted>').toMatch(/^parley-redis: url /);
     await plugin.disconnect().catch(() => undefined);
   });
 
@@ -357,18 +404,48 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
   // sweep. The last row pins the OTHER direction: behind an ACL name the username is not a secret,
   // and a sweep that struck it out would rewrite a word as ordinary as `default` — or this plugin's
   // own `parley-` prefix — throughout every message it composes from a server's text.
-  const credentials: Array<[string, string]> = [
+  const kinds: Array<[string, string]> = [
     ['a plain credential', SECRET],
     ['a credential with URL-unsafe characters', 'p@ss:w0rd/2'],
     ['a credential with a percent sign', '50%off'],
     ['a non-ASCII credential', 'pässwörd'],
   ];
 
+  /** `base` run on with a counter to `length` chars, so that no stretch of it repeats. */
+  const stretch = (base: string, length: number): string => {
+    let out = '';
+    for (let n = 0; out.length < length; n++) out += `${base}${n}`;
+    return out.slice(0, length);
+  };
+
+  // Crossed with LENGTH, because Redis quotes back only the first 128 bytes of what it was sent: a
+  // credential that fits comes back whole, and one that does not comes back as a prefix of itself,
+  // which a sweep for the whole credential never finds.
+  const lengths: Array<[string, (base: string) => string]> = [
+    ['', (base) => base],
+    [', 64 chars long', (base) => stretch(base, 64)],
+    [', 127 chars long', (base) => stretch(base, 127)],
+    [', 200 chars long', (base) => stretch(base, 200)],
+    [', 2048 chars long', (base) => stretch(base, 2048)],
+  ];
+
+  const credentials = kinds.flatMap(([kind, base]) =>
+    lengths.map(([length, grow]) => [`${kind}${length}`, grow(base)] as [string, string]),
+  );
+
+  /** An ACL name long enough to push the credential most of the way out of Redis's echo. */
+  const LONG_ACL_NAME = stretch('parley-acl-', 100);
+
   /** Where the credential sits in the URL, and the ACL name (if any) that must SURVIVE the sweep. */
   const positions: Array<[string, (encoded: string) => string, string | undefined]> = [
     ['in the password position', (c) => `//:${c}@`, undefined],
     ['in the username position, with no password', (c) => `//${c}@`, undefined],
     ['in the password position, behind an ACL name', (c) => `//parley:${c}@`, 'parley'],
+    [
+      'in the password position, behind a long ACL name',
+      (c) => `//${LONG_ACL_NAME}:${c}@`,
+      LONG_ACL_NAME,
+    ],
   ];
 
   const credentialRows = positions.flatMap(([where, authority, aclName]) =>
@@ -382,6 +459,19 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
         ],
     ),
   );
+
+  /** How long a run of the credential may survive: shorter than this, it is ordinary text. */
+  const WINDOW = 8;
+
+  /** Every run of `WINDOW` chars of `secret` that `text` still carries. */
+  const survivingWindows = (text: string, secret: string): string[] => {
+    const found = new Set<string>();
+    for (let i = 0; i + WINDOW <= secret.length; i++) {
+      const window = secret.slice(i, i + WINDOW);
+      if (text.includes(window)) found.add(window);
+    }
+    return [...found];
+  };
 
   // -------------------------------------------------------------------------------------------
   // CLASS: a lifecycle call that FAILS must return every socket it opened. The reader half of this
@@ -482,6 +572,10 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
         );
         for (const spelling of new Set([credential, inTheUrl])) {
           expectSafeError('connect()', failure, spelling);
+          expect(
+            survivingWindows(`${failure?.message ?? ''}\n${failure?.stack ?? ''}`, spelling),
+            'part of the credential survived the sweep',
+          ).toEqual([]);
         }
         if (aclName !== undefined) {
           expect(

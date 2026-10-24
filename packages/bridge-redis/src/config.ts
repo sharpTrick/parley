@@ -136,6 +136,17 @@ function normalizeUrl(value: unknown, fallback: string): string {
     return reject(`use the redis: or rediss: scheme (got '${parsed.protocol}')`);
   }
   if (parsed.hostname === '') return reject(`name a host (got '${parsed.protocol}' and none)`);
+  if (!/^(\/\d*)?$/.test(parsed.pathname)) {
+    return reject('name a database by its number if it names one at all (redis://host:port/2)');
+  }
+  // node-redis percent-decodes the user and password, and would otherwise refuse one that does not
+  // decode only in open(), after the live connection is already torn down.
+  try {
+    decodeURIComponent(parsed.username);
+    decodeURIComponent(parsed.password);
+  } catch {
+    return reject("percent-encode its user and password (every '%' must begin a %XX escape)");
+  }
   return url;
 }
 

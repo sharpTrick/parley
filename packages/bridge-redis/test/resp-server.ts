@@ -101,16 +101,32 @@ export const commandOf = (argv: string[]): string => (argv[0] ?? '').toLowerCase
 /** The password every hostile-server case puts in its URL, so every one can fail on leaking it. */
 export const SECRET = 'hunter2';
 
+/** How many BYTES of argument text Redis quotes back before it stops. */
+const ECHO_BUDGET_BYTES = 128;
+
 /**
  * How Redis itself quotes the arguments it was given back at the client — `, with args beginning
- * with: 'hunter2', 'CLIENT', ` — which is what a real server appends to an unknown-command refusal,
+ * with: 'parley' 'hunter2' ` — which is what a real server appends to an unknown-command refusal,
  * and therefore what it hands back when `AUTH` is the command it did not know.
+ *
+ * Keep the byte budget, so that a long credential comes back the way a real server returns it: cut
+ * to a PREFIX, possibly mid-character. Redis appends `'<arg>' ` per argument while what it has so
+ * far is under the budget, cutting each argument to the room left.
  */
-export const withArgs = (argv: string[]): string =>
-  `, with args beginning with: ${argv
-    .slice(1)
-    .map((arg) => `'${arg}', `)
-    .join('')}`;
+export function withArgs(argv: string[]): string {
+  let echoed = Buffer.alloc(0);
+  for (const arg of argv.slice(1)) {
+    if (echoed.length >= ECHO_BUDGET_BYTES) break;
+    const room = ECHO_BUDGET_BYTES - echoed.length;
+    const quoted = Buffer.concat([
+      Buffer.from("'"),
+      Buffer.from(arg, 'utf8').subarray(0, room),
+      Buffer.from("' "),
+    ]);
+    echoed = Buffer.concat([echoed, quoted]);
+  }
+  return `, with args beginning with: ${echoed.toString('utf8')}`;
+}
 
 /** A RESP error line. */
 export const respError = (code: string, text: string): string => `-${code} ${text}\r\n`;

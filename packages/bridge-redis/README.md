@@ -30,9 +30,10 @@ of no recognisable shape (a Matrix-style `s123_456`, `$`, an empty string, a val
 the uint64 each id component is) is rejected with an error naming it and the topic.
 
 **`fetch_recent` long-poll (`block_ms`).** `fetchRecent` also accepts an optional request-level
-`block_ms`: when nothing is newer than `since`, the call holds up to `block_ms` for a new message
-before returning (possibly empty), so a polling agent's token cost scales with messages, not
-wall-clock time. Redis serves this natively via an `XREAD BLOCK` on a dedicated reader connection.
+`block_ms`: when the window comes back empty — nothing newer than `since`, or, with no `since`, an
+empty topic — the call holds up to `block_ms` for a new message before returning (possibly empty),
+so a polling agent's token cost scales with messages, not wall-clock time. Redis serves this
+natively via an `XREAD BLOCK` on a dedicated reader connection.
 Core caps the wait at `catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return
 catch-up semantics, and a budget below 1ms floors to nothing and returns immediately — `XREAD BLOCK
 0` would block forever. A refusal the server will never stop returning (the same `NOAUTH`/`NOPERM`/

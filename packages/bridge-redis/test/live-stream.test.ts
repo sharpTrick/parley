@@ -437,6 +437,11 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
     ),
   );
 
+  /** When a row's post lands: long after any read has seen its window empty, well inside the budget. */
+  const ARRIVAL_MS = 100;
+  const afterMs = <T>(ms: number, work: () => Promise<T>): Promise<T> =>
+    new Promise((r) => setTimeout(r, ms)).then(work);
+
   it.each(rows)('%s', async (_label, seed, mint) =>
     withPlugin({}, ({ plugin, prefix }) =>
       withWriter(async (writer) => {
@@ -448,18 +453,77 @@ describe.skipIf(!redisUp)('redis failure modes — a cursor past the high-water 
         // must never answer with BOTH an empty page and the same cursor back — that pair is a dead
         // end that repeats forever, and on an EMPTY stream it is the only way the heal can be
         // observed at all.
-        const started = Date.now();
-        const page = await plugin.fetchRecent({ topic: t, since, blockMs: 2000 });
+        const page = await plugin.fetchRecent({ topic: t, since });
         expect(page.messages.length > 0 || page.nextCursor !== since).toBe(true);
         expect(page.messages.map((m) => m.content)).toEqual(expected);
         expect(page.nextCursor).not.toBe(since);
-        // …and a cursor that can never come true must not burn the granted budget waiting for it.
-        expect(Date.now() - started).toBeLessThan(1000);
+
+        // …and a long poll from the same stale cursor waits on the HEALED window: one holding
+        // entries is answered at once, and an empty one parks until the next post rather than
+        // answering at once with the empty page a timed-out long poll also returns.
+        const started = Date.now();
+        const arrival = afterMs(ARRIVAL_MS, () => plugin.post(t, asHandle('w'), 'three'));
+        const waited = await plugin.fetchRecent({ topic: t, since, blockMs: 2000 });
+        const elapsed = Date.now() - started;
+        await arrival;
+        expect(waited.messages.map((m) => m.content)).toEqual(
+          expected.length > 0 ? expected : ['three'],
+        );
+        expect(waited.nextCursor).not.toBe(since);
+        expect(elapsed, 'the long poll was woken by its budget running out').toBeLessThan(1000);
 
         // …and the healed cursor is live: it advances over the next post rather than replaying.
-        await plugin.post(t, asHandle('w'), 'three');
         const next = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
         expect(next.messages.map((m) => m.content)).toEqual(['three']);
+      }),
+    ),
+  );
+
+  // The same budget owed by every OTHER way a read can arrive at an empty window: a since-less read
+  // and one from the stream's own high-water mark. A long poll that answers an empty window at once
+  // hands back exactly what a timed-out one does, so the caller cannot tell them apart.
+  const emptyStates = states.slice(1);
+  const readShapes: Array<[string, (tail: Tail) => string | undefined]> = [
+    ['with no since', () => undefined],
+    ["from the stream's high-water mark", (t) => `${t.ms}-${t.seq}`],
+  ];
+  const emptyRows = emptyStates.flatMap(([stateLabel, seed]) =>
+    readShapes.map(
+      ([shapeLabel, mint]) =>
+        [`${shapeLabel}, on a stream ${stateLabel}`, seed, mint] as [
+          string,
+          StreamState,
+          (tail: Tail) => string | undefined,
+        ],
+    ),
+  );
+
+  it.each(emptyRows)('a long poll of an empty window waits for the next post: %s', async (
+    _label,
+    seed,
+    mint,
+  ) =>
+    withPlugin({}, ({ plugin, prefix }) =>
+      withWriter(async (writer) => {
+        const t = freshTopic();
+        const { expected, tail } = await seed(writer, `${prefix}${t}`);
+        expect(expected, 'the stream is not empty, so this row grades nothing').toEqual([]);
+        const minted = mint(tail);
+        const since = minted === undefined ? undefined : asCursor(minted);
+
+        const started = Date.now();
+        const arrival = afterMs(ARRIVAL_MS, () => plugin.post(t, asHandle('w'), 'fresh'));
+        const page = await plugin.fetchRecent({ topic: t, since, blockMs: 2000 });
+        const elapsed = Date.now() - started;
+        await arrival;
+        expect(
+          page.messages.map((m) => m.content),
+          'an empty window was answered at once instead of waited on',
+        ).toEqual(['fresh']);
+        expect(elapsed, 'the long poll was woken by its budget running out').toBeLessThan(1000);
+
+        const after = await plugin.fetchRecent({ topic: t, since: page.nextCursor });
+        expect(after.messages).toEqual([]);
       }),
     ),
   );
