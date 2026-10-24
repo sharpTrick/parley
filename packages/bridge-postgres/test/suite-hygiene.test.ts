@@ -52,6 +52,7 @@ describe('the real-server harness is shared, not restated', () => {
       'faultyProxy',
       'isUp',
       'rand',
+      'scratchRole',
       'settleWithin',
       'settledBackendCount',
       'settledSockets',

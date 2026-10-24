@@ -74,6 +74,59 @@ export async function dropTable(table: string, url = PG_URL): Promise<void> {
   }, url);
 }
 
+export interface ScratchRole {
+  /** A login role minted for this test; it holds USAGE on {@link schema} and nothing else. */
+  role: string;
+  /** A schema minted for this test, owned by the admin role, and first on both search paths. */
+  schema: string;
+  /** Connects as {@link role}. */
+  url: string;
+  /** Connects as the admin role — the owner of everything the admin bootstraps here. */
+  adminUrl: string;
+  /** Drop the schema with everything in it, then the role. */
+  drop: () => Promise<void>;
+}
+
+function withSearchPath(url: string, schema: string): URL {
+  const parsed = new URL(url);
+  parsed.searchParams.set('options', `-c search_path=${schema}`);
+  return parsed;
+}
+
+/**
+ * A role that is NOT the admin, and a schema of its own to be one in. Every other real-server case
+ * connects as the superuser in the suite's DSN, so no privilege boundary is crossed anywhere else.
+ * Both names are random and both are dropped, because this is the shared server.
+ */
+export async function scratchRole(): Promise<ScratchRole> {
+  const name = `parley_role_${rand()}${rand()}`;
+  const password = `${rand()}${rand()}`;
+  await withAdmin(async (admin) => {
+    await admin.query(`CREATE SCHEMA "${name}"`);
+    await admin.query(`CREATE ROLE "${name}" LOGIN PASSWORD '${password}'`);
+    await admin.query(`GRANT USAGE ON SCHEMA "${name}" TO "${name}"`);
+  });
+  const url = withSearchPath(PG_URL, name);
+  url.username = name;
+  url.password = password;
+  return {
+    role: name,
+    schema: name,
+    url: url.toString(),
+    adminUrl: withSearchPath(PG_URL, name).toString(),
+    drop: () =>
+      withAdmin(async (admin) => {
+        await admin.query(
+          'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1',
+          [name],
+        );
+        await admin.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+        await admin.query(`DROP OWNED BY "${name}"`);
+        await admin.query(`DROP ROLE IF EXISTS "${name}"`);
+      }),
+  };
+}
+
 /** How many server backends carry `application_name` — this plugin's own, not the database's. */
 export async function backendCount(appName: string): Promise<number> {
   return withAdmin(async (admin) => {
@@ -154,6 +207,8 @@ export interface FaultyProxy extends Fault {
   refuseNew: () => void;
   /** Undo {@link refuseNew}. Connections stranded while it was on stay stranded. */
   admitNew: () => void;
+  /** Abort every connection made so far with an RST in both directions; new ones are admitted. */
+  reset: () => void;
 }
 
 /** A TCP proxy in front of `url` whose behaviour can be changed under a live connection. */
@@ -202,6 +257,9 @@ export async function faultyProxy(url = PG_URL): Promise<FaultyProxy> {
     },
     admitNew: () => {
       admitting = true;
+    },
+    reset: () => {
+      for (const socket of held.splice(0)) socket.resetAndDestroy();
     },
     close: shutdown(server, held),
   };

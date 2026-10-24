@@ -31,6 +31,8 @@ const state = vi.hoisted(() => ({
 
 interface MockShape {
   listened: string[];
+  /** Every statement this connection was asked to run, dead or alive. */
+  sent: string[];
   emit: (event: string, arg?: unknown) => boolean;
 }
 
@@ -39,6 +41,7 @@ vi.mock('pg', async () => {
 
   class MockClient extends FakeEmitter implements MockShape {
     readonly listened: string[] = [];
+    readonly sent: string[] = [];
     constructor() {
       super();
       state.clients.push(this);
@@ -50,6 +53,7 @@ vi.mock('pg', async () => {
       }
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
+      this.sent.push(sql);
       if (state.dead.has(this)) {
         throw new Error('Client has encountered a connection error and is not queryable');
       }
@@ -220,4 +224,44 @@ describe('a seam call across a listener blackout keeps its declared outcome', ()
     },
     30000,
   );
+});
+
+// A listener nobody writes to cannot tell a peer that is gone from one that is merely quiet, so the
+// listener has to be asked to answer — and the question belongs to whichever connection IS the
+// listener. A replacement adopted after a drop that is never asked is one silent peer away from the
+// dead push the asking exists to prevent, and a dropped connection that is still being asked is a
+// timer and a dead socket held for the life of the process, once per reconnect.
+/** Past this, a listener nobody has asked to answer has gone quiet unnoticed for too long. */
+const PROBE_CEILING_MS = 8000;
+
+describe('the listener is asked to answer while it is the listener, and only then', () => {
+  it('a replacement adopted after a drop is probed, and the dropped connection is not', async () => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: URL, table_name: 'parley_bo' });
+    try {
+      const topic = asTopic('probed');
+      await plugin.subscribe(topic, () => undefined);
+      const dropped = state.clients.at(-1) as MockShape;
+      state.dead.add(dropped);
+      dropped.emit('end');
+      const sentBeforeTheDrop = dropped.sent.length;
+
+      const channel = channelFor(topic);
+      await until(() => state.clients.some((c) => c !== dropped && c.listened.includes(channel)));
+      const replacement = state.clients.find((c) => c !== dropped && c.listened.includes(channel));
+      expect(replacement, 'the reconnect never adopted a replacement').toBeDefined();
+      const listens = (replacement as MockShape).sent.length;
+
+      await sleep(PROBE_CEILING_MS);
+      expect(
+        (replacement as MockShape).sent.length,
+        'the replacement listener was never asked to answer',
+      ).toBeGreaterThan(listens);
+      expect(dropped.sent.length, 'a dropped listener was still being written to').toBe(
+        sentBeforeTheDrop,
+      );
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+    }
+  }, 30000);
 });

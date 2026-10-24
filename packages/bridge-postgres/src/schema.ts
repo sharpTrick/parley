@@ -95,6 +95,14 @@ export function channelFor(topic: string): string {
   return `parley_${createHash('md5').update(topic, 'utf8').digest('hex')}`;
 }
 
+/** The doorbell, exactly as `pg_proc.prosrc` holds it, so the bootstrap can tell a stale one. */
+const NOTIFY_BODY = `
+BEGIN
+  PERFORM pg_notify('parley_' || md5(convert_to(NEW.topic, 'UTF8')), NEW.seq::text);
+  RETURN NULL;
+END;
+`;
+
 /**
  * Idempotent DDL: the message table, the sender registry, and the NOTIFY trigger. Run inside a
  * transaction under an advisory lock (index.ts `connect`) so concurrent bridge processes
@@ -110,35 +118,45 @@ export function channelFor(topic: string): string {
  * process's `post()`: `CREATE INDEX` holds SHARE, `CREATE TRIGGER` SHARE ROW EXCLUSIVE, and
  * `ALTER TABLE`/`DROP INDEX` ACCESS EXCLUSIVE — all conflicting
  * with the ROW EXCLUSIVE an INSERT holds — and the `IF NOT EXISTS` spelling still takes the lock. Keep
- * every behavioural change to the doorbell in the trigger FUNCTION (replaced unconditionally), so
- * that skipping the re-create cannot ship a stale one.
+ * every behavioural change to the doorbell in the trigger FUNCTION (replaced whenever its body is
+ * not this one), so that skipping the re-create cannot ship a stale one.
+ *
+ * Every statement here is behind an existence check, the tables and the function included, so that
+ * a start against a table that is already current needs no privilege beyond the DML the seam calls
+ * use: PostgreSQL checks CREATE on the schema before it looks at `IF NOT EXISTS`, and only a
+ * function's owner may `CREATE OR REPLACE` it.
  */
 export function buildSchema(table: string): string {
   const n = quotedNames(table);
   const raw = schemaNames(table);
   const legacyTsIndex = `"${raw.messages}_ts"`;
   return `
-CREATE TABLE IF NOT EXISTS ${n.messages} (
-  seq         BIGSERIAL PRIMARY KEY,
-  topic       TEXT NOT NULL,
-  sender      TEXT NOT NULL,
-  content     TEXT NOT NULL,
-  ts          TEXT NOT NULL,           -- ISO 8601 from the poster's clock, informational only
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- server-stamped; retention decides on this
-  in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
-);
-CREATE TABLE IF NOT EXISTS ${n.senders} (
-  handle      TEXT PRIMARY KEY,
-  backend_ref TEXT NOT NULL
-);
-CREATE OR REPLACE FUNCTION ${n.notifyFn}() RETURNS trigger AS $PARLEY$
-BEGIN
-  PERFORM pg_notify('parley_' || md5(convert_to(NEW.topic, 'UTF8')), NEW.seq::text);
-  RETURN NULL;
-END;
-$PARLEY$ LANGUAGE plpgsql;
 DO $PARLEY_BOOTSTRAP$
 BEGIN
+  IF to_regclass('${n.messages}') IS NULL THEN
+    CREATE TABLE ${n.messages} (
+      seq         BIGSERIAL PRIMARY KEY,
+      topic       TEXT NOT NULL,
+      sender      TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      ts          TEXT NOT NULL,           -- ISO 8601 from the poster's clock, informational only
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- server-stamped; retention decides on this
+      in_reply_to TEXT                     -- backendMsgId this threads under, or NULL
+    );
+  END IF;
+  IF to_regclass('${n.senders}') IS NULL THEN
+    CREATE TABLE ${n.senders} (
+      handle      TEXT PRIMARY KEY,
+      backend_ref TEXT NOT NULL
+    );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc
+    WHERE oid = to_regprocedure('${n.notifyFn}()') AND prosrc = $PARLEY_BODY$${NOTIFY_BODY}$PARLEY_BODY$
+  ) THEN
+    CREATE OR REPLACE FUNCTION ${n.notifyFn}() RETURNS trigger AS $PARLEY$${NOTIFY_BODY}$PARLEY$
+    LANGUAGE plpgsql;
+  END IF;
   IF NOT EXISTS (
     SELECT 1 FROM pg_attribute
     WHERE attrelid = '${n.messages}'::regclass AND attname = 'created_at' AND NOT attisdropped

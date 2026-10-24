@@ -2,7 +2,7 @@ import { asHandle, asTopic, type Message, type Topic } from '@sharptrick/parley-
 import { describe, expect, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
 import { schemaNames } from '../src/schema.js';
-import { dropTable, isUp, PG_URL, rand, sleep, withAdmin } from './pg-harness.js';
+import { dropTable, isUp, PG_URL, rand, scratchRole, sleep, withAdmin } from './pg-harness.js';
 
 // The deployment this plugin is FOR is N bridge processes sharing one table, and every one of them
 // runs the idempotent bootstrap on start. So `connect()` is not a one-off cost: a rolling deploy, a
@@ -111,9 +111,9 @@ const EVERY_RELATION = {
   superseded_ts_index: false,
 };
 
-async function pushWorks(table: string, topic: Topic): Promise<string[]> {
+async function pushWorks(table: string, topic: Topic, url = PG_URL): Promise<string[]> {
   const plugin = new PostgresPlugin();
-  await plugin.connect({ url: PG_URL, table_name: table });
+  await plugin.connect({ url, table_name: table });
   const seen: Message[] = [];
   try {
     await plugin.subscribe(topic, (m) => seen.push(m));
@@ -181,6 +181,99 @@ if (await isUp(PG_URL)) {
         expect(await pushWorks(table, topic), 'the NOTIFY trigger never fired').toEqual(['pushed']);
       } finally {
         await dropTable(table);
+      }
+    }, 60000);
+  });
+
+  // The same deployment under least privilege: one role bootstraps, and every bridge after it runs
+  // as a role granted only the DML its seam calls use. A start against a table that is already
+  // current has nothing to create, so it must need nothing more than that — and a start that DOES
+  // have something to create must say which privilege it lacks rather than hand back the driver's
+  // bare 'permission denied'. The stale-function column is the control on the other side: a body
+  // this version did not write has to be replaced, so only its owner may connect, which is what
+  // proves the comparison that lets everyone else skip it can see a difference at all.
+  type Who = 'the owner' | 'a role with only DML rights' | 'a role with DML rights and CREATE';
+  type State = 'no table yet' | 'already bootstrapped' | 'a trigger function this version did not write';
+  type Outcome = 'connects' | 'refused';
+
+  const PRIVILEGE: Record<Who, Record<State, Outcome>> = {
+    'the owner': {
+      'no table yet': 'connects',
+      'already bootstrapped': 'connects',
+      'a trigger function this version did not write': 'connects',
+    },
+    'a role with only DML rights': {
+      'no table yet': 'refused',
+      'already bootstrapped': 'connects',
+      'a trigger function this version did not write': 'refused',
+    },
+    'a role with DML rights and CREATE': {
+      'no table yet': 'connects',
+      'already bootstrapped': 'connects',
+      'a trigger function this version did not write': 'refused',
+    },
+  };
+
+  const PRIVILEGE_CELLS = (Object.keys(PRIVILEGE) as Who[]).flatMap((who) =>
+    (Object.keys(PRIVILEGE[who]) as State[]).map(
+      (state) => [`${who}, ${state} (${PRIVILEGE[who][state]})`, who, state] as const,
+    ),
+  );
+
+  describe('connect() needs DDL privileges only when it has DDL to do', () => {
+    it.each(PRIVILEGE_CELLS)('%s', async (_label, who, state) => {
+      const scratch = await scratchRole();
+      const table = `parley_boot_${rand()}`;
+      const names = schemaNames(table);
+      const url = who === 'the owner' ? scratch.adminUrl : scratch.url;
+      try {
+        await withAdmin(async (admin) => {
+          if (who === 'a role with DML rights and CREATE') {
+            await admin.query(`GRANT CREATE ON SCHEMA "${scratch.schema}" TO "${scratch.role}"`);
+          }
+        });
+        if (state !== 'no table yet') {
+          const first = new PostgresPlugin();
+          await first.connect({ url: scratch.adminUrl, table_name: table });
+          await first.disconnect();
+          await withAdmin(async (admin) => {
+            const s = `"${scratch.schema}"`;
+            await admin.query(
+              `GRANT SELECT, INSERT ON ${s}."${names.messages}", ${s}."${names.senders}" TO "${scratch.role}"`,
+            );
+            await admin.query(
+              `GRANT USAGE ON SEQUENCE ${s}."${names.messages}_seq_seq" TO "${scratch.role}"`,
+            );
+            if (state === 'a trigger function this version did not write') {
+              // A doorbell that never rings, so a bootstrap that leaves it in place is visible.
+              await admin.query(
+                `CREATE OR REPLACE FUNCTION ${s}."${names.notifyFn}"() RETURNS trigger AS $$ ` +
+                  'BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql',
+              );
+            }
+          });
+        }
+
+        const plugin = new PostgresPlugin();
+        const outcome = await plugin.connect({ url, table_name: table }).then(
+          () => 'connected',
+          (e: unknown) => (e as Error).message,
+        );
+        await plugin.disconnect();
+
+        if (PRIVILEGE[who][state] === 'refused') {
+          expect(outcome, 'connect() bootstrapped what this role may not create').not.toBe('connected');
+          expect(outcome).toMatch(new RegExp(`^parley-postgres: the bootstrap of table '${table}'`));
+          expect(outcome, 'the refusal does not say a privilege is what is missing').toContain('42501');
+          return;
+        }
+        expect(outcome, 'connect() demanded a privilege it had nothing to use for').toBe('connected');
+        const topic = asTopic(`boot-${rand()}`);
+        expect(await pushWorks(table, topic, url), 'the NOTIFY trigger never fired').toEqual([
+          'pushed',
+        ]);
+      } finally {
+        await scratch.drop();
       }
     }, 60000);
   });

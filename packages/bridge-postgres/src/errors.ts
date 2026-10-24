@@ -167,6 +167,26 @@ export function answerAbandoned(what: string, budgetMs: number, err: unknown): E
   );
 }
 
+/** PostgreSQL's SQLSTATE for a role lacking a privilege the statement needs. */
+const INSUFFICIENT_PRIVILEGE = '42501';
+
+/**
+ * Name a bootstrap the connecting role may not perform. A start against a current table needs no
+ * DDL at all, so reaching this means there IS something to create or replace — which only a role
+ * with CREATE on the schema, owning what is already there, may do.
+ */
+export function bootstrapForbidden(table: string, err: unknown): Error {
+  if ((err as { code?: string } | undefined)?.code !== INSUFFICIENT_PRIVILEGE) return err as Error;
+  const detail = err instanceof Error ? err.message : String(err);
+  return new Error(
+    `parley-postgres: the bootstrap of table '${table}' needs a privilege this role lacks ` +
+      `(${INSUFFICIENT_PRIVILEGE}: ${detail}). Nothing was created. Connect once as the role that ` +
+      'owns the tables and their trigger function — or, for a table not yet created, any role ' +
+      'with CREATE on the schema — so that it can create what is missing or bring the function ' +
+      'up to date; after that, a role with only the DML rights on those tables connects too.',
+  );
+}
+
 /** PostgreSQL's SQLSTATE for a statement that gave up waiting on a lock (`lock_timeout`). */
 const LOCK_NOT_AVAILABLE = '55P03';
 

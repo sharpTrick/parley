@@ -5,6 +5,8 @@ import { PostgresPush } from './push.js';
 
 /** Backoff between listener reconnect attempts after the connection drops. */
 const RECONNECT_DELAY_MS = 500;
+/** How often the adopted listener is asked to answer — see {@link PostgresListener.heartbeat}. */
+const HEARTBEAT_MS = 5000;
 /**
  * How long a seam call waits for the shared LISTEN connection — a first connect, or the backoff
  * reconnect after a drop — before giving up. Bounded for the same reason as {@link LOCK_WAIT_MS}.
@@ -125,7 +127,23 @@ export abstract class PostgresListener extends PostgresPush {
       throw new Error('parley-postgres: disconnected while the listener connection was in flight');
     }
     this.listener = client;
+    this.heartbeat(client);
     return client;
+  }
+
+  /**
+   * Ask the listener to answer, every {@link HEARTBEAT_MS}. Once its LISTENs are in place nothing
+   * else is sent on it, so a peer that stops answering while it holds the socket open — a hung
+   * primary, a pooler mid-failover — is otherwise silence rather than an 'end': no reconnect, no
+   * redrive, and push stays dead while the bridge believes it is subscribed. The probe is bounded by
+   * the client's `query_timeout`, and a probe that fails hands the socket to the same 'end' recovery
+   * every other loss goes through.
+   */
+  private heartbeat(client: Client): void {
+    const beat = setInterval(() => {
+      client.query('SELECT 1').catch(() => void endWithin(client, 0));
+    }, HEARTBEAT_MS).unref();
+    client.once('end', () => clearInterval(beat));
   }
 
   /**

@@ -111,6 +111,16 @@ config:
 table-level lock: the `CREATE TRIGGER` runs only when the trigger is missing. A rolling restart
 therefore does not stall the other processes' `post()`s.
 
+Nor does it need DDL privileges on such a table. Every statement in the bootstrap runs only when
+there is something to create or replace, so the bridges can run as a role holding just `SELECT` and
+`INSERT` on `<table_name>` and `<table_name>_senders`, `USAGE` on `<table_name>_seq_seq`, and
+`DELETE` on `<table_name>` if `retention_days` is set. Two starts are the exception, and need the
+role that owns the tables and their trigger function (or, for the first, any role with `CREATE` on
+the schema): the first one against a table that does not exist yet, and the first one after an
+upgrade that changes the trigger function. Run under the narrower role, those fail with
+`parley-postgres: the bootstrap of table '…' needs a privilege this role lacks (42501: …)` and
+create nothing.
+
 Cross-process write safety is structural, not configured: `post` wraps every insert in a
 transaction that takes `pg_advisory_xact_lock(hashtext(topic))` first. `BIGSERIAL` assigns `seq`
 at INSERT time, not COMMIT time, so without the lock a larger `seq` could become visible before

@@ -1,9 +1,19 @@
 import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { INDEXED_FIELDS, MAX_INDEXED_BYTES } from '../src/errors.js';
 import { PostgresPlugin } from '../src/index.js';
 import { buildSchema } from '../src/schema.js';
-import { dropTable, isUp, PG_URL, rand, withAdmin } from './pg-harness.js';
+import {
+  dropTable,
+  faultyProxy,
+  isUp,
+  PG_URL,
+  rand,
+  scratchRole,
+  sleep,
+  withAdmin,
+} from './pg-harness.js';
 import { type Field, incompressible } from './storable-corpus.js';
 
 // Two facts about a SERVER are compiled into this plugin: how large an index key PostgreSQL will
@@ -245,49 +255,117 @@ describe.skipIf(!up)(`a refusal this plugin never anticipated is still named (${
     });
   }, 30000);
 
-  // What the SERVER says about a relation that is not there — the disclosure this plugin is between
-  // the agent and, and the classification it is allowed to pass on. Read off the server rather than
-  // written down here: a hand-written expectation of PostgreSQL's wording is the thing that makes
-  // the rows below pass on a deployment whose driver never named the relation in the first place.
-  const absent = `parley_absent_${rand()}`;
-  let discloses = { message: '', code: '' };
+  // What the SERVER says at each place a seam call can fail — the disclosure this plugin is between
+  // the agent and, and the classification it is allowed to pass on. Measured per row off a direct
+  // connection broken the same way, rather than written down here: a hand-written expectation of the
+  // driver's wording is what makes a row pass on a deployment whose driver never quoted it at all.
+  interface Broken {
+    /** What the driver's own text quotes about the deployment at this site. */
+    secret: string;
+    disclosed: { message: string; code: string };
+    cleanup: () => Promise<void>;
+  }
 
-  // Taken in setup rather than in the case below, so that running one row on its own still has it.
-  beforeAll(async () => {
-    discloses = await withAdmin(async (admin) => {
-      const failed = await admin.query(`SELECT 1 FROM "${absent}"`).then(
-        () => undefined,
-        (e: unknown) => e as { message: string; code: string },
-      );
-      return { message: failed?.message ?? '', code: failed?.code ?? '' };
-    });
-  });
-
-  it('the driver really does name the relation, so the rows below are not vacuous', () => {
-    expect(discloses.message, 'the server did not quote the relation it could not find').toContain(
-      absent,
+  const failure = (attempt: () => Promise<unknown>): Promise<Broken['disclosed']> =>
+    attempt().then(
+      () => ({ message: 'RESOLVED', code: '' }),
+      (e: unknown) => ({
+        message: String((e as Error).message),
+        code: String((e as { code?: unknown }).code ?? ''),
+      }),
     );
-    expect(discloses.code, 'the server refused it with no code to hand on').not.toBe('');
-  });
+
+  const freshConnection = (url: string): Promise<Broken['disclosed']> => {
+    const direct = new Client({ connectionString: url });
+    direct.on('error', () => undefined);
+    return failure(async () => {
+      try {
+        await direct.connect();
+        await direct.query('SELECT 1');
+      } finally {
+        await direct.end().catch(() => undefined);
+      }
+    });
+  };
+
+  // The failure SITE is the axis: a refusal can land on a statement, or before any statement, on the
+  // pooled checkout that has to dial a fresh connection. The checkout sites are why this is a table —
+  // a statement site alone is reached only after a checkout that succeeded.
+  const SITES: Record<string, (solo: PostgresPlugin, table: string) => Promise<Broken>> = {
+    'the relation is gone from under it': async (solo, table) => {
+      await solo.connect({ url: PG_URL, table_name: table, pool_size: 1 });
+      await withAdmin(async (admin) => {
+        await admin.query(`DROP TABLE "${table}" CASCADE`);
+        await admin.query(`DROP TABLE "${table}_senders" CASCADE`);
+      });
+      const disclosed = await withAdmin((admin) =>
+        failure(() => admin.query(`SELECT 1 FROM "${table}"`)),
+      );
+      return { secret: table, disclosed, cleanup: () => dropTable(table) };
+    },
+    'a fresh connection is refused at the dial': async (solo, table) => {
+      const proxy = await faultyProxy();
+      await solo.connect({ url: proxy.url, table_name: table, pool_size: 1 });
+      await proxy.close();
+      const { hostname, port } = new URL(proxy.url);
+      return {
+        secret: `${hostname}:${port}`,
+        disclosed: await freshConnection(proxy.url),
+        cleanup: () => dropTable(table),
+      };
+    },
+    'a fresh connection is refused at login': async (solo, table) => {
+      const scratch = await scratchRole();
+      try {
+        await withAdmin(async (admin) => {
+          await admin.query(`GRANT CREATE ON SCHEMA "${scratch.schema}" TO "${scratch.role}"`);
+        });
+        await solo.connect({ url: scratch.url, table_name: table, pool_size: 1 });
+        await withAdmin(async (admin) => {
+          await admin.query(`ALTER ROLE "${scratch.role}" NOLOGIN`);
+          await admin.query(
+            'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1',
+            [scratch.role],
+          );
+        });
+        return {
+          secret: scratch.role,
+          disclosed: await freshConnection(scratch.url),
+          cleanup: scratch.drop,
+        };
+      } catch (err) {
+        await scratch.drop();
+        throw err;
+      }
+    },
+  };
+
+  const CELLS = Object.keys(SITES).flatMap((site) =>
+    (['post', 'fetchRecent', 'resolveIdentity'] as const).map((call) => [call, site] as const),
+  );
 
   // The class: no rejection `serverRefused` builds quotes the deployment. One row per seam call that
-  // reaches it, each against a relation name this run minted — a generated name cannot be satisfied
-  // by accident, the way a regex written against one remembered message can.
+  // reaches it x where it fails, each against a name or an address this run minted — a generated
+  // value cannot be satisfied by accident, the way a regex written against one remembered message can.
   //
   // `subscribe` is NOT here, and it leaks: its own wrapper hands a driver refusal through verbatim,
   // and subscribe-errors.test.ts requires that of it by name. Closing that is a change to what that
   // file asserts, not to this one.
-  it.each(['post', 'fetchRecent', 'resolveIdentity'])(
-    '%s names this plugin, and not the deployment, when the relation is gone from under it',
-    async (call) => {
-      const gone = `parley_gone_${rand()}`;
+  it.each(CELLS)(
+    '%s names this plugin, and not the deployment, when %s',
+    async (call, site) => {
+      const table = `parley_gone_${rand()}`;
       const solo = new PostgresPlugin();
-      await solo.connect({ url: PG_URL, table_name: gone, pool_size: 1 });
+      const broken = await (SITES[site] as (typeof SITES)[string])(solo, table);
       try {
-        await withAdmin(async (admin) => {
-          await admin.query(`DROP TABLE "${gone}" CASCADE`);
-          await admin.query(`DROP TABLE "${gone}_senders" CASCADE`);
-        });
+        expect(broken.disclosed.message, 'the driver does not quote the deployment here').toContain(
+          broken.secret,
+        );
+        expect(broken.disclosed.code, 'the driver refused it with no code to hand on').not.toBe('');
+        // The pool's idle connection died with the fault; let it leave the pool, so the call below
+        // has to check out a fresh one.
+        await sleep(250);
+
         const topic = asTopic(`gone-${rand()}`);
         // Taking the detail out of the answer is only half of it: an operator whose role lost a
         // permission, or whose disk filled, has to still learn of it somewhere, and this plugin
@@ -307,24 +385,24 @@ describe.skipIf(!up)(`a refusal this plugin never anticipated is still named (${
           (e: unknown) => (e as Error).message,
         );
         stderr.mockRestore();
-        expect(message, 'the relation is gone — this must not read as a success').not.toBe(
+        expect(message, 'the database refused it — this must not read as a success').not.toBe(
           'RESOLVED',
         );
         expect(message).toMatch(/^parley-postgres: /);
-        expect(message, "the deployment's own relation name reached agent context").not.toContain(
-          gone,
+        expect(message, 'what the driver said about the deployment reached agent context').not.toContain(
+          broken.secret,
         );
         expect(
           message,
           'the refusal carries nothing the operator can look the condition up by',
-        ).toContain(discloses.code);
+        ).toContain(broken.disclosed.code);
         expect(
           logged.join('\n'),
           "the driver's text reached neither the caller nor the operator",
-        ).toContain(gone);
+        ).toContain(broken.secret);
       } finally {
         await solo.disconnect().catch(() => undefined);
-        await dropTable(gone);
+        await broken.cleanup();
       }
     },
     30000,

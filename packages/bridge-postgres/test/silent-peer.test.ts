@@ -10,6 +10,7 @@ import {
   settleWithin,
   silentPeer,
   sleep,
+  terminateBackends,
 } from './pg-harness.js';
 
 // Class: a peer that is REACHABLE but not ANSWERING. TCP succeeds, so nothing errors; the bytes
@@ -343,6 +344,70 @@ if (await isUp(PG_URL)) {
         ]);
       } finally {
         await settleWithin(plugin.disconnect().catch(() => undefined), CLEANUP_BUDGET_MS);
+        await proxy.close();
+        await dropTable(table);
+      }
+    }, 90000);
+  });
+
+  // The other half of a peer that goes quiet: not that the calls SETTLE, but that push COMES BACK.
+  // The listener is the one connection nothing in a seam call ever writes to, so a peer that stops
+  // answering while it holds the socket open raises nothing on it at all — and push is then dead
+  // for every topic while the bridge believes it is subscribed. One row per way the listener's peer
+  // can fail; each posts a row while the listener is down and requires that row pushed.
+  //
+  // The held-open row heals afterwards, standing in for the failover finishing: new dials reach a
+  // server again while the old socket stays one whose bytes were lost. Without the heal no
+  // replacement could ever land, and the row would grade the network rather than this plugin.
+  const PUSH_RECOVERY_CEILING_MS = 30_000;
+  /** Long enough that a listener probe at any cadence an operator would call live lands inside it. */
+  const HELD_OPEN_MS = 10_000;
+
+  type PeerFailure = 'FIN' | 'RST' | 'black-holed with the socket held open';
+  const PEER_FAILURES: PeerFailure[] = ['FIN', 'RST', 'black-holed with the socket held open'];
+
+  describe('push recovers from every way the listener’s peer can fail', () => {
+    it.each(PEER_FAILURES)('%s', async (failure) => {
+      const proxy = await faultyProxy();
+      const appName = `parley_peer_${rand()}`;
+      const table = `parley_peer_${rand()}`;
+      const topic = asTopic(`peer-${rand()}`);
+      const plugin = new PostgresPlugin();
+      const writer = new PostgresPlugin();
+      const delivered: string[] = [];
+      const arrived = async (n: number, budgetMs: number): Promise<void> => {
+        const deadline = Date.now() + budgetMs;
+        while (delivered.length < n && Date.now() < deadline) await sleep(50);
+      };
+      try {
+        const url = new URL(proxy.url);
+        url.searchParams.set('application_name', appName);
+        await plugin.connect({ url: url.toString(), table_name: table });
+        await writer.connect({ url: PG_URL, table_name: table });
+        await plugin.subscribe(topic, (m) => delivered.push(m.content));
+        await writer.post(topic, asHandle('u'), 'before');
+        await arrived(1, 5000);
+        expect(delivered, 'push was not live before the fault, so this row grades nothing').toEqual([
+          'before',
+        ]);
+
+        if (failure === 'FIN') await terminateBackends(appName);
+        else if (failure === 'RST') proxy.reset();
+        else proxy.blackhole();
+        await writer.post(topic, asHandle('u'), 'while the listener was down');
+        if (failure === 'black-holed with the socket held open') {
+          await sleep(HELD_OPEN_MS);
+          proxy.heal();
+        }
+
+        await arrived(2, PUSH_RECOVERY_CEILING_MS);
+        expect(delivered, 'push stayed dead after the listener’s peer failed').toEqual([
+          'before',
+          'while the listener was down',
+        ]);
+      } finally {
+        await settleWithin(plugin.disconnect().catch(() => undefined), CLEANUP_BUDGET_MS);
+        await writer.disconnect().catch(() => undefined);
         await proxy.close();
         await dropTable(table);
       }

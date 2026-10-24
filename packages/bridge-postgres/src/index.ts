@@ -27,6 +27,7 @@ import {
   answerNeverCame,
   assertCursor,
   assertStorable,
+  bootstrapForbidden,
   dialAbandoned,
   LOCK_WAIT_MS,
   lockWaitAbandoned,
@@ -140,7 +141,8 @@ export class PostgresPlugin extends PostgresListener implements BackendPlugin {
       client.release(true);
       this.starting.delete(pool);
       await endWithin(pool, TEARDOWN_WAIT_MS);
-      const named = lockWaitAbandoned(`bootstrap lock on table '${table}'`, err);
+      const forbidden = bootstrapForbidden(table, err);
+      const named = lockWaitAbandoned(`bootstrap lock on table '${table}'`, forbidden);
       throw answerAbandoned(`the bootstrap of table '${table}'`, QUERY_WAIT_MS, named);
     }
     client.release();
@@ -279,7 +281,12 @@ export class PostgresPlugin extends PostgresListener implements BackendPlugin {
     assertStorable('handle', identity);
     assertStorable('content', content);
     if (opts?.inReplyTo !== undefined) assertStorable('inReplyTo', opts.inReplyTo);
-    const client = await this.require().connect();
+    let client: PoolClient;
+    try {
+      client = await this.require().connect();
+    } catch (err) {
+      throw serverRefused(`the write to topic '${topic}'`, err);
+    }
     try {
       // Keep the registry upsert OUTSIDE the transaction below, so that it cannot lengthen the
       // advisory-locked critical section every same-topic post from every bridge process queues
