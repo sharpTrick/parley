@@ -54,11 +54,11 @@ incarnation for the same reason the id does, on the read side: a persisted curso
 naming a sequence of a stream that is gone is a position the new incarnation reaches again for
 entirely different messages. Catch-up compares the cursor's incarnation with the stream's, so a
 re-provisioned stream is recognised exactly — whether the new incarnation is shorter than the
-persisted sequence or has already grown past it — and that read falls back to the retained window,
-i.e. it returns what a cold start returns rather than resuming at a sequence the new stream never
-assigned. A bare decimal `since` (the pre-0.x cursor form, or a hand-written one) names no
-incarnation, so it can only be judged by the tail it sits above — until the next page that returns a
-message hands back a qualified one.
+persisted sequence or has already grown past it — and that read resumes at the new stream's FIRST
+retained message rather than at a sequence the new stream never assigned: every message the new
+incarnation holds is one the cursor's reader has not seen. A bare decimal `since` (the pre-0.x
+cursor form, or a hand-written one) names no incarnation, so it can only be judged by the tail it
+sits above — until the next page that returns a message hands back a qualified one.
 
 `subscribe` is **not** a nats.js `OrderedConsumer`: it is a plain named ephemeral consumer plus an
 explicit watcher. The server GCs such a consumer after 30s of client absence and `consume()` does

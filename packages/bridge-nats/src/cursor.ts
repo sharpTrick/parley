@@ -11,8 +11,7 @@ export const incarnationToken = (created: string | undefined): string =>
 /**
  * The page a read of a topic with no stream returns. The bare `0` names no incarnation and sits
  * below every sequence, so the catch-up that follows the peer's first `post` starts at the new
- * stream's first message instead of being judged a cursor from a dead incarnation and served the
- * newest window — which would skip everything below it.
+ * stream's first message.
  */
 const ABSENT_TOPIC_CURSOR = asCursor('0');
 

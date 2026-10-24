@@ -1,7 +1,7 @@
 import { asCursor, asTopic, type Cursor, type Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
-import { fakeJetStream, injectFake, payload, type FakeJetStream } from './fake-jetstream.js';
+import { fakeJetStream, injectFake, payload, type FakeJetStream, type FakeRecord } from './fake-jetstream.js';
 
 // Class: a page that returned FEWER messages than its window contained must never advance the
 // cursor past the messages it did not return. Core persists `nextCursor` and replays it as `since`,
@@ -190,6 +190,57 @@ describe('nats cursor integrity — a short read must not skip what it did not r
         expect([...returned, ...replayed]).toEqual(shape.expected);
         expect(returned.length).toBeGreaterThan(0);
       }, 60_000);
+    }
+  }
+});
+
+// The same class across a since-less page drawn from SEVERAL windows of a sparse history: a page is
+// complete from its own first message, whichever window's read came up short. The histories hold a
+// hole (deleted, or another subject's) wide enough that every limit between one and the topic's
+// depth crosses it somewhere, so a page stitched from a short lower window under a higher one is
+// reachable — and the floor keeps "returned nothing, replayed nothing" from passing.
+describe('nats cursor integrity — a short read in any window of a sparse history skips nothing', () => {
+  const own = (seqs: number[]): FakeRecord[] => seqs.map((seq) => ({ seq, data: payload(`m${seq}`) }));
+  const foreign = (seqs: number[]): FakeRecord[] =>
+    seqs.map((seq) => ({ seq, data: payload(`foreign${seq}`), subject: 'parley.someone-elses-topic' }));
+  const range = (from: number, to: number): number[] =>
+    Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  const histories: { name: string; seqs: number[]; records: FakeRecord[] }[] = [
+    { name: 'a deleted run under the tail', seqs: [...range(1, 10), 20], records: own([...range(1, 10), 20]) },
+    {
+      name: 'two deleted runs',
+      seqs: [...range(1, 4), ...range(9, 12), 30],
+      records: own([...range(1, 4), ...range(9, 12), 30]),
+    },
+    {
+      name: 'a run of another subject under the tail',
+      seqs: [...range(1, 6), 16],
+      records: [...own(range(1, 6)), ...foreign(range(7, 15)), ...own([16])].sort((x, y) => x.seq - y.seq),
+    },
+  ];
+  const shortReads = [Number.POSITIVE_INFINITY, 3, 2, 1, 0];
+
+  for (const history of histories) {
+    for (const yieldLimit of shortReads) {
+      it(`${history.name}, a read that yields ${yieldLimit} per pull: every page plus its replay is a complete suffix`, async () => {
+        const all = history.seqs.map((s) => `m${s}`);
+        let widest = 0;
+        for (let limit = 1; limit <= all.length; limit++) {
+          const fake = fakeJetStream({ records: history.records, yieldLimit });
+          const plugin = new NatsPlugin();
+          injectFake(plugin, fake, TOPIC);
+
+          const page = await plugin.fetchRecent({ topic: TOPIC, limit });
+          widest = Math.max(widest, fake.state.created.length);
+          const returned = page.messages.map((m) => m.content);
+          const replayed = await replayFrom(plugin, fake, TOPIC, page.nextCursor);
+          const seen = [...returned, ...replayed];
+
+          expect(seen, `limit ${limit}`).toEqual(all.slice(all.length - seen.length));
+          expect(seen.length, `limit ${limit}`).toBeGreaterThanOrEqual(limit);
+        }
+        expect(widest, 'no limit made the page cross the hole').toBeGreaterThanOrEqual(2);
+      }, 30_000);
     }
   }
 });

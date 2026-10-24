@@ -90,16 +90,16 @@ export abstract class NatsReads extends NatsPulls {
     const lastSeq = info.state.last_seq;
     const firstSeq = info.state.first_seq;
     // A cursor minted by a DIFFERENT incarnation names a sequence of a stream that no longer
-    // exists: re-provisioning restarts the sequences at 1, so that number says nothing about where
-    // the new stream's history begins. Keep the fall back to the retained window, so that catch-up
-    // neither goes deaf waiting on a sequence that will not come nor silently skips everything the
-    // new incarnation holds below it. A legacy bare cursor names no incarnation, so it can only be
-    // judged by the tail it sits above.
+    // exists: re-provisioning restarts the sequences at 1, so every message the new stream holds is
+    // one this reader has not seen. Keep it read from the new stream's FIRST message: the newest
+    // window instead skips everything the new incarnation holds below that window. A legacy bare
+    // cursor names no incarnation, so it can only be judged by the tail it sits above.
     const restarted =
       since !== undefined &&
       (since.incarnation === undefined
         ? since.seq > lastSeq
         : since.incarnation !== this.incarnation(stream));
+    const after = since === undefined ? undefined : restarted ? 0 : since.seq;
     const emptyCursor =
       since === undefined || restarted ? this.cursorAt(stream, lastSeq) : (args.since as Cursor);
     const blockMs = args.blockMs ?? 0;
@@ -132,12 +132,12 @@ export abstract class NatsReads extends NatsPulls {
     // still served by the widening below.
     const tailSeq = (await this.tailSequence(stream, args.topic)) ?? lastSeq;
 
-    if (since !== undefined && !restarted) {
+    if (after !== undefined) {
       // JetStream prunes from the front (`max_age`), and a pull below `first_seq` starts at the
       // first surviving sequence rather than stalling. Keep the clamp anyway, so that an empty read
       // of a pruned window resumes ABOVE the gap: without it the cursor of that page is the `since`
       // it was handed, and catch-up re-reads a range the server will never fill again.
-      const startSeq = Math.max(since.seq + 1, firstSeq, 1);
+      const startSeq = Math.max(after + 1, firstSeq, 1);
       if (startSeq > tailSeq) return waitOrNothing(startSeq);
       const read = await this.pull(stream, args.topic, startSeq, Math.min(limit, tailSeq - startSeq + 1), tailSeq);
       return pageOrWait(read, startSeq);
@@ -150,13 +150,21 @@ export abstract class NatsReads extends NatsPulls {
     // cold start stream — and materialize — every message the topic ever had to return `limit`.
     let newest: Message[] = [];
     let startSeq = tailSeq + 1;
+    let stitched = false;
     for (let span = limit, top = tailSeq; newest.length < limit && top >= firstSeq; span *= WIDEN_FACTOR) {
       startSeq = Math.max(firstSeq, top - span + 1, 1);
       const read = await this.pull(stream, args.topic, startSeq, top - startSeq + 1, top, limit - newest.length);
+      stitched ||= read.length > 0 && newest.length > 0;
       newest = read.concat(newest);
       if (startSeq <= firstSeq) break;
       top = startSeq - 1;
     }
-    return pageOrWait(newest, startSeq);
+    // Any window's pull can end short (idle close, expiry, slow link), and nothing proves a lower one
+    // did not: stitched under a higher window, its unread rest sits below a cursor that has already
+    // passed it. Keep the page ONE ascending pull from the walk's lowest message, so that a short
+    // read can only cut the page's top.
+    const lowest = stitched ? parseCursor(newest[0]?.cursor)?.seq : undefined;
+    if (lowest === undefined) return pageOrWait(newest, startSeq);
+    return pageOrWait(await this.pull(stream, args.topic, lowest, limit, tailSeq), lowest);
   }
 }

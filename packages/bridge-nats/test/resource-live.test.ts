@@ -489,7 +489,9 @@ suite('nats resource hygiene against a live server', () => {
     }, 30_000);
 
     // The no-`since` read above is the one shape that cannot fail; replaying the cursor the bridge
-    // actually persisted is what exercises a store re-provisioned underneath it.
+    // actually persisted is what exercises a store re-provisioned underneath it. Drained in pages
+    // SMALLER than what the removal left behind: a page that covers everything cannot tell a read
+    // from the new stream's start apart from one that skips to its newest window.
     it(`catch-up from the pre-removal cursor recovers after ${removal.name}`, async () => {
       const plugin = new NatsPlugin();
       await plugin.connect(cfg);
@@ -499,13 +501,14 @@ suite('nats resource hygiene against a live server', () => {
         await plugin.post(topic, asHandle('sys'), 'before-2');
         const stale = (await plugin.fetchRecent({ topic })).nextCursor;
         await removal.break(`${streamPrefix}${topic}`);
-        await plugin.post(topic, asHandle('sys'), 'after-1');
+        const after = ['after-1', 'after-2', 'after-3', 'after-4', 'after-5'];
+        for (const c of after) await plugin.post(topic, asHandle('sys'), c);
 
         const drain = async (from: string): Promise<{ seen: string[]; cursor: string }> => {
           const seen: string[] = [];
           let cursor = from;
-          for (let i = 0; i < 6; i++) {
-            const page = await plugin.fetchRecent({ topic, since: cursor as never });
+          for (let i = 0; i < 10; i++) {
+            const page = await plugin.fetchRecent({ topic, since: cursor as never, limit: 2 });
             if (page.messages.length === 0) break;
             seen.push(...page.messages.map((m) => m.content));
             cursor = page.nextCursor;
@@ -514,11 +517,11 @@ suite('nats resource hygiene against a live server', () => {
         };
 
         const first = await drain(stale);
-        expect(first.seen).toContain('after-1');
+        expect(first.seen).toEqual(after);
         expect(first.cursor).not.toBe(stale);
 
-        await plugin.post(topic, asHandle('sys'), 'after-2');
-        expect((await drain(first.cursor)).seen).toContain('after-2');
+        await plugin.post(topic, asHandle('sys'), 'later');
+        expect((await drain(first.cursor)).seen).toEqual(['later']);
       } finally {
         await plugin.disconnect();
       }

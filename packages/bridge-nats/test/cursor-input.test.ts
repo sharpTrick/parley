@@ -3,17 +3,14 @@ import { describe, expect, it } from 'vitest';
 import { NatsPlugin } from '../src/index.js';
 import { fakeJetStream, injectFake, payload, type FakeJetStream } from './fake-jetstream.js';
 
-// Class 1: the backend store was RE-PROVISIONED under a persisted cursor. JetStream sequences
-// restart at 1 in a recreated stream, so a cursor minted against the old one names a sequence the
-// new one will not reach for a long time — or ever. Catch-up must fall back to the retained window,
-// never park on that cursor and return empty pages forever while post/subscribe keep working.
-// The axis that decides this is the new incarnation's LENGTH relative to the persisted sequence:
-// a cursor ABOVE the new tail is the easy half, and a test table that only ever supplies those
-// certifies a rule ("the cursor sits past the tail") rather than the property. Once the new
-// incarnation has GROWN past that sequence, a length-based rule reads the cursor as a live position
-// in a stream that never held it and silently skips everything below it — so every row is graded
-// against the one answer that is right for a cursor of an incarnation that is gone: the page a
-// COLD reader gets.
+// Class 1: the backend store was RE-PROVISIONED under a persisted cursor. Every message the new
+// incarnation holds is one that cursor's reader has never seen, so draining from it yields ALL of
+// them, in order — never parked on a sequence the new stream will not reach, and never resumed at
+// the new stream's tail. Two axes decide this, and a table missing either certifies a rule rather
+// than the property: the new incarnation's LENGTH relative to the persisted sequence (a cursor ABOVE
+// the new tail is the easy half — one that has grown past it reads as a live position), and its
+// length relative to the page `limit` (a newest-window fallback is indistinguishable from a complete
+// read whenever one page covers the whole incarnation).
 // Class 2: `since` is caller input (`parley_fetch_recent` declares it as a plain string), so a
 // value this plugin could not have minted must fail loudly. It may never become a permanently
 // empty page whose `nextCursor` echoes the junk back while the stream demonstrably has messages.
@@ -28,11 +25,11 @@ function withRecords(contents: string[]): { plugin: NatsPlugin; fake: FakeJetStr
 }
 
 /** Everything a reader still sees when it resumes from `cursor` and keeps following nextCursor. */
-async function drainFrom(plugin: NatsPlugin, cursor: Cursor): Promise<string[]> {
+async function drainFrom(plugin: NatsPlugin, cursor: Cursor, limit?: number): Promise<string[]> {
   const seen: string[] = [];
   let since = cursor;
-  for (let i = 0; i < 6; i++) {
-    const page = await plugin.fetchRecent({ topic: TOPIC, since });
+  for (let i = 0; i < 200; i++) {
+    const page = await plugin.fetchRecent({ topic: TOPIC, since, ...(limit === undefined ? {} : { limit }) });
     if (page.messages.length === 0) break;
     seen.push(...page.messages.map((m) => m.content));
     since = page.nextCursor;
@@ -61,8 +58,11 @@ describe('nats catch-up survives a stream re-provisioned under the cursor', () =
 
         expect(page.messages.length).toBeGreaterThan(0);
         expect(page.nextCursor).not.toBe(stale);
-        const seen = [...page.messages.map((m) => m.content), ...(await drainFrom(plugin, page.nextCursor))];
-        expect(ALL.slice(ALL.length - seen.length)).toEqual(seen);
+        const seen = [
+          ...page.messages.map((m) => m.content),
+          ...(await drainFrom(plugin, page.nextCursor, read.extra.limit)),
+        ];
+        expect(seen).toEqual(ALL);
 
         fake.state.records.push({ seq: ALL.length + 1, data: payload('later') });
         expect(await drainFrom(plugin, page.nextCursor)).toContain('later');
@@ -108,12 +108,25 @@ const reprovisions = [
   { name: 'reaches exactly the persisted sequence', length: 5 },
   { name: 'has just grown past the persisted sequence', length: 6 },
   { name: 'has grown far past the persisted sequence', length: 40 },
+  { name: 'has grown past a default page', length: 150 },
+];
+
+const drains: { name: string; extra: { blockMs?: number; limit?: number } }[] = [
+  ...reads,
+  ...[3, 50].map((limit) => ({ name: `limit-${limit} catch-up`, extra: { limit } })),
 ];
 
 describe('nats catch-up judges a cursor by the incarnation that minted it, not by the tail', () => {
+  it('the table holds incarnations longer than the page that drains them', () => {
+    const pages = drains.map((d) => d.extra.limit ?? 100);
+    for (const limit of pages) {
+      expect(reprovisions.some((r) => r.length > limit), `limit ${limit}`).toBe(true);
+    }
+  });
+
   for (const reprovision of reprovisions) {
-    for (const read of reads) {
-      it(`${read.name} from a cursor whose incarnation ${reprovision.name} reads as a cold start`, async () => {
+    for (const read of drains) {
+      it(`${read.name} from a cursor whose incarnation ${reprovision.name} drains everything it holds`, async () => {
         const live = lives(reprovision.length);
         const fake = fakeJetStream({ records: born(OLD), streamCreated: OLD_INCARNATION });
         const plugin = new NatsPlugin();
@@ -123,20 +136,17 @@ describe('nats catch-up judges a cursor by the incarnation that minted it, not b
         fake.state.records = born(live);
         fake.state.streamCreated = NEW_INCARNATION;
         const page = await plugin.fetchRecent({ topic: TOPIC, since: stale, ...read.extra });
+        const seen = [
+          ...page.messages.map((m) => m.content),
+          ...(await drainFrom(plugin, page.nextCursor, read.extra.limit)),
+        ];
 
-        const coldFake = fakeJetStream({ records: born(live), streamCreated: NEW_INCARNATION });
-        const cold = new NatsPlugin();
-        injectFake(cold, coldFake, TOPIC);
-        const reference = await cold.fetchRecent({ topic: TOPIC, ...read.extra });
-
-        expect(page.messages.map((m) => m.content)).toEqual(reference.messages.map((m) => m.content));
-        expect(page.nextCursor).toBe(reference.nextCursor);
-        expect(page.messages.map((m) => m.content).filter((c) => c.startsWith('o'))).toEqual([]);
+        expect(seen).toEqual(live);
 
         // …and the cursor that page hands back keeps working in the incarnation that is now live.
         fake.state.records.push({ seq: live.length + 1, data: payload('later') });
         expect(await drainFrom(plugin, page.nextCursor)).toContain('later');
-      }, 20_000);
+      }, 30_000);
     }
   }
 });

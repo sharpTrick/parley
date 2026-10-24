@@ -95,8 +95,8 @@ const positions: Position[] = [
 
 /**
  * The exact page the shape owes this position. A `since` above the reported `last_seq` names a
- * sequence the stream never had, so the read falls back to the newest window; anything else is the
- * next `limit` messages strictly after `since`. Computed from the shape rather than bounded, so a
+ * sequence the stream never had, so the read starts at the stream's first message; anything else is
+ * the next `limit` messages strictly after `since`. Computed from the shape rather than bounded, so a
  * page that returns FEWER than the window holds — up to and including nothing — fails.
  */
 const owed = (shape: Shape, pos: Position): number[] => {
@@ -106,6 +106,7 @@ const owed = (shape: Shape, pos: Position): number[] => {
   if (since !== undefined && since <= lastSeq) {
     return shape.seqs.filter((s) => s > since).slice(0, limit);
   }
+  if (since !== undefined) return shape.seqs.slice(0, limit);
   return shape.seqs.slice(-Math.min(limit, shape.seqs.length));
 };
 
