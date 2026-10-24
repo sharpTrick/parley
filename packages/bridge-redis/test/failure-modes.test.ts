@@ -593,6 +593,86 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
       }
     },
   );
+
+  // A credential with a BORDER — an opening that recurs inside it — echoed right behind a partial
+  // copy of its own opening: a run matched from the copy falls short, and the real occurrence starts
+  // INSIDE that run, so a sweep that resumes past each run steps over it and leaks the rest. Crossed
+  // with the echo: whole; through Redis's 128-byte cut, which is never struck whole; and twice with
+  // the copies overlapping, where striking one whole strands the other's tail with no opening.
+  const OPENING = 'ABCDEFGH';
+  const bordered: Array<[string, (tail: number) => string]> = [
+    ['a repeated opening', (tail) => `${OPENING}${OPENING}${stretch('s3cr3t-', tail)}`],
+    ['a thrice-repeated opening', (tail) => `${OPENING.repeat(3)}${stretch('s3cr3t-', tail)}`],
+    ['a period-3 run', (tail) => `${'abc'.repeat(8)}${stretch('s3cr3t-', tail)}`],
+    ['a period-4 run', (tail) => `${'ab12'.repeat(6)}${stretch('s3cr3t-', tail)}`],
+    ['a single-char run', (tail) => `${'a'.repeat(20)}${stretch('s3cr3t-', tail)}`],
+    ['a purely periodic credential', (tail) => 'xyz'.repeat(Math.ceil((24 + tail) / 3))],
+    ['an opening that recurs at its end', (tail) => `${OPENING}${stretch('s3cr3t-', tail)}${OPENING}`],
+  ];
+  const tails: Array<[string, number]> = [
+    ['short', 20],
+    ['long enough to be cut', 150],
+  ];
+  const copies = [8, 12, 16];
+  /** The longest proper prefix of `s` that is also a suffix of it. */
+  const borderOf = (s: string): number => {
+    for (let b = s.length - 1; b > 0; b--) if (s.endsWith(s.slice(0, b))) return b;
+    return 0;
+  };
+  const echoShapes: Array<[string, (copy: string, credential: string) => string]> = [
+    ['echoed whole', (copy, credential) => `, with args beginning with: '${copy}${credential}' `],
+    ['echoed through the 128-byte cut', (copy, credential) => withArgs(['AUTH', copy + credential])],
+    [
+      'echoed twice, the copies overlapping on its border',
+      (copy, credential) =>
+        `, with args beginning with: '${copy}${credential}${credential.slice(borderOf(credential))}' `,
+    ],
+  ];
+
+  const borderRows = bordered.flatMap(([family, build]) =>
+    tails.flatMap(([tailLabel, tail]) =>
+      copies.flatMap((copyLength) =>
+        echoShapes.map(([echoLabel, echo]) => {
+          const credential = build(tail);
+          return [
+            `${family}, ${tailLabel}, behind a ${copyLength}-char copy of its opening, ${echoLabel}`,
+            credential,
+            echo(credential.slice(0, copyLength), credential),
+          ] as [string, string, string];
+        }),
+      ),
+    ),
+  );
+
+  it.each(borderRows)('a server echoing AUTH never gets back %s', async (_label, credential, args) => {
+    const seen: string[] = [];
+    const endpoint = await respEndpoint((argv) => {
+      if (commandOf(argv) === 'auth') seen.push(...argv.slice(1));
+      return respError('ERR', `unknown command '${argv[0] ?? ''}'${args}`);
+    });
+    const plugin = new RedisPlugin();
+    try {
+      const url = endpoint.url.replace('//', `//:${encodeURIComponent(credential)}@`);
+      const failure = await plugin.connect({ url, connect_timeout_ms: FAST }).then(
+        () => undefined,
+        (err: Error) => err,
+      );
+      expect(seen, 'the fake never received the credential, so this row grades nothing').toContain(
+        credential,
+      );
+      expect(failure?.message, 'nothing was redacted, so this row grades nothing').toContain(
+        '<redacted>',
+      );
+      expectSafeError('connect()', failure, credential);
+      expect(
+        survivingWindows(`${failure?.message ?? ''}\n${failure?.stack ?? ''}`, credential),
+        'part of the credential survived the sweep',
+      ).toEqual([]);
+    } finally {
+      await plugin.disconnect().catch(() => undefined);
+      endpoint.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

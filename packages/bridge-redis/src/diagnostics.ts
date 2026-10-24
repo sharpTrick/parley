@@ -79,18 +79,55 @@ export const fromCaller = (text: string): string => sanitizeBody(text);
  */
 const ECHOED_PREFIX_CHARS = 8;
 
-/** `text` with every run that matches the opening of `credential`, however far it extends, struck out. */
-function strikeCredential(text: string, credential: string): string {
-  const opening = credential.slice(0, ECHOED_PREFIX_CHARS);
-  let out = '';
-  let from = 0;
-  for (let at = text.indexOf(opening); at !== -1; at = text.indexOf(opening, from)) {
-    let end = at + opening.length;
-    while (end - at < credential.length && text[end] === credential[end - at]) end++;
-    out += `${text.slice(from, at)}<redacted>`;
-    from = end;
+/**
+ * For every position of `text`, how many chars from there match the opening of `credential`: the
+ * Z-algorithm over `credential`, a sentinel no char equals, then `text` — linear, so a hostile
+ * periodic reply cannot make the sweep quadratic.
+ */
+function openingMatchLengths(text: string, credential: string): number[] {
+  const units: number[] = [];
+  for (let i = 0; i < credential.length; i++) units.push(credential.charCodeAt(i));
+  units.push(-1);
+  for (let i = 0; i < text.length; i++) units.push(text.charCodeAt(i));
+  const z = new Array<number>(units.length).fill(0);
+  for (let i = 1, left = 0, right = 0; i < units.length; i++) {
+    let k = i < right ? Math.min(right - i, z[i - left] ?? 0) : 0;
+    while (i + k < units.length && units[k] === units[i + k]) k++;
+    z[i] = k;
+    if (i + k > right) {
+      left = i;
+      right = i + k;
+    }
   }
-  return out + text.slice(from);
+  return z.slice(credential.length + 1);
+}
+
+/**
+ * `text` with every char struck out that lies inside ANY run matching the opening of `credential`.
+ * Keep it a check at every position rather than a scan that resumes past each run: a credential
+ * with a border (`ABCDEFGHABCDEFGH…`) behind a partial copy of itself matches from the copy, falls
+ * short, and the real occurrence starts INSIDE that run — a scan that steps past it leaks the rest.
+ * No whole-string pass goes ahead of it either: replacing one of two OVERLAPPING occurrences leaves
+ * the other's tail behind with no opening to be found by.
+ */
+function strikeCredential(text: string, credential: string): string {
+  const shortest = Math.min(credential.length, ECHOED_PREFIX_CHARS);
+  const matched = openingMatchLengths(text, credential);
+  let out = '';
+  let reach = 0;
+  let striking = false;
+  for (let i = 0; i < text.length; i++) {
+    const run = matched[i] ?? 0;
+    if (run >= shortest) reach = Math.max(reach, i + run);
+    if (i >= reach) {
+      out += text[i];
+      striking = false;
+    } else if (!striking) {
+      out += '<redacted>';
+      striking = true;
+    }
+  }
+  return out;
 }
 
 /**
