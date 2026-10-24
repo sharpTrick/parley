@@ -25,7 +25,7 @@ import {
 import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from '@sharptrick/parley-core/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { SlackPlugin } from '../src/index.js';
+import { compareTs, SlackPlugin } from '../src/index.js';
 import { FakeSlack } from './fake-slack.js';
 import { startSlack } from './harness.js';
 
@@ -450,6 +450,117 @@ describe('slack socket mode: disconnect reason drives the rotation', () => {
       await new Promise((r) => setTimeout(r, 400));
       expect(h.fake.connectionsOpened - dialsBefore, 'extra handshakes').toBe(1);
       expect(h.fake.liveSockets, 'sockets inside the rotation grace').toBe(2);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  // Only the CURRENT socket's warning starts a rotation: the retired half is already on its way out.
+  it('a warning on the retired half of a rotation costs no handshake', async () => {
+    const h = await harness();
+    try {
+      await h.plugin.subscribe(h.topic, () => undefined);
+      h.fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+      await vi.waitFor(() => expect(h.fake.helloSent).toBe(2), { timeout: 4000, interval: 5 });
+      await new Promise((r) => setTimeout(r, 50));
+      const dialsBefore = h.fake.connectionsOpened;
+
+      h.fake.pushUnackedToOldest({ type: 'disconnect', reason: 'warning' });
+      await new Promise((r) => setTimeout(r, 400));
+      expect(h.fake.connectionsOpened - dialsBefore, 'handshakes for a retired warning').toBe(0);
+      expect(h.fake.liveSockets, 'sockets inside the rotation grace').toBe(2);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+/**
+ * CLASS: the seam's live clause — the handler fires in ascending cursor order and never twice —
+ * held against what Socket Mode actually sends: an envelope Slack redelivers with `retry_attempt`
+ * because it saw no ack, an older event landing after a newer one, and, inside a rotation, two
+ * connections feeding one channel with nothing ordering one against the other. Each row pushes a
+ * seeded multiset of `ts` values and grades the sequence the handler saw, not how it was produced.
+ */
+function seeded(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const strictlyAscending = (ts: string[]): boolean =>
+  ts.every((t, i) => i === 0 || compareTs(ts[i - 1]!, t) < 0);
+
+describe('slack live push: ascending ts, never twice, whatever the wire sends', () => {
+  const SEEDS = [1, 2, 3, 4, 5, 6, 7, 8];
+
+  for (const sockets of [1, 2] as const) {
+    for (const seed of SEEDS) {
+      it(`${sockets} socket(s), seed ${seed}: the handler sees a strictly ascending subset`, async () => {
+        const h = await harness();
+        try {
+          const live: string[] = [];
+          await h.plugin.subscribe(h.topic, (m) => live.push(String(m.backendMsgId)));
+          if (sockets === 2) {
+            h.fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+            await vi.waitFor(() => expect(h.fake.helloSent).toBe(2), { timeout: 4000, interval: 5 });
+            expect(h.fake.liveSockets, 'both halves of the rotation feed the channel').toBe(2);
+          }
+
+          const random = seeded(seed);
+          const distinct = Array.from({ length: 8 }, () => h.fake.mintTs());
+          const wire: Array<{ ts: string; attempt: number }> = [];
+          for (const ts of distinct) {
+            const copies = 1 + Math.floor(random() * 3);
+            for (let attempt = 0; attempt < copies; attempt++) wire.push({ ts, attempt });
+          }
+          for (let i = wire.length - 1; i > 0; i--) {
+            const j = Math.floor(random() * (i + 1));
+            [wire[i], wire[j]] = [wire[j]!, wire[i]!];
+          }
+          expect(strictlyAscending(wire.map((w) => w.ts)), 'the wire order is hostile').toBe(false);
+
+          const ids = wire.map(({ ts, attempt }) =>
+            h.fake.pushEnvelope({
+              type: 'events_api',
+              ...(attempt === 0 ? {} : { retry_attempt: attempt, retry_reason: 'timeout' }),
+              payload: { event: { type: 'message', channel: h.topic, ts, text: `t-${ts}`, user: 'U0HUMAN' } },
+            }),
+          );
+          // The ack goes out ahead of routing in the same callback, so every ack in means every
+          // envelope has been through the route.
+          await vi.waitFor(() => {
+            for (const id of ids) expect(h.fake.acked.has(id), `unacked ${id}`).toBe(true);
+          }, { timeout: 4000, interval: 5 });
+
+          expect(strictlyAscending(live), `handler saw ${JSON.stringify(live)}`).toBe(true);
+          for (const ts of live) expect(distinct, `delivered ${ts} was never pushed`).toContain(ts);
+          // Nothing newer supersedes the newest message, so the live path owes it to the agent.
+          const newest = [...distinct].sort(compareTs).at(-1)!;
+          expect(live, 'the newest message').toContain(newest);
+        } finally {
+          await h.cleanup();
+        }
+      });
+    }
+  }
+
+  // The positive control: a stream that already honours the clause loses nothing to it.
+  it('an ascending, duplicate-free stream on one socket is delivered in full', async () => {
+    const h = await harness();
+    try {
+      const live: string[] = [];
+      await h.plugin.subscribe(h.topic, (m) => live.push(String(m.backendMsgId)));
+      const distinct = Array.from({ length: 8 }, () => h.fake.mintTs());
+      for (const ts of distinct) {
+        h.fake.pushEvent(h.topic, { ts, text: `t-${ts}`, user: 'U0HUMAN' });
+      }
+      await vi.waitFor(() => expect(live).toEqual(distinct), { timeout: 4000, interval: 5 });
     } finally {
       await h.cleanup();
     }

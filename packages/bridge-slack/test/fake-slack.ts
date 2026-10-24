@@ -377,6 +377,12 @@ export class FakeSlack {
     for (const ws of this.sockets) ws.send(envelope);
   }
 
+  /** {@link pushUnackedEnvelope} to the LEAST-recently-connected socket alone — see {@link dropOldestSocket}. */
+  pushUnackedToOldest(body: Record<string, unknown>): void {
+    const [oldest] = this.sockets;
+    oldest?.send(JSON.stringify(body));
+  }
+
   /**
    * Close the LEAST-recently-connected socket — the old half of a Socket Mode rotation, which
    * `dropSockets` cannot express because it would take the replacement down with it.

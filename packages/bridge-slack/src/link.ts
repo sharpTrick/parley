@@ -4,7 +4,7 @@ import { WebSocket, type RawData } from 'ws';
 import type { SlackApiCall } from './api.js';
 import { requireUsableSocketUrl, type SlackSettings } from './config.js';
 import { slackToMessage } from './markup.js';
-import { isPlainMessage } from './messages.js';
+import { compareTs, isPlainMessage } from './messages.js';
 import {
   closeQuietly,
   DIAL_BACKOFF_MS,
@@ -22,16 +22,18 @@ interface SocketHost {
 interface Route {
   topic: Topic;
   handler: MessageHandler;
+  /**
+   * The newest `ts` handed to {@link handler}. Keep the route's order on this rather than on the
+   * socket, so that neither a Slack redelivery — sent whenever Slack saw no ack — nor a rotation's
+   * second connection, which Slack does not order against the first, can reach the handler twice
+   * or out of order.
+   */
+  lastTs?: string;
 }
 
 /**
  * ONE shared Socket Mode websocket per plugin instance, opened lazily on the first subscribe: the
  * routes it feeds, and the dial pacer that spaces `apps.connections.open` when it is unavailable.
- *
- * Ascending-`ts` handler invocation is a PLUGIN guarantee and nothing here orders anything: it
- * rests on ONE connection feeding a channel, which a rotation deliberately suspends. Keep
- * {@link DEFAULT_ROTATION_GRACE_MS} bounding that overlap, so that the exposure is the handful of
- * seconds Slack asks for and not the process lifetime.
  */
 export class SocketModeLink {
   private ws?: WebSocket;
@@ -53,8 +55,6 @@ export class SocketModeLink {
   private servingSince = 0;
   /** Whether a {@link reconnect} loop already owns re-establishing the shared socket. */
   private reconnecting = false;
-  /** Sockets that have already spent their one pre-refresh rotation — see {@link routeEnvelope}. */
-  private readonly rotating = new WeakSet<WebSocket>();
 
   constructor(
     private readonly api: SlackApiCall,
@@ -152,8 +152,7 @@ export class SocketModeLink {
     // Keep this abort scoped to the SESSION as well as to `stopped` — which the next `connect()`
     // clears — so that a dial in flight across `disconnect()` + `connect()` cannot open a socket on
     // the retired app_token for a session that subscribed to nothing: it would burn one of the ~10
-    // connections per app token and feed a second event source into one channel for the session's
-    // life, which is what the ascending-`ts` handler guarantee rests on not happening.
+    // connections per app token for the session's life.
     if (this.host.stopped() || this.host.session() !== session) {
       throw new Error('Slack Socket Mode connect aborted — plugin disconnected');
     }
@@ -282,12 +281,16 @@ export class SocketModeLink {
       if (env.reason === 'warning') {
         // An envelope is untrusted input: one rotation per socket, and never while a reconnect owner
         // is already dialling, so that a flood of warnings cannot become a flood of handshakes.
-        if (this.ws !== ws || this.reconnecting || this.rotating.has(ws)) return;
-        this.rotating.add(ws);
+        if (this.ws !== ws || this.reconnecting) return;
+        // Retire it as the CURRENT socket, not only as the ready one, so that its close — which
+        // Slack may send while the replacement is still dialling — is not read as the shared socket
+        // dropping and cannot clear the attempt the reconnect loop owns, leaving the next
+        // `ensureSocket` to dial a second replacement alongside it.
+        this.ws = undefined;
         this.wsReady = undefined;
         // The grace is Slack's to open and OURS to close: an edge that never closes its half would
-        // otherwise leave one established connection behind per rotation — against the ~10 per app
-        // token, and against a channel's ordering, which holds only while one connection feeds it.
+        // otherwise leave one established connection behind per rotation, against the ~10 per app
+        // token.
         const grace = setTimeout(() => closeQuietly(ws), this.host.settings().rotationGraceMs);
         ws.once('close', () => clearTimeout(grace));
         void this.reconnect();
@@ -304,6 +307,8 @@ export class SocketModeLink {
 
     const route = this.routes.get(event.channel);
     if (route === undefined) return;
+    if (route.lastTs !== undefined && compareTs(event.ts, route.lastTs) <= 0) return;
+    route.lastTs = event.ts;
     safeDeliver(route.handler, () =>
       slackToMessage(route.topic, event, this.host.settings().mentionMap),
     );

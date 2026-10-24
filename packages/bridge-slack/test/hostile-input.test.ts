@@ -11,7 +11,14 @@
  *     that carries it, and a rejection that repeats on every catch-up wedges the topic forever,
  *     because the cursor never advances past the record that caused it.
  */
-import { asCursor, asHandle, asTopic, parseMentions, type Topic } from '@sharptrick/parley-core';
+import {
+  asCursor,
+  asHandle,
+  asTopic,
+  type Message,
+  parseMentions,
+  type Topic,
+} from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import {
   compareTs,
@@ -1007,12 +1014,18 @@ describe('slack ts range: the shape guard admits and rejects exactly what it say
     await plugin.connect({ api_url: fake.apiUrl, bot_token: 'xoxb-test', app_token: 'xapp-test' });
     try {
       const topic = asTopic('C0TSLIVE');
+      // The liveness probe goes to a channel of its own: on `topic` it would sit below the widest
+      // admitted `ts`, where the ascending-order clause rightly keeps it off the live path.
+      const probe = asTopic('C0TSPROBE');
       fake.createChannel(topic);
+      fake.createChannel(probe);
       const seen: string[] = [];
-      await plugin.subscribe(topic, (m) => {
+      const handler = (m: Message): void => {
         expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
         seen.push(String(m.backendMsgId));
-      });
+      };
+      await plugin.subscribe(topic, handler);
+      await plugin.subscribe(probe, handler);
       for (const ts of GENERATED) {
         fake.pushEnvelope({
           type: 'events_api',
@@ -1020,7 +1033,7 @@ describe('slack ts range: the shape guard admits and rejects exactly what it say
         });
       }
       // The socket is still serving afterwards — an envelope that killed it would strand this.
-      await plugin.post(topic, asHandle('writer'), 'still alive');
+      await plugin.post(probe, asHandle('writer'), 'still alive');
       await vi.waitFor(() => expect(seen.length).toBeGreaterThan(ADMITTED.length), {
         timeout: 3000,
         interval: 10,

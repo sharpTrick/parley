@@ -36,6 +36,7 @@ import {
   settleWithin,
   sleep,
   startSlack,
+  type Settled,
   type SlackHarness,
   type SlackHarnessOptions,
 } from './harness.js';
@@ -650,6 +651,103 @@ describe('slack teardown racing an in-flight connect', () => {
     }
   });
 
+  /**
+   * CLASS: one owner of the shared socket across a rotation, wherever the old half's close lands.
+   * Slack closes the old connection on its own clock, so the close can arrive while the replacement
+   * is still being dialled, while it is open but ungreeted, or after it is serving — and a second
+   * `ensureSocket` caller (a `subscribe` on another channel) can arrive inside that window or after
+   * the rotation has settled. Every combination owes exactly one handshake and one socket left
+   * carrying both channels: a second dial is a second event source feeding them for the session's
+   * life, and one of the ~10 connections an app token gets.
+   */
+  const ROTATION_PHASES = ['during apps.connections.open', 'between open and hello', 'after hello'] as const;
+  const SECOND_CALLERS = ['inside the window', 'after the rotation settles'] as const;
+
+  for (const phase of ROTATION_PHASES) {
+    for (const caller of SECOND_CALLERS) {
+      it(`old half closing ${phase}, second subscriber ${caller}: one dial, one socket`, async () => {
+        const { fake, plugin, cleanup } = await startPlugin({
+          channels: ['C0ROTA', 'C0ROTB'],
+          handshakeTimeoutMs: 5000,
+        });
+        const first = asTopic('C0ROTA');
+        const other = asTopic('C0ROTB');
+        try {
+          const seen: string[] = [];
+          await plugin.subscribe(first, (m) => seen.push(m.content));
+          const dialsBefore = fake.connectionsOpened;
+
+          let second: Promise<Settled<void>> | undefined;
+          const subscribeOther = (): void => {
+            second = capture(plugin.subscribe(other, (m) => seen.push(m.content)));
+          };
+          const closeOldHalf = async (): Promise<void> => {
+            fake.dropOldestSocket();
+            await vi.waitFor(() => expect(fake.liveSockets).toBe(1), { timeout: 4000, interval: 5 });
+            // Let the plugin's side of the close land before anything else moves.
+            await sleep(50);
+            if (caller === 'inside the window') {
+              subscribeOther();
+              await sleep(50);
+            }
+          };
+
+          if (phase === 'during apps.connections.open') {
+            let held: Promise<void> | undefined;
+            fake.onHit('apps.connections.open', () => {
+              held ??= closeOldHalf();
+              return held;
+            });
+            fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+            await vi.waitFor(() => expect(held, 'the replacement dial was held').toBeDefined(), {
+              timeout: 4000,
+              interval: 5,
+            });
+            await held;
+            await vi.waitFor(() => expect(fake.helloSent, 'replacement greeted').toBe(2), {
+              timeout: 4000,
+              interval: 5,
+            });
+          } else if (phase === 'between open and hello') {
+            fake.setGreet('silent');
+            fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+            await vi.waitFor(() => expect(fake.liveSockets).toBe(2), { timeout: 4000, interval: 5 });
+            fake.setGreet('greet');
+            await closeOldHalf();
+            fake.pushUnackedEnvelope({ type: 'hello' });
+          } else {
+            fake.pushUnackedEnvelope({ type: 'disconnect', reason: 'warning' });
+            await vi.waitFor(() => expect(fake.helloSent, 'replacement greeted').toBe(2), {
+              timeout: 4000,
+              interval: 5,
+            });
+            await closeOldHalf();
+          }
+
+          // The replacement carries the stream before the late caller arrives.
+          await plugin.post(first, asHandle('writer'), 'after the rotation');
+          await vi.waitFor(() => expect(seen).toContain('after the rotation'), {
+            timeout: 4000,
+            interval: 10,
+          });
+          if (caller === 'after the rotation settles') subscribeOther();
+          expect(second, 'the second subscribe was issued').toBeDefined();
+          const settled = await settleWithin(second!, 6000);
+          expect(settled.status, 'second subscribe').toBe('fulfilled');
+
+          await plugin.post(other, asHandle('writer'), 'on the other channel');
+          await vi.waitFor(() => expect(seen).toContain('on the other channel'), {
+            timeout: 4000,
+            interval: 10,
+          });
+          expect(fake.connectionsOpened - dialsBefore, 'handshakes for one rotation').toBe(1);
+          expect(fake.liveSockets, 'sockets once the rotation settles').toBe(1);
+        } finally {
+          await cleanup();
+        }
+      });
+    }
+  }
 });
 
 /**
