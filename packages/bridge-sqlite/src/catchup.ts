@@ -6,12 +6,33 @@ import {
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
+  type Message,
   type Topic,
 } from '@sharptrick/parley-core';
+import { errMessage } from './classify.js';
 import { normalizeLimit } from './config.js';
 import { mintCursor, parseCursor, rowToMessage } from './cursor.js';
 import type { MessageRow } from './schema.js';
 import { SqliteStore } from './store.js';
+
+/**
+ * A row a peer wrote outside `post()` can carry a value this converter refuses — TEXT affinity
+ * does not convert a BLOB. It costs that row, as on the live path, and not the page around it.
+ */
+function convertible(
+  rows: readonly MessageRow[],
+  storeId: string,
+  skipped: Array<{ id: number; err: unknown }>,
+): Message[] {
+  return rows.flatMap((row) => {
+    try {
+      return [rowToMessage(row, storeId)];
+    } catch (err) {
+      skipped.push({ id: row.id, err });
+      return [];
+    }
+  });
+}
 
 /** `post` and the catch-up read. */
 export abstract class SqliteCatchUp extends SqliteStore {
@@ -32,15 +53,31 @@ export abstract class SqliteCatchUp extends SqliteStore {
     const limit = normalizeLimit(args.limit, args.topic);
     const storeId = this.require(this.storeId);
     const resumeAfter = args.since === undefined ? undefined : this.resumeAfter(args.since, args.topic);
-    const rows =
+    const after = (id: number | bigint): MessageRow[] =>
+      this.require(this.selectAfterStmt).all(args.topic, id, limit) as MessageRow[];
+    let rows =
       resumeAfter === undefined
         ? (this.require(this.selectRecentStmt).all(args.topic, limit) as MessageRow[]).reverse()
-        : (this.require(this.selectAfterStmt).all(args.topic, resumeAfter, limit) as MessageRow[]);
-    const servedThrough = rows.at(-1)?.id ?? resumeAfter ?? 0n;
-    return {
-      messages: rows.map((row) => rowToMessage(row, storeId)),
-      nextCursor: mintCursor(storeId, servedThrough),
-    };
+        : after(resumeAfter);
+    let servedThrough = rows.at(-1)?.id ?? resumeAfter ?? 0n;
+    const skipped: Array<{ id: number; err: unknown }> = [];
+    let messages = convertible(rows, storeId, skipped);
+    // Keep reading past a full page that converted to nothing, so that an empty page still means
+    // the topic is exhausted: that is how every caller reads one, and the rows above it would
+    // otherwise be stranded behind a page a peer filled with records this converter refuses.
+    while (messages.length === 0 && rows.length === limit) {
+      rows = after(servedThrough);
+      servedThrough = rows.at(-1)?.id ?? servedThrough;
+      messages = convertible(rows, storeId, skipped);
+    }
+    const first = skipped[0];
+    if (first !== undefined) {
+      process.stderr.write(
+        `parley-sqlite: skipped ${skipped.length} unconvertible row(s) on topic "${args.topic}" ` +
+          `(first: id ${first.id}): ${errMessage(first.err)}\n`,
+      );
+    }
+    return { messages, nextCursor: mintCursor(storeId, servedThrough) };
   }
 
   protected maxId(topic: Topic): number {
