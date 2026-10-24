@@ -180,12 +180,14 @@ export class XmppInbound extends XmppRooms {
 
   /**
    * A reconnect restores the stream but not MUC occupancy — that is presence, and the library does
-   * not re-send it. Re-drive every room in `joined`, not just the subscribed ones, so that a
-   * catch-up-only topic is not left silently outside its room until some later post re-enters it.
+   * not re-send it. Re-drive every room in `joined` AND every subscribed room: a catch-up-only topic
+   * is otherwise left outside its room until some later post re-enters it, and a subscribed room
+   * whose earlier re-entry failed has already been dropped from `joined`.
    */
   protected rejoinAfterReconnect(): void {
     for (const pp of this.pendingPosts.values()) pp.reject(new Error('reconnected; retry post'));
     this.pendingPosts.clear();
-    for (const room of this.forgetAllRooms()) void this.redriveJoin(room, 'reconnect');
+    const rooms = new Set([...this.forgetAllRooms(), ...this.subscriptions.keys()]);
+    for (const room of rooms) void this.redriveJoin(room, 'reconnect');
   }
 }

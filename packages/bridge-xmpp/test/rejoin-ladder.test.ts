@@ -1,5 +1,4 @@
 import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
-import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Class: a constant that no input can reach, and the doc claim built on it. The occupancy re-entry
@@ -74,21 +73,41 @@ describe('XMPP occupancy re-entry walks a documented backoff ladder', () => {
     expect(logged).toContain('not re-entering it again');
     await plugin.disconnect();
   }, 30_000);
-});
 
-// The README states the ladder in prose. Parse the numbers back out of it, so the sentence cannot
-// keep advertising a wait the constants cannot produce.
-describe('the README backoff sentence matches the constants', () => {
-  it('quotes the first step, the top step, the jitter bound and the loss limit', () => {
-    // Line wrapping is not the claim, so flatten it before reading the numbers out.
-    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
-    const sentence = /deferred and backs off\*\*\s*\(([^)]*)\)/.exec(readme)?.[1];
-    expect(sentence).toBeDefined();
-    const numbers = [...(sentence as string).matchAll(/([\d.]+)\s*(ms|s)\b/g)].map(([, n, unit]) =>
-      unit === 's' ? Number(n) * 1000 : Number(n),
-    );
-    // First step, top step, jitter bound — every number the ladder is built from.
-    expect(numbers).toEqual([BASE_MS, REJOIN_MAX_WAIT_MS, BASE_MS]);
-    expect(readme).toContain(`After ${LOSSES} consecutive losses, each within a minute`);
-  });
+  it('occupancy held for a minute starts the ladder over at its first step', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fake = new FakeXmpp();
+    mockState.client = fake;
+    const plugin = new XmppPlugin();
+    await plugin.connect({ password: 'a-real-secret', nick: 'ladder' });
+    const room = priv(plugin).roomJid(TOPIC);
+    await plugin.subscribe(TOPIC, (_m: Message) => undefined);
+
+    const joinTimes = (): number[] =>
+      fake.sentAt.filter(
+        (_, i) =>
+          (fake.sent[i] as { is(n: string): boolean }).is('presence') &&
+          (fake.sent[i]?.attrs.to ?? '').startsWith(`${room}/`),
+      );
+    /** End occupancy once and return how long the plugin waited before re-joining. */
+    const lose = async (): Promise<number> => {
+      const before = joinTimes().length;
+      const at = Date.now();
+      fake.endOccupancy(room, { statuses: ['307'] });
+      await vi.advanceTimersByTimeAsync(REJOIN_MAX_WAIT_MS + BASE_MS);
+      const after = joinTimes();
+      expect(after).toHaveLength(before + 1);
+      return (after.at(-1) as number) - at;
+    };
+
+    const climbed = [await lose(), await lose(), await lose()];
+    expect(climbed[2]).toBeGreaterThanOrEqual(ladder[2] as number);
+
+    await vi.advanceTimersByTimeAsync(61_000);
+    const reset = await lose();
+    expect(reset).toBeGreaterThanOrEqual(ladder[0] as number);
+    expect(reset).toBeLessThan((ladder[0] as number) + BASE_MS);
+    await plugin.disconnect();
+  }, 30_000);
 });

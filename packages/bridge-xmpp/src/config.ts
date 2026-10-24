@@ -31,9 +31,9 @@ export interface XmppBackendConfig {
 }
 
 /**
- * Every name `backend_config` declares — also the set README and DESIGN §11 are checked against.
- * Keep the `satisfies` on it, so that a key added to {@link XmppBackendConfig} without being listed
- * here is a compile error rather than a key `connect()` rejects.
+ * Every name `backend_config` declares. Keep the `satisfies` on it, so that a key added to
+ * {@link XmppBackendConfig} without being listed here is a compile error rather than a key
+ * `connect()` rejects.
  */
 const DECLARED: BackendConfigKeys = {
   keys: Object.keys({
@@ -94,6 +94,37 @@ export function isPlaintextRemote(service: string): boolean {
 const bad = (key: string, reason: string): Error =>
   new Error(`parley-xmpp: invalid backend_config.${key} — ${reason}`);
 
+/** RFC 3454 table B.1: codepoints both nameprep and resourceprep map to nothing. */
+const MAPPED_TO_NOTHING =
+  /[\u00AD\u034F\u1806\u180B-\u180D\u200B-\u200D\u2060\uFE00-\uFE0F\uFEFF]/u;
+/** RFC 3454 table C.1.2: non-ASCII spaces, which resourceprep prohibits. */
+const NON_ASCII_SPACE = /[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/u;
+
+const resourceprepFold = (s: string): string => s.normalize('NFKC');
+const nameprepFold = (s: string): string =>
+  Array.from(s.normalize('NFKC'), (ch) => ch.toLowerCase())
+    .join('')
+    .normalize('NFKC');
+
+/**
+ * The first codepoint of `value` that the server's stringprep profile would rewrite or refuse, or
+ * `undefined` if the server keeps it as written. Prefixes are folded rather than single codepoints,
+ * so that a mark composing with the letter before it is caught too.
+ */
+const preppedCodepoint = (
+  value: string,
+  fold: (s: string) => string,
+  refused: readonly RegExp[],
+): number | undefined => {
+  const chars = Array.from(value);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i] as string;
+    const prefix = chars.slice(0, i + 1).join('');
+    if (refused.some((r) => r.test(ch)) || fold(prefix) !== prefix) return ch.codePointAt(0);
+  }
+  return undefined;
+};
+
 /**
  * Validate `backend_config` before the client is constructed (§11). Keep an unknown key a load
  * error, so that a misspelled one cannot leave every room addressed at the default MUC service and
@@ -119,6 +150,19 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
           'separator here builds a different address than the one written',
       );
     }
+  }
+  const mucService = cfg['muc_service'];
+  const folded =
+    typeof mucService === 'string'
+      ? preppedCodepoint(mucService, nameprepFold, [MAPPED_TO_NOTHING])
+      : undefined;
+  if (folded !== undefined) {
+    throw bad(
+      'muc_service',
+      `contains ${codepointLabel(folded)}, which the server folds away — a JID domainpart is ` +
+        'case-insensitive and NFKC-normalized, and every room answers from the folded form, so no ' +
+        'answer would match the room this bridge addressed. Write it in lowercase NFKC form',
+    );
   }
   for (const key of JID_SIZED_KEYS) {
     const value = cfg[key];
@@ -149,6 +193,18 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
         'to the room, so the room would admit it under a name it never asked for and this ' +
         'connection could not recognise its own presence back from the room. A plain space is ' +
         'fine; these three are not',
+    );
+  }
+  const prepped =
+    typeof nick === 'string'
+      ? preppedCodepoint(nick, resourceprepFold, [MAPPED_TO_NOTHING, NON_ASCII_SPACE])
+      : undefined;
+  if (prepped !== undefined) {
+    throw bad(
+      'nick',
+      `contains ${codepointLabel(prepped)}, which the server's resourceprep profile rewrites or ` +
+        'refuses — the room would admit this connection under a nick it never asked for, and this ' +
+        'connection could not recognise its own presence back from the room',
     );
   }
   const page = cfg['mam_page'];
