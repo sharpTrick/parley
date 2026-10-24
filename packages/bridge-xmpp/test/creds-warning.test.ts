@@ -12,6 +12,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 // standard DNS-SRV form — matched nothing in the plaintext set and went silent, while
 // @xmpp/resolve routes exactly that form through SRV and falls back to cleartext xmpp://…:5222.
 // Only an explicitly encrypted scheme is safe; every other form is a way to reach a plain socket.
+//
+// Each risk is graded as the VALUE `configRisks` returns — which key, which host, which secret —
+// never as words of the sentence: a warning reworded to say the password never goes on the network
+// in the clear still says "in the clear". Of the sentence, only DELIVERY is graded.
 
 const mockState = vi.hoisted(() => ({ client: undefined as unknown }));
 vi.mock('@xmpp/client', async () => {
@@ -25,7 +29,14 @@ import {
   PLANTED_SECRET,
   UNSAFE_TEXT,
 } from '@sharptrick/parley-net-util/testing';
-import { warnInsecureConfig } from '../src/config.js';
+import {
+  type ConfigRisk,
+  configRisks,
+  DEFAULT_PASSWORD,
+  DEFAULT_SERVICE,
+  describeRisk,
+  warnInsecureConfig,
+} from '../src/config.js';
 import { isPlaintextRemote, XmppPlugin } from '../src/index.js';
 import { FakeXmpp } from './fake-xmpp.js';
 
@@ -36,6 +47,38 @@ afterEach(() => {
 
 const spyWarn = (): ReturnType<typeof vi.spyOn> =>
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+const DEFAULT_PASSWORD_RISK: ConfigRisk = { key: 'password', sharedDefault: DEFAULT_PASSWORD };
+const transportRisk = (host: string): ConfigRisk => ({
+  key: 'service',
+  origin: host,
+  exposes: ['password'],
+});
+
+/** The host a service names, as an operator reads it: no port, no IPv6 brackets. */
+const bareHost = (host: string): string =>
+  host
+    .replace(/^(\[[^\]]*]):\d+$/, '$1')
+    .replace(/^\[(.*)]$/, '$1')
+    .replace(/^([^:]*):\d+$/, '$1');
+
+/** The warnings are exactly these risks — as values, then as lines rendered from each. */
+const expectRisks = (
+  config: { service?: string; password?: string },
+  warned: readonly string[],
+  expected: ConfigRisk[],
+): void => {
+  expect(configRisks(config.service ?? DEFAULT_SERVICE, config.password)).toEqual(expected);
+  expect(warned).toHaveLength(expected.length);
+  for (const risk of expected) {
+    const shown = warned.filter((l) => l.includes(describeRisk(risk)));
+    expect(shown, `no warning renders the ${risk.key} risk`).toHaveLength(1);
+    expect(shown[0]).toContain('[parley-xmpp] SECURITY');
+    for (const part of Object.values(risk).flatMap((v: unknown) => (Array.isArray(v) ? v : [v]))) {
+      expect(shown[0], `never names ${String(part)}`).toContain(String(part));
+    }
+  }
+};
 
 const connect = async (config: Record<string, unknown>): Promise<string[]> => {
   const warn = spyWarn();
@@ -48,18 +91,18 @@ const connect = async (config: Record<string, unknown>): Promise<string[]> => {
 
 describe('XMPP default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when password is omitted', async () => {
-    const warned = await connect({ service: 'xmpp://127.0.0.1:5222', username: 'parley' });
-    expect(warned).toHaveLength(1);
-    expect(warned[0]).toContain('parley-xmpp');
-    expect(warned[0]).toContain('password');
+    const config = { service: 'xmpp://127.0.0.1:5222', username: 'parley' };
+    expectRisks(config, await connect(config), [DEFAULT_PASSWORD_RISK]);
   });
 
   it('warns when password is set literally to the well-known default', async () => {
-    expect(await connect({ password: 'parleypass' })).toHaveLength(1);
+    const config = { password: 'parleypass' };
+    expectRisks(config, await connect(config), [DEFAULT_PASSWORD_RISK]);
   });
 
   it('does NOT warn when a real password is supplied to a loopback service', async () => {
-    expect(await connect({ password: 's3cret-real-pw', username: 'parley' })).toEqual([]);
+    const config = { password: 's3cret-real-pw', username: 'parley' };
+    expectRisks(config, await connect(config), []);
   });
 });
 
@@ -116,6 +159,7 @@ const REMOTE = [
 
 interface Cell {
   service: string;
+  host: string;
   password: string | undefined;
   /** How many warnings this configuration must produce: the credential one, the transport one. */
   expected: { credential: boolean; transport: boolean };
@@ -131,6 +175,7 @@ for (const form of forms) {
       for (const password of ['a-real-secret', undefined]) {
         cells.push({
           service: form.service(host),
+          host,
           password,
           expected: {
             credential: password === undefined,
@@ -164,10 +209,7 @@ describe('XMPP transport safety', () => {
   it.each([...LOOPBACK, ...REMOTE].map((host) => [host] as const))(
     '%s is classified exactly as the shared predicate classifies it',
     (host) => {
-      const bare = host
-        .replace(/^(\[[^\]]*]):\d+$/, '$1')
-        .replace(/^\[(.*)]$/, '$1')
-        .replace(/^([^:]*):\d+$/, '$1');
+      const bare = bareHost(host);
       for (const form of forms.filter((f) => !f.encrypted)) {
         expect(isPlaintextRemote(form.service(host))).toBe(!isLoopbackHost(bare));
       }
@@ -175,17 +217,14 @@ describe('XMPP transport safety', () => {
   );
 
   it.each(cells)('$service (password $password) warns as documented', async (cell) => {
-    const warned = await connect({
+    const config = {
       service: cell.service,
       ...(cell.password === undefined ? {} : { password: cell.password }),
-    });
-    const credential = warned.filter((m) => m.includes('default password'));
-    const transport = warned.filter((m) => m.includes('in the clear'));
-    expect(credential).toHaveLength(cell.expected.credential ? 1 : 0);
-    expect(transport).toHaveLength(cell.expected.transport ? 1 : 0);
-    // Nothing else was reported, so a cell that must warn cannot be riding another's line.
-    expect(warned).toHaveLength(credential.length + transport.length);
-    expect(warned.every((m) => m.includes('parley-xmpp'))).toBe(true);
+    };
+    expectRisks(config, await connect(config), [
+      ...(cell.expected.credential ? [DEFAULT_PASSWORD_RISK] : []),
+      ...(cell.expected.transport ? [transportRisk(bareHost(cell.host))] : []),
+    ]);
   });
 });
 
@@ -204,10 +243,12 @@ describe('the transport warning names a host and nothing else the caller wrote',
   };
 
   it('never carries a password written into the address', () => {
-    const warned = lines(`xmpp://bot:${PLANTED_SECRET}@evil.example.com:5222`);
-    expect(warned).toHaveLength(1);
+    const service = `xmpp://bot:${PLANTED_SECRET}@evil.example.com:5222`;
+    const warned = lines(service);
+    expectRisks({ service, password: 'a-real-password' }, warned, [
+      transportRisk('evil.example.com'),
+    ]);
     expect(warned[0]).not.toContain(PLANTED_SECRET);
-    expect(warned[0]).toContain('evil.example.com');
   });
 
   it.each(UNSAFE_TEXT)('%s in the host is one bounded, harmless line', (_label, text) => {

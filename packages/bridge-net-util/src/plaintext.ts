@@ -8,6 +8,20 @@ import { isIPv4, isIPv6 } from 'node:net';
  */
 const SECURE_SCHEMES = new Set(['https:', 'wss:']);
 
+/**
+ * A config value that would put a credential on the wire in the clear, as the FACT rather than as
+ * the sentence an operator reads: which `backend_config` key opens the boundary, the endpoint its
+ * value names, and which `backend_config` keys hold the secrets that endpoint then receives. Keep a
+ * backend's warning RENDERED from one of these and its tests asserting the value, so that a warning
+ * reworded to deny the risk cannot pass by still naming the same words.
+ */
+export interface PlaintextCredentialRisk<Key extends string = string, Secret extends string = string> {
+  key: Key;
+  /** The endpoint, as safe to print: no userinfo, path or query. */
+  origin: string;
+  exposes: readonly Secret[];
+}
+
 /** The origin to name when the URL would put a credential on the wire in the clear, else undefined. */
 export function plaintextRemoteOrigin(baseUrl: string): string | undefined {
   try {

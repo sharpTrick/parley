@@ -3,7 +3,12 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
+import {
+  describeConfigValue,
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+  sanitizeBody,
+} from '@sharptrick/parley-net-util';
 
 import { JID_PART_MAX_BYTES } from './jid.js';
 import { assertXmlSafe, attributeNormalizedCodepoint, codepointLabel } from './stanzas.js';
@@ -223,30 +228,53 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
 /** Longest DNS name there is; a diagnostic naming a host never needs more than this. */
 const MAX_HOST_IN_DIAGNOSTIC = 253;
 
+/** A config shape that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk =
+  | { key: 'password'; sharedDefault: string }
+  | PlaintextCredentialRisk<'service', 'password'>;
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export function describeRisk(risk: ConfigRisk): string {
+  switch (risk.key) {
+    case 'password':
+      return (
+        `connecting with the built-in default password ('${risk.sharedDefault}'). Set ` +
+        `backend_config.${risk.key} to a real secret; a network-reachable XMPP account ` +
+        'provisioned with this password is world-readable/injectable.'
+      );
+    case 'service':
+      return (
+        `backend_config.${risk.key} names the host ${JSON.stringify(risk.origin)}, which can put ` +
+        `${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} on the network in the ` +
+        'clear — it is a non-loopback host over a plaintext scheme, or over no scheme at all, ' +
+        'which @xmpp/resolve answers by DNS-SRV whose candidate list ends at a cleartext ' +
+        "xmpp://…:5222. @xmpp/client's STARTTLS is opportunistic and SASL PLAIN is always offered, " +
+        'so a peer that does not advertise (or that is stripped of) STARTTLS receives the ' +
+        'password. Use xmpps:// or wss://.'
+      );
+  }
+}
+
 /**
  * What the connection about to be dialled exposes the SASL credential to. Neither is a load error —
  * a loopback dev instance on the built-in password is the documented quickstart — so the operator
  * is told rather than stopped.
  */
-export function warnInsecureConfig(service: string, password: string | undefined): void {
+export function configRisks(service: string, password: string | undefined): ConfigRisk[] {
+  const risks: ConfigRisk[] = [];
   if (password === undefined || password === DEFAULT_PASSWORD) {
-    console.warn(
-      '[parley-xmpp] SECURITY: connecting with the built-in default password ' +
-        "('parleypass'). Set backend_config.password to a real secret; a network-reachable " +
-        'XMPP account provisioned with this password is world-readable/injectable.',
-    );
+    risks.push({ key: 'password', sharedDefault: DEFAULT_PASSWORD });
   }
   const host = plaintextRemoteHost(service);
   if (host !== undefined) {
-    console.warn(
-      `[parley-xmpp] SECURITY: backend_config.service names the host ` +
-        `${JSON.stringify(sanitizeBody(host).slice(0, MAX_HOST_IN_DIAGNOSTIC))}, which can put ` +
-        'backend_config.password on the network in the clear — it is a non-loopback host over ' +
-        'a plaintext scheme, or over no scheme at all, which @xmpp/resolve answers by DNS-SRV ' +
-        'whose candidate list ends at ' +
-        "a cleartext xmpp://…:5222. @xmpp/client's STARTTLS is opportunistic and SASL PLAIN is " +
-        'always offered, so a peer that does not advertise (or that is stripped of) STARTTLS ' +
-        'receives the password. Use xmpps:// or wss://.',
-    );
+    const origin = sanitizeBody(host).slice(0, MAX_HOST_IN_DIAGNOSTIC);
+    risks.push({ key: 'service', origin, exposes: ['password'] });
+  }
+  return risks;
+}
+
+export function warnInsecureConfig(service: string, password: string | undefined): void {
+  for (const risk of configRisks(service, password)) {
+    console.warn(`[parley-xmpp] SECURITY: ${describeRisk(risk)}`);
   }
 }

@@ -1,5 +1,9 @@
 import type { Topic } from '@sharptrick/parley-core';
-import { isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
+import {
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+  sanitizeBody,
+} from '@sharptrick/parley-net-util';
 
 // Every line this file writes goes to stderr: stdout is the MCP JSON-RPC channel.
 
@@ -149,29 +153,43 @@ export function fromServer(url: string, text: string): string {
 /** The one scheme node-redis dials over TLS; `redis:` puts the AUTH it sends on the wire as text. */
 const TLS_SCHEME = 'rediss:';
 
+/** A config shape that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk = PlaintextCredentialRisk<'url', 'url'>;
+
 /**
- * Keep this line, so that an operator who put a password in `backend_config.url` and pointed it at a
- * shared deployment — which both the README quickstart and `examples/multi-session` invite — learns
- * that every host on the path can read it and post as this bridge. Loopback is silent, and so is a
+ * A credential in `url` bound for a cleartext remote link. Loopback is not a risk, and neither is a
  * URL with no credential to lose; the ORIGIN is named and never the value.
  */
-export function reportPlaintextCredential(url: string): void {
+export function configRisks(url: string): ConfigRisk[] {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    return;
+    return [];
   }
   const carriesCredential = parsed.username !== '' || parsed.password !== '';
   if (parsed.protocol === TLS_SCHEME || !carriesCredential || isLoopbackHost(parsed.hostname)) {
-    return;
+    return [];
   }
-  process.stderr.write(
-    `parley-redis: SECURITY: backend_config.url ${parsed.protocol}//${parsed.host} carries a ` +
-      `credential over plaintext ${parsed.protocol}// to a non-loopback host, so the AUTH this ` +
-      `bridge sends — and every message body after it — crosses the network in the clear. Use ` +
-      `rediss:// for any remote server.\n`,
-  );
+  return [{ key: 'url', origin: `${parsed.protocol}//${parsed.host}`, exposes: ['url'] }];
+}
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export const describeRisk = (risk: ConfigRisk): string =>
+  `backend_config.${risk.key} ${risk.origin} carries a credential over plaintext ` +
+  `${new URL(risk.origin).protocol}// to a non-loopback host, so the AUTH this bridge sends from ` +
+  `${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} — and every message body after ` +
+  'it — crosses the network in the clear. Use rediss:// for any remote server.';
+
+/**
+ * Keep this line, so that an operator who put a password in `backend_config.url` and pointed it at a
+ * shared deployment — which both the README quickstart and `examples/multi-session` invite — learns
+ * that every host on the path can read it and post as this bridge.
+ */
+export function reportPlaintextCredential(url: string): void {
+  for (const risk of configRisks(url)) {
+    process.stderr.write(`parley-redis: SECURITY: ${describeRisk(risk)}\n`);
+  }
 }
 
 /**

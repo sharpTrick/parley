@@ -5,9 +5,10 @@ import type { JetStreamClient, JetStreamManager, NatsConnection } from 'nats';
 import {
   assertKnownBackendConfig,
   assertNoServerCredentials,
+  configRisks,
   connectionOptions,
+  describeRisk,
   type NatsBackendConfig,
-  plaintextCredentialRisks,
   validatePrefix,
   validateRetentionMaxAgeNs,
 } from './config.js';
@@ -44,7 +45,7 @@ export abstract class NatsSession {
     const retentionMaxAgeNs = validateRetentionMaxAgeNs(cfg.retention_days);
     assertNoServerCredentials(cfg);
     // Report on stderr, NEVER stdout, so that cli.ts's JSON-RPC channel stays parseable.
-    for (const risk of plaintextCredentialRisks(cfg)) console.warn(`[parley-nats] SECURITY: ${risk}`);
+    for (const risk of configRisks(cfg)) console.warn(`[parley-nats] SECURITY: ${describeRisk(risk)}`);
     const epoch = this.epoch;
     this.connecting = true;
     let nc: NatsConnection;

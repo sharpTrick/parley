@@ -1,39 +1,74 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  type ConfigRisk,
+  configRisks,
+  CREDENTIAL_CONFIG_KEYS,
+  describeRisk,
+  resolveConfig,
+} from '../src/config.js';
 import { ZulipPlugin } from '../src/index.js';
 
 // Zulip must not silently run with the repo-public default API key, nor put a real one on the wire
 // in the clear. connect() does no network I/O (auth is per-request HTTP Basic), so both warnings
 // are emitted synchronously.
+//
+// Each risk is graded as the VALUE `configRisks` returns, never as substrings of the sentence built
+// from it: a warning reworded to say the bot email and api_key are NOT sent in the clear names every
+// word a `toContain` could look for. Of the sentence, only DELIVERY is graded. Break `configRisks` —
+// drop a risk, drop a key from `exposes`, name another origin — and this file reds.
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
+const DEFAULT_KEY_RISK: ConfigRisk = { key: 'api_key', sharedDefault: 'parley-api-key' };
+const plaintextRisk = (siteUrl: string): ConfigRisk => ({
+  key: 'site_url',
+  origin: new URL(siteUrl).origin,
+  exposes: [...CREDENTIAL_CONFIG_KEYS],
+});
+
+/** Every string a risk is made of, so the line an operator acts on can be held to naming them all. */
+const partsOf = (risk: ConfigRisk): string[] =>
+  Object.values(risk).flatMap((v: unknown) => (Array.isArray(v) ? v.map(String) : [String(v)]));
+
+/**
+ * The operator SAW it: one line on the warning channel, marked as a security finding, naming every
+ * part of the risk, and rendered FROM that risk.
+ */
+const expectDelivered = (lines: readonly string[], risk: ConfigRisk): void => {
+  const shown = lines.filter((l) => l.includes(describeRisk(risk)));
+  expect(shown, `no warning renders the ${risk.key} risk`).toHaveLength(1);
+  expect(shown[0]).toContain('[parley-zulip] SECURITY');
+  for (const part of partsOf(risk)) expect(shown[0], `never names ${part}`).toContain(part);
+};
+
+/** Connect, and hold the warnings to exactly the risks expected — as values, then as lines. */
+const expectRisks = async (config: Record<string, unknown>, expected: ConfigRisk[]): Promise<void> => {
+  const warn = spyWarn();
+  await new ZulipPlugin().connect(config);
+  expect(configRisks(resolveConfig(config))).toEqual(expected);
+  const lines = warn.mock.calls.map((c) => String(c[0]));
+  expect(lines).toHaveLength(expected.length);
+  for (const risk of expected) expectDelivered(lines, risk);
+  warn.mockRestore();
+};
+
 describe('Zulip default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when api_key is omitted', async () => {
-    const warn = spyWarn();
-    await new ZulipPlugin().connect({ site_url: 'http://127.0.0.1:9991' });
-    expect(warn).toHaveBeenCalledTimes(1);
-    const msg = String(warn.mock.calls[0]?.[0]);
-    expect(msg).toContain('parley-zulip');
-    expect(msg).toContain('api_key');
+    await expectRisks({ site_url: 'http://127.0.0.1:9991' }, [DEFAULT_KEY_RISK]);
   });
 
   it('warns when api_key is set literally to the well-known default', async () => {
-    const warn = spyWarn();
-    await new ZulipPlugin().connect({ api_key: 'parley-api-key', email: 'bot@example.com' });
-    expect(warn).toHaveBeenCalledTimes(1);
+    await expectRisks({ api_key: 'parley-api-key', email: 'bot@example.com' }, [DEFAULT_KEY_RISK]);
   });
 
   it('does NOT warn when a real api_key is supplied over loopback', async () => {
-    const warn = spyWarn();
-    await new ZulipPlugin().connect({
-      site_url: 'http://127.0.0.1:9991',
-      api_key: 's3cret-real-key',
-      email: 'bot@example.com',
-    });
-    expect(warn).not.toHaveBeenCalled();
+    await expectRisks(
+      { site_url: 'http://127.0.0.1:9991', api_key: 's3cret-real-key', email: 'bot@example.com' },
+      [],
+    );
   });
 });
 
@@ -82,15 +117,11 @@ const UNUSABLE_HOSTS = ['my127.0.0.1', '1270.0.0.1', '127.0.0.256'];
 describe('Zulip plaintext-credential warning classifies the host, not its spelling', () => {
   for (const { host, loopback } of NEAR_MISSES) {
     it(`http://${host} is ${loopback ? 'loopback' : 'remote'}`, async () => {
-      const warn = spyWarn();
-      await new ZulipPlugin().connect({
-        site_url: `http://${host}:9991`,
-        email: 'bot@example.com',
-        api_key: 's3cret-real-key',
-      });
-      const all = warn.mock.calls.map((c) => String(c[0])).join('\n');
-      expect(all.includes('plaintext http://')).toBe(!loopback);
-      expect(warn).toHaveBeenCalledTimes(loopback ? 0 : 1);
+      const siteUrl = `http://${host}:9991`;
+      await expectRisks(
+        { site_url: siteUrl, email: 'bot@example.com', api_key: 's3cret-real-key' },
+        loopback ? [] : [plaintextRisk(siteUrl)],
+      );
     });
   }
 
@@ -125,16 +156,19 @@ describe('Zulip credential-transport warning', () => {
     for (const key of KEYS) {
       const expected = Number(transport.plaintextRemote) + Number(key.defaultKey);
       it(`emits ${expected} warning(s) for ${transport.site_url} with ${key.api_key ?? 'no'} key`, async () => {
-        const warn = spyWarn();
-        await new ZulipPlugin().connect({
-          site_url: transport.site_url,
-          email: 'bot@example.com',
-          ...(key.api_key === undefined ? {} : { api_key: key.api_key }),
-        });
-        expect(warn).toHaveBeenCalledTimes(expected);
-        const all = warn.mock.calls.map((c) => String(c[0])).join('\n');
-        expect(all.includes('plaintext http://')).toBe(transport.plaintextRemote);
-        expect(all.includes('built-in default API key')).toBe(key.defaultKey);
+        const risks = [
+          ...(key.defaultKey ? [DEFAULT_KEY_RISK] : []),
+          ...(transport.plaintextRemote ? [plaintextRisk(transport.site_url)] : []),
+        ];
+        expect(risks).toHaveLength(expected);
+        await expectRisks(
+          {
+            site_url: transport.site_url,
+            email: 'bot@example.com',
+            ...(key.api_key === undefined ? {} : { api_key: key.api_key }),
+          },
+          risks,
+        );
       });
     }
   }

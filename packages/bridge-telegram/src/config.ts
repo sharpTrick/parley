@@ -7,7 +7,7 @@ import {
 } from '@sharptrick/parley-core';
 import { describeConfigValue } from '@sharptrick/parley-net-util';
 
-/** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see `plaintextWarning`. */
+/** Bot API base URL when `backend_config.api_url` is unset. Keep it https — see `configRisks`. */
 export const DEFAULT_API_URL = 'https://api.telegram.org';
 
 /** Plugin-specific backend_config (DESIGN §11). */

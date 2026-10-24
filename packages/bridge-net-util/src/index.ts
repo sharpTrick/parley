@@ -17,7 +17,12 @@ import { sleepUnlessStopped } from './timing.js';
 
 export { HttpStatusError, statusOf } from './errors.js';
 export { describeConfigValue } from './config-value.js';
-export { isBaseUrl, isLoopbackHost, plaintextRemoteOrigin } from './plaintext.js';
+export {
+  isBaseUrl,
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+  plaintextRemoteOrigin,
+} from './plaintext.js';
 export { MAX_ERROR_BODY, sanitizeBody } from './redact.js';
 export { bodyRetryAfter, retryAfterFromHeader } from './retry-after.js';
 export { delay, STOP_POLL_MS } from './timing.js';

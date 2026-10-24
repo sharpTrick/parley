@@ -9,6 +9,7 @@
  * later is graded the day it is declared rather than the day someone remembers this file exists.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { CREDENTIAL_CONFIG_KEYS, describeRisk } from '../src/config.js';
 import { ZulipPlugin } from '../src/index.js';
 import { DECLARED_CONFIG_KEYS, DECLARED_CONFIG_TYPES } from './harness.js';
 
@@ -141,7 +142,13 @@ describe('a rejected config value never discloses a secret', () => {
         if (key !== 'site_url') continue;
         expect(outcome.rejected, hiding.where).toBe(hiding.siteUrl === 'rejected');
         expect(outcome.readable, hiding.where).toContain(
-          hiding.siteUrl === 'rejected' ? 'site_url' : 'plaintext http://',
+          hiding.siteUrl === 'rejected'
+            ? 'site_url'
+            : describeRisk({
+                key: 'site_url',
+                origin: new URL(hiding.value).origin,
+                exposes: CREDENTIAL_CONFIG_KEYS,
+              }),
         );
       }
     });

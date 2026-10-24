@@ -67,7 +67,7 @@ const RISKS = {
     apply: (c: Record<string, unknown>) => ({ ...c, homeserver_url: REMOTE_PLAINTEXT }),
     risk: {
       key: 'homeserver_url',
-      plaintextOrigin: new URL(REMOTE_PLAINTEXT).origin,
+      origin: new URL(REMOTE_PLAINTEXT).origin,
       exposes: [...SECRET_CONFIG_KEYS],
     },
   },
@@ -162,7 +162,7 @@ describe('the plaintext-credential risk is decided by the host, not by its spell
         ? [
             {
               key: 'homeserver_url',
-              plaintextOrigin: new URL(homeserverUrl).origin,
+              origin: new URL(homeserverUrl).origin,
               exposes: [...SECRET_CONFIG_KEYS],
             },
           ]

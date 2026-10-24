@@ -32,7 +32,7 @@ expectLabelledRefusal('nats', {
     servers: {
       reason:
         'no shape refusal to grade: every string is a candidate address. What DOES render it — ' +
-        'assertNoServerCredentials and plaintextCredentialRisks — is crossed over the hostile ' +
+        'assertNoServerCredentials and configRisks — is crossed over the hostile ' +
         'corpus in config.test.ts, which is where the value reaches an operator',
       accepts: 'nats://127.0.0.1:4222',
     },

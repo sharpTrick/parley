@@ -12,7 +12,13 @@ import {
   type ConnectionOptions,
 } from 'nats';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { MIN_RETENTION_DAYS } from '../src/config.js';
+import {
+  type ConfigRisk,
+  configRisks,
+  describeRisk,
+  MIN_RETENTION_DAYS,
+  type NatsBackendConfig,
+} from '../src/config.js';
 import {
   captures,
   NatsPlugin,
@@ -608,7 +614,7 @@ describe('nats backend_config — an unrecognised key is refused, not dropped', 
   }
 
   // `tls: true` is the sharpest of these: it supplies no material at all, and merely being defined
-  // is what `plaintextCredentialRisks` reads as proof the link will be encrypted.
+  // is what `configRisks` reads as proof the link will be encrypted.
   const NOT_AN_OBJECT: unknown[] = [true, false, 'yes', '/tmp/ca.pem', 42, null, [], ['/tmp/ca.pem']];
 
   for (const container of containers) {
@@ -737,7 +743,28 @@ describe('nats auth precedence — which credential reaches the driver when two 
 // that can independently flip the answer: the scheme, the host's class, whether `tls` is set, and
 // whether there is a secret to expose at all. The `never echoes the secret` rows below are the
 // neighbouring test that cannot reach this: they grade the failure message, not the transport.
+// Each risk is graded as the VALUE `configRisks` returns — which key, which server, which fields it
+// exposes — never as words of the sentence: a warning reworded to say the host is loopback and `tls`
+// is set still names the server and the field. Of the sentence, only DELIVERY is graded.
 describe('nats transport safety — a credential on an unencrypted remote link warns', () => {
+  /** The warnings are exactly these risks — as values, then as lines rendered from each. */
+  const expectRisks = (
+    config: Record<string, unknown>,
+    warned: readonly string[],
+    expected: ConfigRisk[],
+  ): void => {
+    expect(configRisks(config as NatsBackendConfig)).toEqual(expected);
+    expect(warned).toHaveLength(expected.length);
+    for (const risk of expected) {
+      const shown = warned.filter((l) => l.includes(describeRisk(risk)));
+      expect(shown, 'no warning renders the risk').toHaveLength(1);
+      expect(shown[0]).toContain('[parley-nats] SECURITY');
+      for (const part of [risk.key, risk.origin, ...risk.exposes]) {
+        expect(shown[0], `never names ${part}`).toContain(part);
+      }
+    }
+  };
+
   const warningsFrom = async (config: Record<string, unknown>): Promise<string[]> => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
@@ -799,19 +826,19 @@ describe('nats transport safety — a credential on an unencrypted remote link w
   it.each(cells)(
     'servers $server (secret $secret, tls $tls) warns as documented',
     async ({ server, secret, tls, warns }) => {
-      const warned = await warningsFrom({
+      const config = {
         servers: server,
         ...(secret ? { token: SECRET } : {}),
         ...(tls ? { tls: { ca_file: '/tmp/ca.pem' } } : {}),
-      });
+      };
+      const warned = await warningsFrom(config);
 
-      expect(warned).toHaveLength(warns ? 1 : 0);
-      for (const line of warned) {
-        expect(line).toContain('parley-nats');
-        expect(line).toContain(serverAuthority(server));
-        expect(line).toContain('token');
-        expect(line).not.toContain(SECRET);
-      }
+      expectRisks(
+        config,
+        warned,
+        warns ? [{ key: 'servers', origin: serverAuthority(server), exposes: ['token'] }] : [],
+      );
+      for (const line of warned) expect(line).not.toContain(SECRET);
     },
   );
 
@@ -825,11 +852,15 @@ describe('nats transport safety — a credential on an unencrypted remote link w
   });
 
   it.each(cases)('$name on a remote plaintext server names the field it would expose', async (c) => {
-    const exposed = Object.keys(c.config).filter((k) => credentialKeys.includes(k));
-    const warned = await warningsFrom({ ...c.config, servers: 'nats://nats.example.com:4222' });
+    const exposed = credentialKeys.filter((k) => k in c.config) as ConfigRisk['exposes'];
+    const config = { ...c.config, servers: 'nats://nats.example.com:4222' };
+    const warned = await warningsFrom(config);
 
-    expect(warned).toHaveLength(exposed.length === 0 ? 0 : 1);
-    for (const field of exposed) expect(warned[0]).toContain(field);
+    expectRisks(
+      config,
+      warned,
+      exposed.length === 0 ? [] : [{ key: 'servers', origin: 'nats.example.com:4222', exposes: exposed }],
+    );
     for (const line of warned) expect(line).not.toContain(SECRET);
   });
 
@@ -869,17 +900,21 @@ describe('nats transport safety — a credential on an unencrypted remote link w
 
   // The `tls://` entry warns like the rest: it is a remote host, and the scheme buys it nothing.
   it('warns once per offending entry when servers is a list', async () => {
-    const warned = await warningsFrom({
+    const config = {
       servers: ['nats://127.0.0.1:4222', 'nats://a.example.com:4222', 'tls://b.example.com:4222', 'nats://c.example.com:4222'],
       token: SECRET,
-    });
+    };
+    const warned = await warningsFrom(config);
 
-    expect(warned).toHaveLength(3);
-    expect(warned.map((l) => (/servers "([^"]+)"/.exec(l) ?? [])[1])).toEqual([
-      'a.example.com:4222',
-      'b.example.com:4222',
-      'c.example.com:4222',
-    ]);
+    expectRisks(
+      config,
+      warned,
+      ['a.example.com:4222', 'b.example.com:4222', 'c.example.com:4222'].map((origin) => ({
+        key: 'servers',
+        origin,
+        exposes: ['token'],
+      })),
+    );
   });
 });
 

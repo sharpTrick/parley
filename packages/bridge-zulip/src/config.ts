@@ -3,6 +3,7 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
+import { type PlaintextCredentialRisk, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
 
 /** Plugin-specific backend_config. */
 export interface ZulipBackendConfig {
@@ -47,6 +48,47 @@ export interface ZulipConfig {
   stream: string;
   eventsTimeoutMs: number;
   usesDefaultApiKey: boolean;
+}
+
+/**
+ * Every `backend_config` key spent in the HTTP Basic credential. Both are defaulted, so neither is
+ * filtered by presence: an unset one still goes on the wire.
+ */
+export const CREDENTIAL_CONFIG_KEYS = ['email', 'api_key'] as const satisfies
+  readonly (keyof ZulipBackendConfig)[];
+
+/** A config shape that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk =
+  | { key: 'api_key'; sharedDefault: string }
+  | PlaintextCredentialRisk<'site_url', (typeof CREDENTIAL_CONFIG_KEYS)[number]>;
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export function describeRisk(risk: ConfigRisk): string {
+  switch (risk.key) {
+    case 'api_key':
+      return (
+        `connecting with the built-in default API key ('${risk.sharedDefault}'). Set ` +
+        `backend_config.${risk.key} to a real secret; a network-reachable Zulip bot provisioned ` +
+        'with this key is world-readable/injectable.'
+      );
+    case 'site_url':
+      return (
+        `backend_config.${risk.key} ${risk.origin} is plaintext http:// to a non-loopback host, so ` +
+        `${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} travel the network as an ` +
+        'unencrypted HTTP Basic header on every request. Use https://.'
+      );
+  }
+}
+
+/** Every config shape that widens this backend's trust boundary, which `connect()` warns about. */
+export function configRisks(cfg: ZulipConfig): ConfigRisk[] {
+  const risks: ConfigRisk[] = [];
+  if (cfg.usesDefaultApiKey) risks.push({ key: 'api_key', sharedDefault: DEFAULT_API_KEY });
+  const origin = plaintextRemoteOrigin(cfg.baseUrl);
+  if (origin !== undefined) {
+    risks.push({ key: 'site_url', origin, exposes: CREDENTIAL_CONFIG_KEYS });
+  }
+  return risks;
 }
 
 /**

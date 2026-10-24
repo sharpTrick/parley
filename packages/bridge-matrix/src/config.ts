@@ -8,6 +8,7 @@ import {
   DEFAULT_DEADLINE_MS,
   describeConfigValue,
   isBaseUrl,
+  type PlaintextCredentialRisk,
   plaintextRemoteOrigin,
 } from '@sharptrick/parley-net-util';
 import { aliasOf, LEGAL_LOCALPART, MAX_ALIAS_BYTES } from './alias.js';
@@ -200,7 +201,7 @@ export type SecretConfigKey = (typeof SECRET_CONFIG_KEYS)[number];
  * an operator reads: which key opens the boundary, and what about that key's value opens it.
  */
 export type ConfigRisk =
-  | { key: 'homeserver_url'; plaintextOrigin: string; exposes: readonly SecretConfigKey[] }
+  | PlaintextCredentialRisk<'homeserver_url', SecretConfigKey>
   | { key: 'password'; sharedDefault: string }
   | { key: 'shared_room'; room: string; isolatedOnlyBy: string }
   | { key: 'room_preset'; preset: 'public_chat' };
@@ -210,7 +211,7 @@ export function describeRisk(risk: ConfigRisk): string {
   switch (risk.key) {
     case 'homeserver_url':
       return (
-        `backend_config.${risk.key} ${risk.plaintextOrigin} is plaintext http:// to a non-loopback ` +
+        `backend_config.${risk.key} ${risk.origin} is plaintext http:// to a non-loopback ` +
         'host, so the m.login.password POST carries ' +
         `${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} across the network in the ` +
         'clear, and the access token it returns rides every later request the same way. Use ' +
@@ -246,9 +247,9 @@ export function describeRisk(risk: ConfigRisk): string {
  */
 export function configRisks(cfg: MatrixBackendConfig): ConfigRisk[] {
   const risks: ConfigRisk[] = [];
-  const plaintextOrigin = plaintextRemoteOrigin(cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL);
-  if (plaintextOrigin !== undefined) {
-    risks.push({ key: 'homeserver_url', plaintextOrigin, exposes: SECRET_CONFIG_KEYS });
+  const origin = plaintextRemoteOrigin(cfg.homeserver_url ?? DEFAULT_HOMESERVER_URL);
+  if (origin !== undefined) {
+    risks.push({ key: 'homeserver_url', origin, exposes: SECRET_CONFIG_KEYS });
   }
   if (cfg.password === undefined || cfg.password === DEFAULT_PASSWORD) {
     risks.push({ key: 'password', sharedDefault: DEFAULT_PASSWORD });

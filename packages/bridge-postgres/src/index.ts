@@ -14,10 +14,11 @@ import {
 import type { Pool, PoolClient } from 'pg';
 import { DIAL_WAIT_MS, endWithin, openPool, QUERY_WAIT_MS, TEARDOWN_WAIT_MS } from './connection.js';
 import {
+  configRisks,
   DEFAULT_POOL_SIZE,
   DEFAULT_TABLE_NAME,
   DEFAULT_URL,
-  plaintextCredentialOrigin,
+  describeRisk,
   type PostgresBackendConfig,
   usesDefaultCredentials,
   validateBackendConfig,
@@ -94,24 +95,11 @@ export class PostgresPlugin extends PostgresListener implements BackendPlugin {
     this.retentionDays = cfg.retention_days ?? undefined;
     this.stopped = false;
 
-    if (usesDefaultCredentials(this.url)) {
-      console.warn(
-        '[parley-postgres] SECURITY: connecting with the repo-public default credentials ' +
-          "('postgres://parley:parley@…'). Set backend_config.url to a real connection string; a " +
-          'network-reachable database provisioned with these credentials is world-readable/injectable.',
-      );
-    }
-
-    const plaintext = plaintextCredentialOrigin(this.url);
-    if (plaintext !== undefined) {
-      // Keep this on stderr rather than console.warn, so that a caller counting one of these two
-      // warnings does not silently count the other.
-      process.stderr.write(
-        `parley-postgres: SECURITY: backend_config.url ${plaintext} carries a credential to a ` +
-          `non-loopback host with TLS off, so the password this bridge sends — and every message ` +
-          `body after it — crosses the network in the clear, where anyone on the path can read ` +
-          `both and write to this table. Add '?sslmode=require' for any remote server.\n`,
-      );
+    for (const risk of configRisks(this.url)) {
+      // Keep the plaintext risk on stderr rather than console.warn, so that a caller counting one of
+      // these two warnings does not silently count the other.
+      if ('sharedDefault' in risk) console.warn(`[parley-postgres] SECURITY: ${describeRisk(risk)}`);
+      else process.stderr.write(`parley-postgres: SECURITY: ${describeRisk(risk)}\n`);
     }
 
     const pool = openPool(this.url, cfg.pool_size ?? DEFAULT_POOL_SIZE);

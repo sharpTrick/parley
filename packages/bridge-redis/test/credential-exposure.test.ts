@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { resolveConfig } from '../src/config.js';
+import { type ConfigRisk, configRisks, describeRisk } from '../src/diagnostics.js';
 import { type RedisBackendConfig, RedisPlugin } from '../src/index.js';
 import { FAST_MS as FAST, freeEndpoint } from './support.js';
 
@@ -13,6 +15,10 @@ import { FAST_MS as FAST, freeEndpoint } from './support.js';
 // satisfied by warning about everything. The silent rows are what make the loud ones mean anything.
 //
 // Decided before any server is reached, so nothing here needs one and nothing here can skip.
+//
+// The risk is graded as the VALUE `configRisks` returns — which key, which origin, which secret —
+// never as words of the sentence: a warning reworded to say the AUTH never crosses the network in
+// the clear still names the host. Of the sentence, only DELIVERY is graded.
 
 /** The value that must never appear in a line about the URL that carries it. */
 const SECRET = 's3cret';
@@ -76,11 +82,17 @@ const safe: Array<[string, () => Promise<RedisBackendConfig> | RedisBackendConfi
 describe('bridge-redis — a credential bound for a cleartext remote link is reported', () => {
   it.each(exposed)('%s', async (_label, url) => {
     const capture = await connecting({ url });
-    const [line = ''] = securityLines(capture);
-    expect(line, `connect() accepted ${url} in silence`).not.toBe('');
-    expect(line, 'the warning does not name the origin an operator has to change').toContain(
-      new URL(url).host,
-    );
+    const parsed = new URL(url);
+    const risk: ConfigRisk = { key: 'url', origin: `${parsed.protocol}//${parsed.host}`, exposes: ['url'] };
+    expect(configRisks(url)).toEqual([risk]);
+    const lines = securityLines(capture);
+    expect(lines, `connect() did not report ${url} exactly once`).toHaveLength(1);
+    const [line = ''] = lines;
+    expect(line, 'the warning does not render the risk').toContain(describeRisk(risk));
+    expect(line).toMatch(/^parley-redis: SECURITY: /);
+    for (const part of [risk.key, risk.origin, ...risk.exposes]) {
+      expect(line, `the warning never names ${part}`).toContain(part);
+    }
     expect(line, 'the warning prints the credential it is warning about').not.toContain(SECRET);
     expect(
       capture.stdout,
@@ -91,7 +103,9 @@ describe('bridge-redis — a credential bound for a cleartext remote link is rep
 
 describe('bridge-redis — a URL with nothing to expose is reported on by nothing', () => {
   it.each(safe)('%s', async (_label, mint) => {
-    const capture = await connecting(await mint());
+    const config = await mint();
+    expect(configRisks(resolveConfig(config).url)).toEqual([]);
+    const capture = await connecting(config);
     expect(
       securityLines(capture),
       'a URL that exposes no credential was warned about, so the warning means nothing when it ' +

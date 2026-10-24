@@ -7,7 +7,7 @@ import {
   type AllowedMentions,
   type DiscordBackendConfig,
 } from './config.js';
-import { plaintextCredentialRisks } from './creds.js';
+import { configRisks, describeRisk } from './creds.js';
 import { warn } from './diagnostics.js';
 import { DiscordGateway } from './gateway.js';
 import { dialBudgetFor } from './ladder.js';
@@ -63,7 +63,7 @@ export abstract class DiscordSession {
     this.stopped = false;
     this.connected = true;
 
-    for (const risk of plaintextCredentialRisks(cfg)) warn(`SECURITY: ${risk}`);
+    for (const risk of configRisks(cfg)) warn(`SECURITY: ${describeRisk(risk)}`);
   }
 
   async disconnect(): Promise<void> {

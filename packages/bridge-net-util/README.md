@@ -177,6 +177,15 @@ dependency-free; `vitest` is an optional peer, needed only by whoever imports th
   about an unproven scheme. A URL with no host (`file:`, `mailto:`) names no remote endpoint and
   answers `undefined`.
 
+- `PlaintextCredentialRisk` — `{ key, origin, exposes }`: the `backend_config` key whose value
+  opens the boundary, the endpoint it names (no userinfo, path or query), and the keys holding the
+  secrets that endpoint receives. Every backend's plaintext-credential warning is computed as one of
+  these and rendered from it only where it is written to stderr, so a test asserts the risk rather
+  than the sentence: a warning reworded to deny the risk still names the same words, and a
+  substring check cannot tell it from the truth. There is no shared renderer — what to do instead
+  (`rediss://`, `sslmode=require`, `backend_config.tls`, `xmpps://`) and how the secret travels (a
+  URL path, a Basic header, a CONNECT frame) are each backend's own, and are not fields.
+
 These live here so the backends that warn about the same thing share one classifier: a security
 predicate copied per backend is a predicate fixed in one place and left wrong in the others. One
 fork is outstanding rather than hypothetical: `bridge-discord` needs the scheme to recommend as

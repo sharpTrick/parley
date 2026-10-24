@@ -12,8 +12,7 @@ import {
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
-import { resolveConfig } from './config.js';
+import { configRisks, describeRisk, resolveConfig } from './config.js';
 import { ZulipConnection } from './connection.js';
 import { readWindow } from './history.js';
 import { startPushLoop } from './push-loop.js';
@@ -47,20 +46,8 @@ export class ZulipPlugin implements BackendPlugin {
     if (this.conn.connected) await this.conn.close();
     this.conn.open(cfg);
 
-    if (cfg.usesDefaultApiKey) {
-      console.warn(
-        '[parley-zulip] SECURITY: connecting with the built-in default API key ' +
-          "('parley-api-key'). Set backend_config.api_key to a real secret; a network-reachable " +
-          'Zulip bot provisioned with this key is world-readable/injectable.',
-      );
-    }
-    const plaintext = plaintextRemoteOrigin(cfg.baseUrl);
-    if (plaintext !== undefined) {
-      console.warn(
-        `[parley-zulip] SECURITY: backend_config.site_url ${plaintext} is plaintext http:// to a ` +
-          'non-loopback host, so the bot email and api_key travel the network as an unencrypted ' +
-          'HTTP Basic header on every request. Use https://.',
-      );
+    for (const risk of configRisks(cfg)) {
+      console.warn(`[parley-zulip] SECURITY: ${describeRisk(risk)}`);
     }
   }
 

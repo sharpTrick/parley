@@ -5,7 +5,12 @@ import {
   type BackendConfigKeys,
   MAX_TIMER_MS,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isBaseUrl, plaintextRemoteOrigin } from '@sharptrick/parley-net-util';
+import {
+  describeConfigValue,
+  isBaseUrl,
+  type PlaintextCredentialRisk,
+  plaintextRemoteOrigin,
+} from '@sharptrick/parley-net-util';
 import { SlackShapeError } from './api.js';
 import { DEFAULT_HANDSHAKE_TIMEOUT_MS, DEFAULT_ROTATION_GRACE_MS } from './socket.js';
 
@@ -251,16 +256,8 @@ export function resolveConfig(cfg: SlackBackendConfig): SlackSettings {
   };
 }
 
-/**
- * A config that widens this backend's trust boundary, as the FACT rather than as the sentence an
- * operator reads: which key opens it, which origin the value names, and which of this config's
- * secrets that origin then receives.
- */
-export interface ConfigRisk {
-  key: string;
-  origin: string;
-  exposes: string[];
-}
+/** A config that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk = PlaintextCredentialRisk<'api_url', (typeof TOKEN_CONFIG_KEYS)[number]>;
 
 /** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
 export const describeRisk = (risk: ConfigRisk): string =>

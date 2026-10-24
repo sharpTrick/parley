@@ -25,7 +25,13 @@ import {
   type TelegramBackendConfig,
 } from './config.js';
 import { recordToMessage, requireLimit, requireOwnCursor } from './cursor.js';
-import { describe, Diagnostics, fromCaller, plaintextWarning } from './diagnostics.js';
+import {
+  configRisks,
+  describe,
+  describeRisk,
+  Diagnostics,
+  fromCaller,
+} from './diagnostics.js';
 import { pollUpdates } from './poll.js';
 import { keyOf, type ObservedRecord, ObservedStore } from './store.js';
 import {
@@ -124,8 +130,9 @@ export class TelegramPlugin implements BackendPlugin {
       // is redacted against THIS connection's token rather than the previous connection's.
       this.api = api;
       requireNumericKnobs(cfg);
-      const warning = plaintextWarning(apiUrl);
-      if (warning !== undefined) this.diagnostics.report(warning);
+      for (const risk of configRisks(apiUrl)) {
+        this.diagnostics.report(`SECURITY: ${describeRisk(risk)}`);
+      }
       const timeoutS = cfg.poll_timeout_s ?? 25;
       const chats = new ChatResolver(api, cfg.chat_map ?? {}, this.diagnostics, (chatId) => {
         if (generation === this.generation) this.store?.serve(chatId);

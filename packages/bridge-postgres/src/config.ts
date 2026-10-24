@@ -3,7 +3,11 @@ import {
   type BackendConfig,
   type BackendConfigKeys,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isLoopbackHost } from '@sharptrick/parley-net-util';
+import {
+  describeConfigValue,
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+} from '@sharptrick/parley-net-util';
 import { parse as parseDsn } from 'pg-connection-string';
 import { badConfig } from './errors.js';
 
@@ -143,7 +147,8 @@ export function plaintextCredentialOrigin(url: string): string | undefined {
   if (!carriesCredential || host === '' || isLoopbackHost(host) || Boolean(parsed.ssl)) {
     return undefined;
   }
-  return `postgres://${host}${parsed.port === null || parsed.port === undefined ? '' : `:${parsed.port}`}`;
+  // Truthiness, not `null`: the parser reports an omitted port as '', which names no port.
+  return `postgres://${host}${parsed.port ? `:${parsed.port}` : ''}`;
 }
 
 /**
@@ -164,4 +169,38 @@ export function usesDefaultCredentials(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * A config shape that widens this backend's trust boundary, as the fact rather than the sentence.
+ * Both concern `url`, which is where a Postgres credential lives, so the shape is the discriminant.
+ */
+export type ConfigRisk = { key: 'url'; sharedDefault: string } | PlaintextCredentialRisk<'url', 'url'>;
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export function describeRisk(risk: ConfigRisk): string {
+  if ('sharedDefault' in risk) {
+    return (
+      `connecting with the repo-public default credentials ('postgres://${risk.sharedDefault}@…'). ` +
+      `Set backend_config.${risk.key} to a real connection string; a network-reachable database ` +
+      'provisioned with these credentials is world-readable/injectable.'
+    );
+  }
+  return (
+    `backend_config.${risk.key} ${risk.origin} carries a credential to a non-loopback host with TLS ` +
+    `off, so the password in ${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} — ` +
+    'and every message body after it — crosses the network in the clear, where anyone on the path ' +
+    "can read both and write to this table. Add '?sslmode=require' for any remote server."
+  );
+}
+
+/** Every config shape that widens this backend's trust boundary, which `connect()` warns about. */
+export function configRisks(url: string): ConfigRisk[] {
+  const risks: ConfigRisk[] = [];
+  if (usesDefaultCredentials(url)) {
+    risks.push({ key: 'url', sharedDefault: `${DEFAULT_USER}:${DEFAULT_PASSWORD}` });
+  }
+  const origin = plaintextCredentialOrigin(url);
+  if (origin !== undefined) risks.push({ key: 'url', origin, exposes: ['url'] });
+  return risks;
 }

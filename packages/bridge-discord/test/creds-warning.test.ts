@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { DiscordBackendConfig } from '../src/config.js';
+import { type ConfigRisk, configRisks, describeRisk } from '../src/creds.js';
 import { DiscordPlugin } from '../src/index.js';
 
 // CLASS: a configurable endpoint that carries a SECRET and accepts a plaintext scheme. Both
@@ -9,6 +11,11 @@ import { DiscordPlugin } from '../src/index.js';
 // origin, because an operator with two endpoints configured cannot act on "something is plaintext".
 // It stays a WARNING, not a load error: the in-process fakes and loopback dev proxies are plaintext
 // by construction.
+//
+// Each risk is graded as the VALUE `configRisks` returns — key, origin, the secret exposed, the
+// scheme to use — never as words of the sentence: a warning reworded to say nobody on the path can
+// take the token still names the key, the origin and `wss://`. Of the sentence, only DELIVERY is
+// graded: one SECURITY line, rendered from that risk, naming every part of it.
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -19,6 +26,32 @@ const connectWith = async (config: Record<string, unknown>): Promise<string[]> =
   await new DiscordPlugin().connect({ token: 'a-real-bot-token', ...config });
   return spy.mock.calls.map((c) => String(c[0]));
 };
+
+const security = (lines: readonly string[]): string[] => lines.filter((l) => l.includes('SECURITY'));
+
+/** Connect, and hold the warnings to exactly the risks expected — as values, then as lines. */
+const expectRisks = async (config: Record<string, unknown>, expected: ConfigRisk[]): Promise<void> => {
+  const written = security(await connectWith(config));
+  expect(configRisks({ token: 'a-real-bot-token', ...config } as DiscordBackendConfig)).toEqual(
+    expected,
+  );
+  expect(written).toHaveLength(expected.length);
+  for (const risk of expected) {
+    const shown = written.filter((l) => l.includes(describeRisk(risk)));
+    expect(shown, `no warning renders the ${risk.key} risk`).toHaveLength(1);
+    expect(shown[0]).toContain('parley-discord: SECURITY');
+    for (const part of [risk.key, risk.origin, risk.secure, ...risk.exposes]) {
+      expect(shown[0], `never names ${part}`).toContain(part);
+    }
+  }
+};
+
+const riskOf = (key: ConfigRisk['key'], url: string, secure: string): ConfigRisk => ({
+  key,
+  origin: new URL(url).origin,
+  exposes: ['token'],
+  secure,
+});
 
 /** Both secret-carrying endpoints, with the plaintext scheme each one accepts. */
 const KEYS: Array<{
@@ -58,15 +91,7 @@ describe('Discord plaintext-credential warning classifies the host, not its spel
   for (const { key, url, secure } of KEYS) {
     for (const { host, loopback } of HOSTS) {
       it(`${key} ${url(host)} ${loopback ? 'is loopback and stays silent' : 'warns'}`, async () => {
-        const written = await connectWith({ [key]: url(host) });
-        const flagged = written.filter((line) => line.includes('plaintext scheme'));
-        expect(flagged).toHaveLength(loopback ? 0 : 1);
-        if (!loopback) {
-          expect(flagged[0]).toContain(`backend_config.${key}`);
-          expect(flagged[0]).toContain(new URL(url(host)).origin);
-          expect(flagged[0]).toContain(secure);
-          expect(flagged[0]).toContain('SECURITY');
-        }
+        await expectRisks({ [key]: url(host) }, loopback ? [] : [riskOf(key, url(host), secure)]);
       });
     }
   }
@@ -74,29 +99,24 @@ describe('Discord plaintext-credential warning classifies the host, not its spel
   for (const { key, url } of KEYS) {
     it(`${key} over an encrypted scheme is silent`, async () => {
       const encrypted = url('discord.example.com').replace(/^http:/, 'https:').replace(/^ws:/, 'wss:');
-      const written = await connectWith({ [key]: encrypted });
-      expect(written.filter((line) => line.includes('plaintext scheme'))).toEqual([]);
+      await expectRisks({ [key]: encrypted }, []);
     });
   }
 
   it('names BOTH endpoints when both are plaintext and remote', async () => {
-    const written = await connectWith({
-      api_url: 'http://proxy.internal/api/v10',
-      gateway_url: 'ws://proxy.internal',
-    });
-    const flagged = written.filter((line) => line.includes('plaintext scheme'));
-    expect(flagged).toHaveLength(2);
-    expect(flagged.join('')).toContain('backend_config.api_url');
-    expect(flagged.join('')).toContain('backend_config.gateway_url');
+    await expectRisks({ api_url: 'http://proxy.internal/api/v10', gateway_url: 'ws://proxy.internal' }, [
+      riskOf('api_url', 'http://proxy.internal/api/v10', 'https://'),
+      riskOf('gateway_url', 'ws://proxy.internal', 'wss://'),
+    ]);
   });
 
   it('the defaults (Discord itself, no override) are silent', async () => {
-    expect((await connectWith({})).filter((l) => l.includes('plaintext scheme'))).toEqual([]);
+    await expectRisks({}, []);
   });
 
   it('a warning is one stderr line, so a hostile origin cannot forge a second', async () => {
-    const written = await connectWith({ api_url: 'http://proxy.internal/api/v10' });
-    const flagged = written.filter((line) => line.includes('plaintext scheme'));
+    const flagged = security(await connectWith({ api_url: 'http://proxy.internal/api/v10' }));
+    expect(flagged).toHaveLength(1);
     expect(flagged[0]!.endsWith('\n')).toBe(true);
     expect(flagged[0]!.slice(0, -1)).not.toContain('\n');
   });
@@ -111,7 +131,6 @@ describe('Discord plaintext-credential warning classifies the host, not its spel
   });
 
   it('is not fooled by a value that is not a URL at all', async () => {
-    const written = await connectWith({ api_url: 'not a url', gateway_url: 'also not a url' });
-    expect(written.filter((line) => line.includes('plaintext scheme'))).toEqual([]);
+    await expectRisks({ api_url: 'not a url', gateway_url: 'also not a url' }, []);
   });
 });

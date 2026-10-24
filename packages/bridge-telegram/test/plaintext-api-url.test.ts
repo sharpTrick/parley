@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { type ConfigRisk, configRisks, describeRisk } from '../src/diagnostics.js';
 import { TelegramPlugin } from '../src/index.js';
 import { captureStderr, packageSource, registerCleanup, startFake, storePath } from './rig.js';
 
@@ -16,6 +17,10 @@ const shippedDefault = /const DEFAULT_API_URL = '([^']+)'/.exec(packageSource())
  * merely looks like an address, and `[::1]` is loopback written in a form no `127.` test sees. The
  * warning must fire exactly when the credential would cross the network unencrypted — no more, no
  * less — and must never itself be the thing that prints a secret.
+ *
+ * The risk is graded as the VALUE `configRisks` returns — which key, which origin, which secret —
+ * never as words of the sentence: a warning reworded to say this API never carries the token in the
+ * path still says "plaintext" and "http://". Of the sentence, only DELIVERY is graded.
  */
 const PASSWORD = 's3cret-in-the-url';
 
@@ -69,14 +74,24 @@ describe('telegram plaintext api_url', () => {
       );
     expect(connected).toBe(reaches);
 
-    const security = stderr.filter((l) => l.includes('SECURITY'));
-    expect(security).toHaveLength(warns ? 1 : 0);
-    if (!warns) return;
     // The ORIGIN, so an operator can tell which host it is — and only the origin, so a secret
     // smuggled into userinfo or a path is not what the warning itself prints.
-    expect(security[0]).toContain(new URL(apiUrl).origin);
-    expect(security[0]).not.toContain(PASSWORD);
-    expect(security[0]).toMatch(/http:\/\/|plaintext/);
+    const expected: ConfigRisk[] = warns
+      ? [{ key: 'api_url', origin: new URL(apiUrl).origin, exposes: ['token'] }]
+      : [];
+    expect(configRisks(apiUrl)).toEqual(expected);
+
+    const security = stderr.filter((l) => l.includes('SECURITY'));
+    expect(security).toHaveLength(expected.length);
+    for (const risk of expected) {
+      const shown = security.filter((l) => l.includes(describeRisk(risk)));
+      expect(shown, 'no warning renders the risk').toHaveLength(1);
+      expect(shown[0]).toContain('parley-telegram: SECURITY');
+      for (const part of [risk.key, risk.origin, ...risk.exposes]) {
+        expect(shown[0], `never names ${part}`).toContain(part);
+      }
+      expect(shown[0]).not.toContain(PASSWORD);
+    }
   }, 20_000);
 
   /**

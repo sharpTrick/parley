@@ -4,7 +4,12 @@ import {
   type BackendConfigKeys,
   isPlainObject,
 } from '@sharptrick/parley-core';
-import { describeConfigValue, isLoopbackHost, sanitizeBody } from '@sharptrick/parley-net-util';
+import {
+  describeConfigValue,
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+  sanitizeBody,
+} from '@sharptrick/parley-net-util';
 import { readFileSync } from 'node:fs';
 import { credsAuthenticator, nkeyAuthenticator, type ConnectionOptions } from 'nats';
 
@@ -267,29 +272,38 @@ export function assertNoServerCredentials(cfg: NatsBackendConfig): void {
   }
 }
 
+/** Every `backend_config` key the CONNECT frame carries as a credential. */
+const CREDENTIAL_CONFIG_KEYS = ['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const;
+
+/** A `servers` entry that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk = PlaintextCredentialRisk<
+  'servers',
+  (typeof CREDENTIAL_CONFIG_KEYS)[number]
+>;
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export const describeRisk = (risk: ConfigRisk): string =>
+  `backend_config.${risk.key} ${JSON.stringify(risk.origin)} is a non-loopback host and ` +
+  'backend_config.tls is unset, so nothing here forces encryption and the CONNECT frame ' +
+  `may carry backend_config.${risk.exposes.join('/')} across the network in the clear. Set ` +
+  'backend_config.tls — nats.js discards the URL scheme, so tls:// does not encrypt.';
+
 /**
- * One warning per `servers` entry that would put a configured credential on a remote link nothing
+ * One risk per `servers` entry that would put a configured credential on a remote link nothing
  * in this config forces to be encrypted. A warning rather than a load error: a TLS-terminating
  * sidecar, a loopback fixture, and a server whose INFO offers TLS (which nats.js then upgrades to
  * on its own) are all legitimate — but none is a reason for the mistake to be silent. Setting
  * `backend_config.tls` is what turns that opportunistic upgrade into a fail-fast guarantee.
  */
-export function plaintextCredentialRisks(cfg: NatsBackendConfig): string[] {
-  const fields = (['token', 'user', 'pass', 'creds_file', 'nkey_seed'] as const).filter(
-    (field) => cfg[field] !== undefined,
-  );
-  if (fields.length === 0 || cfg.tls !== undefined) return [];
+export function configRisks(cfg: NatsBackendConfig): ConfigRisk[] {
+  const exposes = CREDENTIAL_CONFIG_KEYS.filter((field) => cfg[field] !== undefined);
+  if (exposes.length === 0 || cfg.tls !== undefined) return [];
   const servers = [cfg.servers ?? DEFAULT_SERVERS].flat();
   return servers.flatMap((server) => {
     const text = String(server);
     if (plaintextRemoteServer(text) === undefined) return [];
-    const named = sanitizeBody(serverAuthority(text)).slice(0, MAX_AUTHORITY_IN_DIAGNOSTIC);
-    return [
-          `backend_config.servers ${JSON.stringify(named)} is a non-loopback host and ` +
-            'backend_config.tls is unset, so nothing here forces encryption and the CONNECT frame ' +
-            `may carry backend_config.${fields.join('/')} across the network in the clear. Set ` +
-            'backend_config.tls — nats.js discards the URL scheme, so tls:// does not encrypt.',
-    ];
+    const origin = sanitizeBody(serverAuthority(text)).slice(0, MAX_AUTHORITY_IN_DIAGNOSTIC);
+    return [{ key: 'servers', origin, exposes }];
   });
 }
 

@@ -1,4 +1,8 @@
-import { plaintextRemoteOrigin, sanitizeBody } from '@sharptrick/parley-net-util';
+import {
+  type PlaintextCredentialRisk,
+  plaintextRemoteOrigin,
+  sanitizeBody,
+} from '@sharptrick/parley-net-util';
 
 /**
  * Diagnostics go to stderr — stdout is the MCP JSON-RPC channel (see cli.ts). Keep every line the
@@ -109,16 +113,21 @@ export class Diagnostics {
   }
 }
 
+/** A config shape that widens this backend's trust boundary, as the fact rather than the sentence. */
+export type ConfigRisk = PlaintextCredentialRisk<'api_url', 'token'>;
+
 /**
- * The `connect`-time warning a plaintext `api_url` earns, or `undefined`. Names the ORIGIN only, so
- * that a secret smuggled into userinfo or a path is not what the warning itself prints.
+ * The risks a `connect` to `apiUrl` warns about. Names the ORIGIN only, so that a secret smuggled
+ * into userinfo or a path is not what the warning itself prints.
  */
-export function plaintextWarning(apiUrl: string): string | undefined {
+export function configRisks(apiUrl: string): ConfigRisk[] {
   const origin = plaintextRemoteOrigin(apiUrl);
-  if (origin === undefined) return undefined;
-  return (
-    `SECURITY: backend_config.api_url ${origin} is plaintext http:// to a non-loopback ` +
-    `host. This API carries the bot token in the URL PATH, so every request line puts it ` +
-    `on the network in the clear and into the logs of every proxy on the way. Use https://.`
-  );
+  return origin === undefined ? [] : [{ key: 'api_url', origin, exposes: ['token'] }];
 }
+
+/** The operator's stderr line for a risk. Rendered from the risk, so it cannot describe another. */
+export const describeRisk = (risk: ConfigRisk): string =>
+  `backend_config.${risk.key} ${risk.origin} is plaintext http:// to a non-loopback ` +
+  `host. This API carries ${risk.exposes.map((k) => `backend_config.${k}`).join(' and ')} in ` +
+  `the URL PATH, so every request line puts it on the network in the clear and into the logs of ` +
+  `every proxy on the way. Use https://.`;
