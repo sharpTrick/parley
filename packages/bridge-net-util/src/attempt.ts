@@ -1,5 +1,6 @@
 import { BodyTooLargeError, LabelledError } from './errors.js';
 import { errorText, MAX_ERROR_BODY, redactUrls, sanitizeBody } from './redact.js';
+import { MAX_TIMER_MS } from './timing.js';
 
 /**
  * Bytes of a body the caller will never be handed worth pulling off the socket: enough that
@@ -78,9 +79,6 @@ function isCallerAbort(err: unknown, signal: AbortSignal): boolean {
   if (!signal.aborted) return false;
   return err === (signal.reason as unknown) || (err instanceof Error && err.name === 'AbortError');
 }
-
-/** Longest delay a Node timer holds. Past it the delay wraps and the timer fires at 1ms instead. */
-const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * `ms` as Node's timer will take it. `AbortSignal.timeout` demands an integer inside the 32-bit

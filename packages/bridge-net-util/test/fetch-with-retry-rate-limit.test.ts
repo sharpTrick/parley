@@ -417,3 +417,26 @@ describe('fetchWithRetry', () => {
     expect(seen).toEqual(['0.01']);
   });
 });
+
+// REAL TIMERS on purpose: `captureWaits()` replaces `setTimeout`, so it can never show the wrap
+// Node applies to a delay past 2^31-1ms — the one that turns a month-long stated wait into a retry
+// one millisecond later. A deadline large enough to hold each wait is what lets it be honoured.
+describe('a stated wait past the timer range is not retried early', () => {
+  it.each([2 ** 31 - 2, 2 ** 31 - 1, 2 ** 31, 30 * 24 * 60 * 60 * 1000])(
+    'Retry-After of %ims',
+    async (ms) => {
+      const state = stubForever(() => res(429, '', { 'retry-after': String(ms / 1000) }));
+      let stopped = false;
+      const call = fetchWithRetry(
+        'https://x/y',
+        {},
+        loop({ isStopped: () => stopped, deadlineMs: 4e9, maxAttempts: 50 }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(state.calls).toBe(1);
+      stopped = true;
+      await expect(call).rejects.toThrow('429 (disconnected)');
+      expect(state.calls).toBe(1);
+    },
+  );
+});
