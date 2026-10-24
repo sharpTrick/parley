@@ -1,3 +1,4 @@
+import { warn } from './diagnostics.js';
 import type { DiscordMessage } from './wire.js';
 
 /**
@@ -9,18 +10,12 @@ import type { DiscordMessage } from './wire.js';
 export const IDENTIFY_QUOTA_PER_DAY = 1000;
 export const IDENTIFY_QUOTA_WINDOW_MS = 86_400_000;
 
-/**
- * Reconnect backoff ceiling FOR ONE DIALER: what a gateway that never comes up costs. Scaled by the
- * `gateway_dialers` fan-out, so the fleet sharing one token — not the process — is what stays
- * inside {@link IDENTIFY_QUOTA_PER_DAY}.
- */
+/** Reconnect backoff ceiling FOR ONE DIALER: what a gateway that never comes up costs. */
 export const RECONNECT_CAP_MS = 120_000;
 
 /**
  * How long a socket must stay up AFTER READY before its reconnect budget is forgiven, FOR ONE
- * DIALER. A forgiven ladder re-dials from its FIRST rung, so this window — not the ceiling — is
- * what paces a gateway that drops just after every READY, and it is scaled and bounded by the same
- * quota for the same reason.
+ * DIALER.
  */
 export const STABLE_CONNECTION_MS = 120_000;
 
@@ -28,6 +23,8 @@ export const STABLE_CONNECTION_MS = 120_000;
 export interface DialBudget {
   reconnectCapMs: number;
   stableConnectionMs: number;
+  /** IDENTIFYs this instance may send in any {@link IDENTIFY_QUOTA_WINDOW_MS}. */
+  identifiesPerWindow: number;
 }
 
 /** One token's IDENTIFY budget, divided among the instances that share it. */
@@ -36,7 +33,33 @@ export function dialBudgetFor(dialers: number | undefined): DialBudget {
   return {
     reconnectCapMs: RECONNECT_CAP_MS * fanOut,
     stableConnectionMs: STABLE_CONNECTION_MS * fanOut,
+    identifiesPerWindow: Math.floor(IDENTIFY_QUOTA_PER_DAY / fanOut),
   };
+}
+
+/**
+ * Every IDENTIFY this instance sent inside the trailing quota window, oldest first — the ONE thing
+ * that decides whether another may be sent. The ladder's figures only pace dials, and a socket that
+ * stays up long enough forgives them; this forgives nothing but time.
+ */
+export class IdentifyLedger {
+  private spent: number[] = [];
+
+  /** The earliest time one more IDENTIFY fits inside `allowance`. */
+  admitsAt(now: number, allowance: number): number {
+    // A spend stamped after `now` was made by a wall clock since stepped back; it happened no later
+    // than now, and leaving it in the future would hold the next IDENTIFY past any timer's range.
+    this.spent = this.spent.map((t) => Math.min(t, now)).filter((t) => t > now - IDENTIFY_QUOTA_WINDOW_MS);
+    const over = this.spent.length - allowance;
+    return over < 0 ? now : this.spent[over]! + IDENTIFY_QUOTA_WINDOW_MS;
+  }
+
+  /** Record one IDENTIFY if `allowance` has room for it, and say whether it did. */
+  spend(now: number, allowance: number): boolean {
+    if (this.admitsAt(now, allowance) > now) return false;
+    this.spent.push(now);
+    return true;
+  }
 }
 
 /** First rung of the reconnect ladder, doubled per attempt up to {@link RECONNECT_CAP_MS}. */
@@ -81,6 +104,8 @@ export abstract class GatewayLadder {
   protected epoch = 0;
   /** Minimum delay the NEXT dial must honor; set by op 9 to Discord's mandated random 1–5 s. */
   protected invalidSessionWaitMs = 0;
+  /** Outlives every `connect()`, so that no lifecycle call can hand the quota back. */
+  protected readonly identifies = new IdentifyLedger();
 
   constructor(protected readonly host: GatewayHost) {}
 
@@ -145,9 +170,18 @@ export abstract class GatewayLadder {
   protected chargeDialAttempt(): number {
     const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, this.budget.reconnectCapMs);
     const jitter = Math.floor(Math.random() * BACKOFF_JITTER_MS);
-    const wait = Math.max(this.invalidSessionWaitMs, backoff + jitter);
+    const now = Date.now();
+    const allowance = this.budget.identifiesPerWindow;
+    const quotaWait = this.identifies.admitsAt(now, allowance) - now;
+    if (quotaWait > 0) {
+      warn(
+        `this instance's share of the bot token's IDENTIFY quota (${allowance} per ` +
+          `${IDENTIFY_QUOTA_WINDOW_MS}ms) is spent; live push waits ${quotaWait}ms for the next dial`,
+      );
+    }
+    const wait = Math.max(this.invalidSessionWaitMs, backoff + jitter, quotaWait);
     this.invalidSessionWaitMs = 0;
-    this.nextDialAt = Date.now() + wait;
+    this.nextDialAt = now + wait;
     return wait;
   }
 

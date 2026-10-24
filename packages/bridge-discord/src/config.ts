@@ -7,7 +7,7 @@ import {
   MAX_TIMER_MS,
   type Topic,
 } from '@sharptrick/parley-core';
-import { RECONNECT_CAP_MS } from './ladder.js';
+import { IDENTIFY_QUOTA_PER_DAY } from './ladder.js';
 
 /** Plugin-specific backend_config. */
 export interface DiscordBackendConfig {
@@ -49,13 +49,8 @@ export interface AllowedMentions {
 
 export const DEFAULT_ALLOWED_MENTIONS: AllowedMentions = { parse: ['users'], replied_user: false };
 
-/**
- * Most dialers whose share of the reconnect ceiling still ARMS: {@link RECONNECT_CAP_MS} is
- * multiplied by this knob and the product is a `setTimeout` delay, so a larger fleet would wrap
- * that ceiling to 1ms — a ladder that re-IDENTIFYs as fast as the socket closes, which is the
- * bot-token reset the ceiling exists to prevent.
- */
-export const MAX_DIALERS = Math.floor(MAX_TIMER_MS / RECONNECT_CAP_MS);
+/** Most dialers one token's IDENTIFY quota can still give one IDENTIFY each per window. */
+export const MAX_DIALERS = IDENTIFY_QUOTA_PER_DAY;
 
 /**
  * What a declared `backend_config` value must BE. Core parses `backend_config` as an unchecked
@@ -114,8 +109,8 @@ const SHAPE_REFUSALS: Record<ConfigShape, (value: unknown) => string | undefined
     wholeIn(value, 1, MAX_DIALERS)
       ? undefined
       : `expected an integer from 1 to ${MAX_DIALERS} (how many instances share this bot token ` +
-        `and open a gateway socket; it multiplies the ${RECONNECT_CAP_MS}ms reconnect ceiling, ` +
-        `which has to stay inside Node's timer range), got ${figure(value)}`,
+        `and open a gateway socket; each gets an equal share of the token's ` +
+        `${IDENTIFY_QUOTA_PER_DAY}-IDENTIFY daily quota, which cannot go below one), got ${figure(value)}`,
 
   'nested object': () => undefined,
 };

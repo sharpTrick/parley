@@ -145,6 +145,16 @@ export class DiscordGateway extends GatewayLadder {
                 ws.close();
                 break;
               }
+              if (!this.identifies.spend(Date.now(), this.budget.identifiesPerWindow)) {
+                reject(
+                  new Error(
+                    "Discord gateway dial refused: this instance's share of the bot token's " +
+                      'IDENTIFY quota is spent',
+                  ),
+                );
+                ws.close();
+                break;
+              }
               heartbeat = setInterval(() => {
                 if (ws.readyState !== WebSocket.OPEN) return;
                 if (awaitedAck) {
