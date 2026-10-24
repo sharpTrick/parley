@@ -4,6 +4,7 @@ import { reasonOf, shapeOf, warn } from './diagnostics.js';
 import { INTENTS } from './intents.js';
 import {
   GatewayLadder,
+  identifyAllowanceFor,
   INVALID_SESSION_MIN_WAIT_MS,
   INVALID_SESSION_SPREAD_MS,
   TerminalGatewayCloseError,
@@ -51,7 +52,7 @@ export class DiscordGateway extends GatewayLadder {
     this.token = cfg.token;
     this.urlOverride = cfg.gateway_url;
     this.handshakeTimeoutMs = cfg.handshake_timeout_ms ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
-    this.resetLadder(budget);
+    this.resetLadder(budget, identifyAllowanceFor(cfg.gateway_dialers));
     this.seq = null;
   }
 
@@ -145,7 +146,7 @@ export class DiscordGateway extends GatewayLadder {
                 ws.close();
                 break;
               }
-              if (!this.identifies.spend(Date.now(), this.budget.identifiesPerWindow)) {
+              if (!this.identifies.spend(Date.now(), this.identifyAllowance)) {
                 reject(
                   new Error(
                     "Discord gateway dial refused: this instance's share of the bot token's " +

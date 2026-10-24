@@ -14,6 +14,7 @@ import {
 } from '../src/index.js';
 import { FAKE_TOKEN, FakeWs, instances, resetGateway, state, totalIdentifies } from './fake-gateway.js';
 import { HUGE_HB, NO_HANDSHAKE_TIMEOUT, reachReady, stubFetch } from './harness.js';
+import { identifyAllowanceFor } from '../src/ladder.js';
 
 /**
  * A fleet sharing one bot token never IDENTIFYs more often, in any 24h, than Discord allows that
@@ -280,7 +281,7 @@ describe('no lifecycle call refills the share', () => {
     };
     const plugin = new DiscordPlugin();
     await connectAt(plugin, MAX_DIALERS / 2);
-    expect(dialBudgetFor(MAX_DIALERS / 2).identifiesPerWindow, 'the first share holds two').toBe(2);
+    expect(identifyAllowanceFor(MAX_DIALERS / 2), 'the first share holds two').toBe(2);
     const first = await reachReady(plugin, TOPIC);
     const greeted = new Set<FakeWs>(instances);
     first.serverClose(1006);
@@ -327,8 +328,8 @@ describe('no lifecycle call refills the share', () => {
 
 describe('the fan-out domain is the one the quota can serve', () => {
   it('every accepted fan-out has a share of at least one IDENTIFY, and the next would have none', () => {
-    expect(dialBudgetFor(MAX_DIALERS).identifiesPerWindow).toBeGreaterThanOrEqual(1);
-    expect(dialBudgetFor(MAX_DIALERS + 1).identifiesPerWindow).toBe(0);
+    expect(identifyAllowanceFor(MAX_DIALERS)).toBeGreaterThanOrEqual(1);
+    expect(identifyAllowanceFor(MAX_DIALERS + 1)).toBe(0);
     expect(
       Math.max(dialBudgetFor(MAX_DIALERS).reconnectCapMs, dialBudgetFor(MAX_DIALERS).stableConnectionMs),
       'an accepted fan-out arms a delay setTimeout cannot hold, so it fires at 1 ms',
@@ -339,7 +340,6 @@ describe('the fan-out domain is the one the quota can serve', () => {
     expect(dialBudgetFor(1)).toEqual({
       reconnectCapMs: RECONNECT_CAP_MS,
       stableConnectionMs: STABLE_CONNECTION_MS,
-      identifiesPerWindow: IDENTIFY_QUOTA_PER_DAY,
     });
     expect(dialBudgetFor(undefined)).toEqual(dialBudgetFor(1));
   });

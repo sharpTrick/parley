@@ -23,8 +23,6 @@ export const STABLE_CONNECTION_MS = 120_000;
 export interface DialBudget {
   reconnectCapMs: number;
   stableConnectionMs: number;
-  /** IDENTIFYs this instance may send in any {@link IDENTIFY_QUOTA_WINDOW_MS}. */
-  identifiesPerWindow: number;
 }
 
 /** One token's IDENTIFY budget, divided among the instances that share it. */
@@ -33,8 +31,12 @@ export function dialBudgetFor(dialers: number | undefined): DialBudget {
   return {
     reconnectCapMs: RECONNECT_CAP_MS * fanOut,
     stableConnectionMs: STABLE_CONNECTION_MS * fanOut,
-    identifiesPerWindow: Math.floor(IDENTIFY_QUOTA_PER_DAY / fanOut),
   };
+}
+
+/** IDENTIFYs one of `dialers` instances may send in any {@link IDENTIFY_QUOTA_WINDOW_MS}. */
+export function identifyAllowanceFor(dialers: number | undefined): number {
+  return Math.floor(IDENTIFY_QUOTA_PER_DAY / (dialers ?? 1));
 }
 
 /**
@@ -106,6 +108,8 @@ export abstract class GatewayLadder {
   protected invalidSessionWaitMs = 0;
   /** Outlives every `connect()`, so that no lifecycle call can hand the quota back. */
   protected readonly identifies = new IdentifyLedger();
+  /** This instance's share of the ledger: {@link identifyAllowanceFor} of `gateway_dialers`. */
+  protected identifyAllowance = identifyAllowanceFor(1);
 
   constructor(protected readonly host: GatewayHost) {}
 
@@ -125,8 +129,9 @@ export abstract class GatewayLadder {
     return this.reconnectTimer !== undefined;
   }
 
-  protected resetLadder(budget: DialBudget): void {
+  protected resetLadder(budget: DialBudget, identifyAllowance: number): void {
     this.budget = budget;
+    this.identifyAllowance = identifyAllowance;
     this.reconnectAttempts = 0;
     this.invalidSessionWaitMs = 0;
     this.nextDialAt = 0;
@@ -171,7 +176,7 @@ export abstract class GatewayLadder {
     const backoff = Math.min(BACKOFF_BASE_MS * 2 ** this.reconnectAttempts++, this.budget.reconnectCapMs);
     const jitter = Math.floor(Math.random() * BACKOFF_JITTER_MS);
     const now = Date.now();
-    const allowance = this.budget.identifiesPerWindow;
+    const allowance = this.identifyAllowance;
     const quotaWait = this.identifies.admitsAt(now, allowance) - now;
     if (quotaWait > 0) {
       warn(
