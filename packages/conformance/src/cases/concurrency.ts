@@ -22,6 +22,8 @@ export function concurrencyCases(ctx: ConformanceContext): void {
   // when the gap has filled in — so this one puts the reader INSIDE the write window.
   it('a reader interleaved with concurrent writers loses no message', async (testCtx) => {
     if (ctx.concurrentPost === 'unsupported') {
+      // The declaration CI's skip gate admits: a skip that names the capability the plugin lacks.
+      Object.assign(testCtx.task.meta, { capability: 'concurrentPost: unsupported' });
       testCtx.skip();
       return;
     }
@@ -78,6 +80,7 @@ export function concurrencyCases(ctx: ConformanceContext): void {
 
   it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {
     if (ctx.concurrentPost === 'unsupported') {
+      Object.assign(testCtx.task.meta, { capability: 'concurrentPost: unsupported' });
       testCtx.skip();
       return;
     }

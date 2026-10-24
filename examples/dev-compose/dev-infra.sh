@@ -39,6 +39,16 @@ wait_for() { # <secs> <label> <cmd...>
   die "$label did not become ready within ${secs}s"
 }
 
+# Register a test account. The ONE failure accepted is the server's own "that account exists"
+# answer, matched by its message: anything else — server down, wrong shared secret — is an account
+# the suites will not have, and a missing account skips the cases that need it instead of failing.
+seed() { # <label> <already-exists pattern> <cmd...>
+  local label="$1" exists="$2" out; shift 2
+  if out="$("$@" 2>&1)"; then log "registered $label"; return 0; fi
+  if grep -qF -- "$exists" <<<"$out"; then log "$label already present"; return 0; fi
+  die "could not register $label:"$'\n'"$out"
+}
+
 up_redis()    { "${COMPOSE[@]}" up -d redis;    wait_for 30 redis    "${COMPOSE[@]}" exec -T redis redis-cli ping; }
 up_nats()     { "${COMPOSE[@]}" up -d nats;     wait_for 30 nats     "${COMPOSE[@]}" exec -T nats wget -qO- http://localhost:8222/healthz; }
 up_postgres() { "${COMPOSE[@]}" up -d postgres; wait_for 30 postgres "${COMPOSE[@]}" exec -T postgres pg_isready -U parley; }
@@ -48,15 +58,18 @@ up_xmpp() {
   # Gate on the c2s port from the host (prosody has no pidfile, so `prosodyctl status` is unreliable;
   # host bash has /dev/tcp, the dash in the container does not).
   wait_for 30 prosody bash -c 'exec 3<>/dev/tcp/127.0.0.1/5222'
-  # Seed the test account (idempotent: a duplicate register just errors, which we ignore).
-  "${COMPOSE[@]}" exec -T prosody prosodyctl register parley parley.local parleypass 2>/dev/null \
-    && log "registered xmpp user parley@parley.local" \
-    || log "xmpp user parley@parley.local already present"
+  seed_xmpp
+}
+
+# prosodyctl `register` resets an existing account's password and succeeds; "already exists" is what
+# a prosodyctl that refuses a duplicate prints.
+seed_xmpp() {
+  seed "xmpp user parley@parley.local" "already exists" \
+    "${COMPOSE[@]}" exec -T prosody prosodyctl register parley parley.local parleypass
   # A SECOND account: MUC's unique-nick rule is per bare JID, so the multi-session suite needs two
   # accounts to observe the cross-account `conflict` the XMPP README documents.
-  "${COMPOSE[@]}" exec -T prosody prosodyctl register parley2 parley.local parleypass2 2>/dev/null \
-    && log "registered xmpp user parley2@parley.local" \
-    || log "xmpp user parley2@parley.local already present"
+  seed "xmpp user parley2@parley.local" "already exists" \
+    "${COMPOSE[@]}" exec -T prosody prosodyctl register parley2 parley.local parleypass2
 }
 
 up_matrix() {
@@ -80,18 +93,22 @@ up_matrix() {
   "${COMPOSE[@]}" up -d synapse
   wait_for 90 synapse "${COMPOSE[@]}" exec -T synapse \
     python -c 'import urllib.request; urllib.request.urlopen("http://localhost:8008/health", timeout=3)'
-  # 5. Seed the test account (idempotent: re-register of an existing user just errors).
-  "${COMPOSE[@]}" exec -T synapse register_new_matrix_user \
-    -u parley -p parleypass -a -c /data/homeserver.yaml http://localhost:8008 2>/dev/null \
-    && log "registered matrix user @parley:parley.local" \
-    || log "matrix user @parley:parley.local already present"
+  # 5. Seed the test accounts.
+  seed_matrix
+}
+
+# Synapse answers a taken localpart with M_USER_IN_USE, which register_new_matrix_user prints as
+# its `error` text.
+seed_matrix() {
+  seed "matrix user @parley:parley.local" "User ID already taken" \
+    "${COMPOSE[@]}" exec -T synapse register_new_matrix_user \
+    -u parley -p parleypass -a -c /data/homeserver.yaml http://localhost:8008
   # A SECOND account, as the xmpp path also does: the configuration the README calls production is
   # one room per topic with a DISTINCT account per session, and every such room is invite-only — so
   # only two accounts can observe whether a peer can read and write a topic the other one created.
-  "${COMPOSE[@]}" exec -T synapse register_new_matrix_user \
-    -u parley2 -p parleypass2 -a -c /data/homeserver.yaml http://localhost:8008 2>/dev/null \
-    && log "registered matrix user @parley2:parley.local" \
-    || log "matrix user @parley2:parley.local already present"
+  seed "matrix user @parley2:parley.local" "User ID already taken" \
+    "${COMPOSE[@]}" exec -T synapse register_new_matrix_user \
+    -u parley2 -p parleypass2 -a -c /data/homeserver.yaml http://localhost:8008
 }
 
 up_keycloak() {
@@ -148,4 +165,6 @@ main() {
   esac
 }
 
-main "$@"
+# Sourced (by the repo-contract tests, to drive `seed_*` against a stand-in docker) it defines and
+# runs nothing.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"

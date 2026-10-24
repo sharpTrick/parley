@@ -344,6 +344,8 @@ export function liveCases(ctx: ConformanceContext): void {
   // one of the contending writers.
   it('subscribe delivers a message written by an independent client', async (testCtx) => {
     if (ctx.concurrentPost === 'unsupported') {
+      // The declaration CI's skip gate admits: a skip that names the capability the plugin lacks.
+      Object.assign(testCtx.task.meta, { capability: 'concurrentPost: unsupported' });
       testCtx.skip();
       return;
     }

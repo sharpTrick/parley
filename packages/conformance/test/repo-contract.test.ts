@@ -776,13 +776,14 @@ describe("CONTRIBUTING names every one of the repo's scripts the PR gate runs", 
  * The gate that stops a self-skipping suite from reading as a passing one — graded by RUNNING it,
  * not by reading the workflow that calls it.
  *
- * It used to be a `node -e` script pasted into both workflows, and it failed only a test file whose
- * EVERY assertion skipped. Fourteen files across seven packages mix a server-gated block with
- * ungated ones, so the gated half could vanish — `bridge-xmpp`'s MAM paging is that backend's whole
- * catch-up mechanism — while the file still reported passes and the gate printed "0 of N skipped".
+ * Its rule: every case that did not run is refused, unless its body ran and declared a capability
+ * its plugin lacks. Any coarser unit lets a gated case vanish beside siblings that ran — a whole
+ * file hid a server-gated `describe`, and a `describe` hid a case gated on a second account.
  *
  * Rows below are the shapes that distinction turns on, run through the shipped script over planted
- * reports, so neither the rule nor the exit code can drift from what CI executes.
+ * reports, so neither the rule nor the exit code can drift from what CI executes; the last rows run
+ * a real suite through vitest's own reporter, so the declaration the conformance suite writes is
+ * the one the gate reads.
  */
 describe('the skip gate CI runs', () => {
   const REPO_DIR = fileURLToPath(new URL('../../../', import.meta.url));
@@ -821,12 +822,20 @@ describe('the skip gate CI runs', () => {
     expect(statSync(GATE_SCRIPT).isFile()).toBe(true);
   });
 
-  const CASE = (title: string, status: string, ancestorTitles: string[] = []) => ({
+  const CASE = (
+    title: string,
+    status: string,
+    ancestorTitles: string[] = [],
+    meta: Record<string, unknown> = {},
+  ) => ({
     title,
     fullName: [...ancestorTitles, title].join(' '),
     ancestorTitles,
     status,
+    meta,
   });
+
+  const LACKS = { capability: 'concurrentPost: unsupported' };
 
   const runGate = (report: unknown): { code: number; err: string } => {
     const dir = mkdtempSync(join(tmpdir(), 'skip-gate-'));
@@ -876,16 +885,44 @@ describe('the skip gate CI runs', () => {
       [file('thing.test.ts', [CASE('a', 'passed'), CASE('b', 'todo', ['a group'])])],
       true,
     ],
+    // A case gated on a second account, beside siblings that need only the first: the group ran,
+    // and the two cases that grade the cross-account claims did not.
+    [
+      'an undeclared case skip beside running siblings in its own group',
+      [
+        file('multi-session-doc.test.ts', [
+          CASE('shared account, same nick', 'passed', ['XMPP multi-session config claims']),
+          CASE('different accounts, same nick', 'skipped', ['XMPP multi-session config claims']),
+          CASE('nick unset on the loser', 'skipped', ['XMPP multi-session config claims']),
+        ]),
+      ],
+      true,
+    ],
+    [
+      'a declaration that names no capability',
+      [
+        file('conformance.test.ts', [
+          CASE('post round-trips', 'passed', ['seam conformance: telegram']),
+          CASE('concurrent writers', 'skipped', ['seam conformance: telegram'], { capability: ' ' }),
+        ]),
+      ],
+      true,
+    ],
+    [
+      'a declaration on a case that is not a skip',
+      [file('thing.test.ts', [CASE('a', 'passed'), CASE('b', 'todo', ['a group'], LACKS)])],
+      true,
+    ],
     // The half that must NOT fire: the conformance suite skips its concurrency cases for a backend
-    // whose context declares one writer. That is a capability stated in the repo, beside siblings
-    // that ran — not a dependency that failed to come up.
+    // whose context declares one writer, and says so from inside the body. That is a capability
+    // stated in the repo — not a dependency that failed to come up.
     [
       'cases the plugin declared unsupported, beside running siblings',
       [
         file('conformance.test.ts', [
           CASE('post round-trips', 'passed', ['seam conformance: telegram']),
-          CASE('concurrent writers', 'skipped', ['seam conformance: telegram']),
-          CASE('multi-process writes', 'skipped', ['seam conformance: telegram']),
+          CASE('concurrent writers', 'skipped', ['seam conformance: telegram'], LACKS),
+          CASE('multi-process writes', 'skipped', ['seam conformance: telegram'], LACKS),
         ]),
       ],
       false,
@@ -897,19 +934,97 @@ describe('the skip gate CI runs', () => {
     expect(code).toBe(refused ? 1 : 0);
   });
 
-  it('names the group it refuses, so the operator knows which server did not come up', () => {
+  it('names the case it refuses, so the operator knows which server did not come up', () => {
     const { err } = runGate({
       testResults: [
         file('mam-paging.test.ts', [
           CASE('pages forward', 'passed', ['ungated']),
           CASE('reads the window', 'skipped', [GATED]),
+          CASE('concurrent writers', 'skipped', ['single-writer backend'], LACKS),
         ]),
       ],
     });
-    expect(err).toContain(GATED);
-    expect(err).toContain('mam-paging.test.ts');
+    expect(err).toContain(`mam-paging.test.ts › ${GATED} › reads the window`);
     expect(err).not.toContain('ungated');
+    expect(err).not.toContain('single-writer backend');
   });
+
+  interface RealRun {
+    statuses: string[];
+    gate: { code: number; err: string };
+  }
+
+  /** Vitest's own JSON reporter over `args`, then the shipped gate over what it wrote. */
+  const realRun = (args: string[], cwd: string): RealRun => {
+    const out = join(mkdtempSync(join(tmpdir(), 'skip-gate-real-')), 'report.json');
+    const vitest = join(REPO_DIR, 'node_modules', 'vitest', 'vitest.mjs');
+    const run = spawnSync(
+      process.execPath,
+      [vitest, 'run', ...args, '--reporter=json', `--outputFile=${out}`],
+      { cwd, encoding: 'utf8' },
+    );
+    expect(existsSync(out), `${run.stderr}${run.stdout}`.slice(-2000)).toBe(true);
+    const report = JSON.parse(readFileSync(out, 'utf8')) as {
+      testResults?: { assertionResults?: { status: string }[] }[];
+    };
+    const statuses = (report.testResults ?? []).flatMap((f) =>
+      (f.assertionResults ?? []).map((a) => a.status),
+    );
+    const gate = spawnSync(process.execPath, [GATE_SCRIPT, out], { encoding: 'utf8' });
+    return { statuses, gate: { code: gate.status ?? -1, err: `${gate.stderr}${gate.stdout}` } };
+  };
+
+  // A context declaring `concurrentPost: 'unsupported'`, through the real reporter, so the key the
+  // conformance suite writes and the key the gate reads cannot drift apart while every planted row
+  // above stays green.
+  it(
+    "admits the conformance suite's own capability skips, as vitest reports them",
+    () => {
+      const { statuses, gate } = realRun(
+        ['packages/bridge-telegram/test/conformance.test.ts'],
+        REPO_DIR,
+      );
+      // Precondition: the run skipped something, and everything else passed — otherwise "the gate
+      // admitted it" says nothing about a capability skip.
+      expect(statuses.filter((s) => s === 'skipped').length).toBeGreaterThan(0);
+      expect(statuses.filter((s) => s !== 'skipped' && s !== 'passed')).toEqual([]);
+      expect(gate.code, gate.err).toBe(0);
+    },
+    120_000,
+  );
+
+  // The shape that got through: an infrastructure `skipIf` on one case, beside a sibling that ran
+  // and a declared skip the gate must keep admitting.
+  it(
+    'refuses an undeclared skipIf beside a running sibling, as vitest reports it',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'skip-gate-fixture-'));
+      writeFileSync(
+        join(dir, 'vitest.config.mjs'),
+        "export default { test: { globals: true, include: ['*.test.mjs'] } };\n",
+      );
+      writeFileSync(
+        join(dir, 'gated.test.mjs'),
+        [
+          "describe('needs a second account', () => {",
+          "  it('runs on the first', () => { expect(1).toBe(1); });",
+          "  it.skipIf(true)('needs the second', () => {});",
+          "  it('one writer only', (ctx) => {",
+          "    Object.assign(ctx.task.meta, { capability: 'concurrentPost: unsupported' });",
+          '    ctx.skip();',
+          '  });',
+          '});',
+          '',
+        ].join('\n'),
+      );
+      const { statuses, gate } = realRun(['--root', dir, '--config', join(dir, 'vitest.config.mjs')], dir);
+      expect(statuses.sort()).toEqual(['passed', 'skipped', 'skipped']);
+      expect(gate.code, gate.err).toBe(1);
+      expect(gate.err).toContain('needs a second account › needs the second');
+      expect(gate.err).not.toContain('one writer only');
+    },
+    60_000,
+  );
 
   // A gate handed nothing has nothing to disagree with, and every report shape above would pass it.
   it('refuses a report with no test files at all', () => {
@@ -918,6 +1033,62 @@ describe('the skip gate CI runs', () => {
   });
 });
 
+
+/**
+ * A seeding step that reports every failure as "already present" turns a missing test account into
+ * skipped cases — the suites probe the account and skip what needs it. So each seeder must accept
+ * exactly its server's own "that account exists" answer and fail loudly on anything else.
+ *
+ * Driven through the shipped script against a stand-in `docker` on PATH, so the rows grade the real
+ * command lines without touching the shared services.
+ */
+describe('dev-infra seeds every test account, or fails', () => {
+  const SCRIPT = fileURLToPath(new URL('../../../examples/dev-compose/dev-infra.sh', import.meta.url));
+
+  const seedWith = (seeder: string, out: string, code: number) => {
+    const bin = mkdtempSync(join(tmpdir(), 'dev-infra-docker-'));
+    const calls = join(bin, 'calls');
+    writeFileSync(
+      join(bin, 'docker'),
+      `#!/bin/sh\necho "$*" >> '${calls}'\nprintf '%s\\n' "$FAKE_OUT"\nexit "$FAKE_CODE"\n`,
+      { mode: 0o755 },
+    );
+    const run = spawnSync('bash', ['-c', `source '${SCRIPT}' && ${seeder}`], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, FAKE_OUT: out, FAKE_CODE: String(code) },
+    });
+    const argv = existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n') : [];
+    return { code: run.status ?? -1, out: `${run.stdout}${run.stderr}`, argv };
+  };
+
+  const SEEDERS = [
+    ['seed_xmpp', 'That user already exists', 'prosodyctl register'],
+    ['seed_matrix', 'ERROR! Received 400 Bad Request\nUser ID already taken.', 'register_new_matrix_user'],
+  ] as const;
+
+  it.each(SEEDERS)('%s registers both accounts on a fresh server', (seeder, _exists, tool) => {
+    const { code, out, argv } = seedWith(seeder, '', 0);
+    expect(code, out).toBe(0);
+    expect(argv.filter((a) => a.includes(tool))).toHaveLength(2);
+    expect(argv.some((a) => /\bparley2\b/.test(a))).toBe(true);
+  });
+
+  it.each(SEEDERS)('%s accepts the server saying the account exists', (seeder, exists) => {
+    const { code, out, argv } = seedWith(seeder, exists, 1);
+    expect(code, out).toBe(0);
+    expect(out.match(/already present/g)).toHaveLength(2);
+    expect(argv).toHaveLength(2);
+  });
+
+  it.each(SEEDERS)('%s fails, naming the account and the reason, on any other error', (seeder) => {
+    const { code, out, argv } = seedWith(seeder, 'service is not running', 1);
+    expect(code).not.toBe(0);
+    expect(out).toContain('could not register');
+    expect(out).toContain('service is not running');
+    expect(out).not.toContain('already present');
+    expect(argv, 'it went on to the second account after the first failed').toHaveLength(1);
+  });
+});
 
 /**
  * CLASS: a module-resolution table whose entries do not all match the way they are read. Vitest
