@@ -112,7 +112,7 @@ export async function pollUpdates(opts: {
         continue;
       }
       const u = element as TgUpdate;
-      const msg = UPDATE_KINDS.map((kind) => u[kind]).find((m) => m !== undefined);
+      const msg = UPDATE_KINDS.map((kind) => u[kind]).find((m) => m != null);
       const label = `Telegram GET /getUpdates → update ${String(u.update_id)}`;
       let carried: { chatId: string; message: TgMessage } | undefined;
       if (msg !== undefined) {

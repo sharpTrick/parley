@@ -532,6 +532,25 @@ describe('telegram non-conforming message objects', () => {
     // The loop advanced its offset past the injected update rather than re-reading it forever.
     await vi.waitFor(() => expect(fake.retainedUpdates()).toBe(0), { timeout: 8000, interval: 20 });
   }, 20_000);
+
+  it.each([
+    { empty: 'message', carried: 'channel_post' },
+    { empty: 'channel_post', carried: 'message' },
+  ])('serves the $carried of an update whose $empty is null', async ({ empty, carried }) => {
+    captureStderr();
+    const fake = await startFake();
+    const plugin = await connectTo(fake, storePath());
+    const topic = asTopic(MESSAGE_CHAT);
+    const text = `carried by ${carried} beside a null ${empty}`;
+
+    fake.injectRawUpdate({ [empty]: null, [carried]: { ...conformingMessage(), text } });
+
+    await vi.waitFor(
+      async () =>
+        expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.content)).toContain(text),
+      { timeout: 8000, interval: 20 },
+    );
+  }, 20_000);
 });
 
 /**
