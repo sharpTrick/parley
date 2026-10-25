@@ -279,6 +279,23 @@ describe('telegram store claim naming this process', () => {
     }
   });
 
+  it('leaves the claim of a holder that took it over when the stale one releases', () => {
+    const store = freshStore();
+    const stale = new StoreLock(store);
+    stale.claim();
+    // The stale holder stopped refreshing past its lease — a stalled event loop — and was replaced.
+    backdate(lockOf(store), PAST_THE_LEASE_MS);
+    const successor = new StoreLock(store);
+    expect(() => successor.claim()).not.toThrow();
+
+    stale.release();
+    expect(readFileSync(lockOf(store), 'utf8').trim()).toBe(String(process.pid));
+    expect(() => new StoreLock(store).claim()).toThrow(/already claimed/);
+
+    successor.release();
+    expect(existsSync(lockOf(store))).toBe(false);
+  });
+
   const OWNERS = [
     {
       name: 'a released claim',

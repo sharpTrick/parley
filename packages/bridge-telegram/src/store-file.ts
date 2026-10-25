@@ -214,6 +214,16 @@ function leaseFresh(path: string): boolean {
   return Date.now() - mtimeMs <= LEASE_MS;
 }
 
+/** True while `path` names the very file `held` was read from, rather than one that replaced it. */
+function isFileAt(held: { dev: number; ino: number }, path: string): boolean {
+  try {
+    const current = lstatSync(path);
+    return current.dev === held.dev && current.ino === held.ino;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether the process a claim-protocol file names still holds it. A file naming THIS pid is graded
  * by its lease, never by the kernel or by this module's memory: the kernel always answers yes, which
@@ -270,8 +280,18 @@ export class StoreLock {
     this.held = false;
     clearInterval(this.lease);
     this.lease = undefined;
-    if (this.claimFd !== undefined) closeSync(this.claimFd);
+    const fd = this.claimFd;
     this.claimFd = undefined;
+    if (fd === undefined) return;
+    let ours: boolean;
+    try {
+      ours = isFileAt(fstatSync(fd), this.path);
+    } finally {
+      closeSync(fd);
+    }
+    // A holder stalled past its lease has been taken over, and the claim at this name is the new
+    // holder's. Keep the check, so that releasing the stale one cannot delete it.
+    if (!ours) return;
     try {
       unlinkSync(this.path);
     } catch {
