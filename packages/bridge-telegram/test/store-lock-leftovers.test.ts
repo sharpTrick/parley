@@ -1,9 +1,19 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { siblingPaths, StoreLock } from '../src/store-file.js';
+import { siblingPaths, StoreFile, StoreLock } from '../src/store-file.js';
 
 /**
  * Lets one case run a competing starter INSIDE a claim, at a boundary counted in reads of the
@@ -44,6 +54,15 @@ const deadPid = (): number => {
   expect(pid).toBeGreaterThan(0);
   return pid;
 };
+
+/** Set `path`'s mtime `ms` into the past — a claim its holder stopped refreshing that long ago. */
+const backdate = (path: string, ms: number): void => {
+  const then = (Date.now() - ms) / 1000;
+  utimesSync(path, then, then);
+};
+
+/** Older than the lease a claim naming this pid is held by: what a crashed run leaves after it. */
+const PAST_THE_LEASE_MS = 31_000;
 
 let dir = '';
 const freshStore = (): string => {
@@ -92,17 +111,22 @@ describe('telegram store claim over a crashed take-over', () => {
     { name: 'nothing at all', bytes: (): string => '' },
     { name: 'bytes that are no pid', bytes: (): string => 'not-a-pid\n' },
     // A bridge restarted under its crashed run's pid — PID 1 in a container on a persistent volume.
-    { name: 'this pid, held by nothing here', bytes: (): string => `${process.pid}\n` },
+    {
+      name: 'this pid, its lease run out',
+      bytes: (): string => `${process.pid}\n`,
+      age: PAST_THE_LEASE_MS,
+    },
   ];
 
   const GRID = SIBLINGS.flatMap((which) => CORPSES.map((corpse) => ({ which, ...corpse })));
 
-  it.each(GRID)('starts over a leftover $which carrying $name', ({ which, bytes }) => {
+  it.each(GRID)('starts over a leftover $which carrying $name', ({ which, bytes, age }) => {
     const path = freshStore();
     // Every row but the claim path itself needs a claim to take over from, or the take-over the
     // leftover would block is never reached.
     if (which !== 'lock') writeFileSync(pathOf(path, 'lock'), `${deadPid()}\n`);
     writeFileSync(pathOf(path, which), bytes());
+    if (age !== undefined) backdate(pathOf(path, which), age);
 
     const first = new StoreLock(path);
     expect(() => first.claim()).not.toThrow();
@@ -122,21 +146,31 @@ describe('telegram store claim over a crashed take-over', () => {
    * started refusing on one would be this same defect wearing a different file.
    */
   const HOLDER_PATHS = new Set(['lock', 'break']);
-  it.each(SIBLINGS)('refuses over a live %s only where the protocol reads a holder', (which) => {
-    const path = freshStore();
-    if (which !== 'lock') writeFileSync(pathOf(path, 'lock'), `${deadPid()}\n`);
-    writeFileSync(pathOf(path, which), `${process.ppid}\n`);
+  const LIVE = [
+    { name: 'a live foreign process', pid: (): number => process.ppid },
+    { name: 'this pid inside its lease', pid: (): number => process.pid },
+  ];
+  const LIVE_GRID = SIBLINGS.flatMap((which) =>
+    LIVE.map((live) => ({ which, holder: live.name, pid: live.pid })),
+  );
+  it.each(LIVE_GRID)(
+    'refuses over $which naming $holder only where the protocol reads a holder',
+    ({ which, pid }) => {
+      const path = freshStore();
+      if (which !== 'lock') writeFileSync(pathOf(path, 'lock'), `${deadPid()}\n`);
+      writeFileSync(pathOf(path, which), `${pid()}\n`);
 
-    const lock = new StoreLock(path);
-    let refused = false;
-    try {
-      lock.claim();
-    } catch {
-      refused = true;
-    }
-    lock.release();
-    expect(refused).toBe(HOLDER_PATHS.has(which));
-  });
+      const lock = new StoreLock(path);
+      let refused = false;
+      try {
+        lock.claim();
+      } catch {
+        refused = true;
+      }
+      lock.release();
+      expect(refused).toBe(HOLDER_PATHS.has(which));
+    },
+  );
 
   /** The refusal names every path an operator must clear, or one start heals and the next does not. */
   it('names both claim-protocol paths an operator has to clear', () => {
@@ -153,11 +187,12 @@ describe('telegram store claim over a crashed take-over', () => {
 });
 
 /**
- * A claim naming THIS process is the one holder the kernel cannot adjudicate — it is always alive —
- * so whether it is a leftover or a live claim is a question about this process's own state. Each row
- * builds that state the way a bridge reaches it and asserts both verdicts: a store held here refuses
- * a second claimant however its path is spelled, and one released, or never held here, is taken
- * over.
+ * A claim naming THIS pid is the one holder the kernel cannot adjudicate — it is always alive — and
+ * the same pid can be a live holder this module has never seen: a second PID-1 container on a shared
+ * volume, another module instance, a worker thread. So it is graded by its lease, which its holder
+ * keeps refreshing. A held claim refuses a second claimant however it arrives, for as long as its
+ * holder runs; a crashed run's leftover is taken over once the lease runs out (the rows above); and
+ * a holder that lets go stops refreshing.
  */
 describe('telegram store claim naming this process', () => {
   const lockOf = (store: string): string => siblingPaths(store).lock;
@@ -211,15 +246,85 @@ describe('telegram store claim naming this process', () => {
     first.release();
   });
 
-  it.each(HOLDERS)('takes over this pid once $name was released', ({ hold }) => {
+  it('refuses a second claimant from another module instance while this one holds it', async () => {
     const store = freshStore();
-    hold(store).release();
-    // What a crash between claim and release leaves: the claim, naming us, held by nothing.
-    writeFileSync(lockOf(store), `${process.pid}\n`);
+    const first = new StoreLock(store);
+    first.claim();
+    vi.resetModules();
+    const other = await import('../src/store-file.js');
+    // The precondition: nothing this module instance remembers is reachable from the other.
+    expect(other.StoreLock).not.toBe(StoreLock);
 
-    const next = new StoreLock(store);
-    expect(() => next.claim()).not.toThrow();
-    next.release();
+    expect(() => new other.StoreLock(store).claim()).toThrow(/already claimed/);
+    expect(readFileSync(lockOf(store), 'utf8').trim()).toBe(String(process.pid));
+    first.release();
+  });
+
+  it.each(HOLDERS)('keeps refusing while $name runs on for many leases', ({ hold }) => {
+    vi.useFakeTimers();
+    try {
+      const store = freshStore();
+      const born = Date.now();
+      const first = hold(store);
+      // Asked at every half lease, so that a refresh slower than the lease cannot slip between.
+      for (let step = 0; step < 40; step++) {
+        vi.advanceTimersByTime(PAST_THE_LEASE_MS / 2);
+        expect(() => new StoreLock(store).claim()).toThrow(/already claimed/);
+      }
+      // The precondition: the clock the lease is read against has moved past many leases.
+      expect(Date.now() - born).toBeGreaterThanOrEqual(10 * PAST_THE_LEASE_MS);
+      first.release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  const OWNERS = [
+    {
+      name: 'a released claim',
+      open: (store: string): (() => void) => {
+        const lock = new StoreLock(store);
+        lock.claim();
+        return () => lock.release();
+      },
+    },
+    {
+      name: 'a closed store file',
+      open: (store: string): (() => void) => {
+        const file = new StoreFile(store);
+        return () => file.close();
+      },
+    },
+  ];
+
+  /** Descriptors this process holds on `path`. */
+  const openFdsOn = (path: string): number =>
+    readdirSync('/proc/self/fd').filter((fd) => {
+      try {
+        const link = readlinkSync(join('/proc/self/fd', fd));
+        return link === path || link === `${path} (deleted)`;
+      } catch {
+        return false;
+      }
+    }).length;
+
+  it.each(OWNERS)('leaves no lease refresh running after $name', ({ open }) => {
+    vi.useFakeTimers();
+    try {
+      const store = freshStore();
+      const before = vi.getTimerCount();
+      const stop = open(store);
+      // The precondition: holding the claim runs the refresh, on the descriptor, this case expects
+      // to stop.
+      expect(vi.getTimerCount()).toBe(before + 1);
+      expect(openFdsOn(lockOf(store))).toBe(1);
+
+      stop();
+      expect(vi.getTimerCount()).toBe(before);
+      expect(openFdsOn(lockOf(store))).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -238,21 +343,30 @@ describe('telegram store claim touches only the state it wrote', () => {
   /** Stands in for a competing starter: alive, and certainly not us. */
   const foreignPid = (): number => process.ppid;
 
-  it('leaves a competitor take-over token that replaced the corpse it read', () => {
-    const path = freshStore();
-    const foreign = foreignPid();
-    writeFileSync(pathOf(path, 'lock'), `${deadPid()}\n`);
-    writeFileSync(pathOf(path, 'break'), `${deadPid()}\n`);
+  /** Competing starters a take-over token can come from: another process, or this pid elsewhere. */
+  const COMPETITORS = [
+    { name: 'another process', pid: foreignPid },
+    { name: 'this pid in another module instance', pid: (): number => process.pid },
+  ];
 
-    interleave(2, () => writeFileSync(pathOf(path, 'break'), `${foreign}\n`));
-    const lock = new StoreLock(path);
-    expect(() => lock.claim()).toThrow(/already claimed/);
-    competitor.armed = false;
+  it.each(COMPETITORS)(
+    'leaves a take-over token from $name that replaced the corpse it read',
+    ({ pid }) => {
+      const path = freshStore();
+      const rival = pid();
+      writeFileSync(pathOf(path, 'lock'), `${deadPid()}\n`);
+      writeFileSync(pathOf(path, 'break'), `${deadPid()}\n`);
 
-    // The hook has to have run, or the case grades nothing.
-    expect(competitor.fired).toBe(true);
-    expect(readFileSync(pathOf(path, 'break'), 'utf8').trim()).toBe(String(foreign));
-  });
+      interleave(2, () => writeFileSync(pathOf(path, 'break'), `${rival}\n`));
+      const lock = new StoreLock(path);
+      expect(() => lock.claim()).toThrow(/already claimed/);
+      competitor.armed = false;
+
+      // The hook has to have run, or the case grades nothing.
+      expect(competitor.fired).toBe(true);
+      expect(readFileSync(pathOf(path, 'break'), 'utf8').trim()).toBe(String(rival));
+    },
+  );
 
   it('never publishes a take-over token another process wrote', () => {
     const path = freshStore();

@@ -5,18 +5,18 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
+  futimesSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
-  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname } from 'node:path';
 import { describe, Diagnostics, note } from './diagnostics.js';
 
 /** Mode for everything the store creates — the plaintext of every message the bridge has seen. */
@@ -192,29 +192,38 @@ function processExists(pid: number): boolean {
   }
 }
 
-/** Every claim path a {@link StoreLock} in this process currently holds, by {@link claimKey}. */
-const HELD = new Set<string>();
-
 /**
- * One spelling per claim path, so that a second store in this process reaching the same file
- * through a symlinked or relative directory still finds the first one's entry in {@link HELD}.
+ * How long a claim-protocol file naming THIS process's pid stays live without its holder refreshing
+ * it — and so the longest a bridge restarted under its crashed run's pid waits to reclaim the store.
  */
-function claimKey(path: string): string {
+const LEASE_MS = 30_000;
+/**
+ * How often a holder refreshes its claim. Keep it well inside the lease, so that an event loop
+ * stalled for most of a lease — a large compaction, a long GC — does not let a live claim go stale.
+ */
+const REFRESH_MS = LEASE_MS / 6;
+
+/** True while the file at `path` was refreshed within {@link LEASE_MS}. */
+function leaseFresh(path: string): boolean {
+  let mtimeMs: number;
   try {
-    return join(realpathSync(dirname(path)), basename(path));
+    mtimeMs = lstatSync(path).mtimeMs;
   } catch {
-    return resolve(path);
+    return false;
   }
+  return Date.now() - mtimeMs <= LEASE_MS;
 }
 
 /**
- * Whether the process a claim-protocol file names still holds it. A file naming THIS process is
- * held only while a {@link StoreLock} here holds it: asking the kernel would always answer yes, so a
- * bridge restarted under its old pid — PID 1 in a container on a persistent volume — would refuse
- * its own crashed run's leftover forever.
+ * Whether the process a claim-protocol file names still holds it. A file naming THIS pid is graded
+ * by its lease, never by the kernel or by this module's memory: the kernel always answers yes, which
+ * would leave a bridge restarted under its old pid — PID 1 in a container on a persistent volume —
+ * refusing its own crashed run's leftover forever; and a live holder with the same pid but another
+ * module instance — a second PID-1 container on the same volume, a worker thread — is invisible to
+ * this one's memory, which would hand the store to a second writer.
  */
 function holderAlive(pid: number, path: string): boolean {
-  return pid === process.pid ? HELD.has(claimKey(path)) : processExists(pid);
+  return pid === process.pid ? leaseFresh(path) : processExists(pid);
 }
 
 /**
@@ -230,8 +239,10 @@ export class StoreLock {
   private readonly stealPath: string;
   /** Set once {@link claim} succeeded, so {@link release} can never unlink another process's claim. */
   private held = false;
-  /** The {@link HELD} entry this lock registered while it holds the claim. */
-  private heldKey: string | undefined;
+  /** The held claim, by descriptor, so that a refresh lands on OUR file whatever its name holds. */
+  private claimFd: number | undefined;
+  /** The interval refreshing the claim's lease while it is held. */
+  private lease: NodeJS.Timeout | undefined;
 
   constructor(private readonly storePath: string) {
     const siblings = siblingPaths(storePath);
@@ -257,8 +268,10 @@ export class StoreLock {
   release(): void {
     if (!this.held) return;
     this.held = false;
-    if (this.heldKey !== undefined) HELD.delete(this.heldKey);
-    this.heldKey = undefined;
+    clearInterval(this.lease);
+    this.lease = undefined;
+    if (this.claimFd !== undefined) closeSync(this.claimFd);
+    this.claimFd = undefined;
     try {
       unlinkSync(this.path);
     } catch {
@@ -315,7 +328,7 @@ export class StoreLock {
       return false;
     }
     const stolen = lockHolder(this.stealPath);
-    if (stolen !== undefined && holderAlive(stolen, this.breakPath)) {
+    if (stolen !== undefined && holderAlive(stolen, this.stealPath)) {
       // It was replaced between the read and the rename. Put the SAME file back under the shared
       // name and stand down, so that a live take-over is not cut off by one that came to bury a
       // corpse.
@@ -372,11 +385,23 @@ export class StoreLock {
     return true;
   }
 
-  /** Mark the claim held, here and in {@link HELD}. */
+  /** Mark the claim held and keep its lease fresh until {@link release}. */
   private hold(): void {
     this.held = true;
-    this.heldKey = claimKey(this.path);
-    HELD.add(this.heldKey);
+    this.claimFd = openOwn(this.path, constants.O_RDONLY);
+    this.lease = setInterval(() => this.refresh(), REFRESH_MS);
+    this.lease.unref();
+  }
+
+  /** Stamp the held claim as live now. A refresh that fails is retried by the next one. */
+  private refresh(): void {
+    if (this.claimFd === undefined) return;
+    const now = Date.now() / 1000;
+    try {
+      futimesSync(this.claimFd, now, now);
+    } catch {
+      // The lease ages one period; the next refresh tries again.
+    }
   }
 }
 
