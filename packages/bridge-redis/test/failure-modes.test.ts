@@ -409,6 +409,8 @@ describe('redis failure modes — a reachable server that cannot serve the seam'
     ['a credential with URL-unsafe characters', 'p@ss:w0rd/2'],
     ['a credential with a percent sign', '50%off'],
     ['a non-ASCII credential', 'pässwörd'],
+    ['a credential whose URL-unsafe characters come after its opening', 'correcthorse@battery/staple'],
+    ['a credential whose non-ASCII characters come after its opening', 'longpassphrase-wörter'],
   ];
 
   /** `base` run on with a counter to `length` chars, so that no stretch of it repeats. */

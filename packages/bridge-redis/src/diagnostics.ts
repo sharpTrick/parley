@@ -107,22 +107,30 @@ function openingMatchLengths(text: string, credential: string): number[] {
 }
 
 /**
- * `text` with every char struck out that lies inside ANY run matching the opening of `credential`.
- * Keep it a check at every position rather than a scan that resumes past each run: a credential
- * with a border (`ABCDEFGHABCDEFGH…`) behind a partial copy of itself matches from the copy, falls
- * short, and the real occurrence starts INSIDE that run — a scan that steps past it leaks the rest.
- * No whole-string pass goes ahead of it either: replacing one of two OVERLAPPING occurrences leaves
- * the other's tail behind with no opening to be found by.
+ * `text` with every char struck out that lies inside ANY run matching the opening of ANY of
+ * `credentials`. Keep it a check at every position rather than a scan that resumes past each run: a
+ * credential with a border (`ABCDEFGHABCDEFGH…`) behind a partial copy of itself matches from the
+ * copy, falls short, and the real occurrence starts INSIDE that run — a scan that steps past it
+ * leaks the rest. And keep every spelling measured against the ORIGINAL text, struck once: a pass
+ * that strikes one spelling first (`correcthorse%40…` against an echoed `correcthorse@…`) removes
+ * the opening the next spelling needed, and leaves its tail behind — as does a whole-string pass,
+ * on two OVERLAPPING occurrences.
  */
-function strikeCredential(text: string, credential: string): string {
-  const shortest = Math.min(credential.length, ECHOED_PREFIX_CHARS);
-  const matched = openingMatchLengths(text, credential);
+function strikeCredentials(text: string, credentials: readonly string[]): string {
+  const reachFrom = new Array<number>(text.length).fill(0);
+  for (const credential of credentials) {
+    const shortest = Math.min(credential.length, ECHOED_PREFIX_CHARS);
+    const matched = openingMatchLengths(text, credential);
+    for (let i = 0; i < text.length; i++) {
+      const run = matched[i] ?? 0;
+      if (run >= shortest) reachFrom[i] = Math.max(reachFrom[i] ?? 0, i + run);
+    }
+  }
   let out = '';
   let reach = 0;
   let striking = false;
   for (let i = 0; i < text.length; i++) {
-    const run = matched[i] ?? 0;
-    if (run >= shortest) reach = Math.max(reach, i + run);
+    reach = Math.max(reach, reachFrom[i] ?? 0);
     if (i >= reach) {
       out += text[i];
       striking = false;
@@ -143,11 +151,7 @@ function strikeCredential(text: string, credential: string): string {
  * cannot hand it this plugin's own password to log.
  */
 export function fromServer(url: string, text: string): string {
-  let redacted = text;
-  for (const spelling of credentialSpellings(url)) {
-    redacted = strikeCredential(redacted, spelling);
-  }
-  return sanitizeBody(redacted);
+  return sanitizeBody(strikeCredentials(text, credentialSpellings(url)));
 }
 
 /** The one scheme node-redis dials over TLS; `redis:` puts the AUTH it sends on the wire as text. */
