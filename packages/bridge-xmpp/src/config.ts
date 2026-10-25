@@ -106,10 +106,14 @@ const MAPPED_TO_NOTHING =
 const NON_ASCII_SPACE = /[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/u;
 
 const resourceprepFold = (s: string): string => s.normalize('NFKC');
+/**
+ * Nameprep's case map (RFC 3454 B.2) is full case folding, which `toLowerCase` is not: it leaves ß
+ * and final ς alone. Keep dotless ı out of the round trip, so that a Turkish domainpart the server
+ * keeps as written is not refused — B.2 has no entry for it, but `toUpperCase` sends it to I.
+ */
+const caseFold = (ch: string): string => (ch === '\u0131' ? ch : ch.toUpperCase().toLowerCase());
 const nameprepFold = (s: string): string =>
-  Array.from(s.normalize('NFKC'), (ch) => ch.toLowerCase())
-    .join('')
-    .normalize('NFKC');
+  Array.from(s.normalize('NFKC'), caseFold).join('').normalize('NFKC');
 
 /**
  * The first codepoint of `value` that the server's stringprep profile would rewrite or refuse, or
@@ -156,6 +160,18 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
       );
     }
   }
+  for (const key of JID_SIZED_KEYS) {
+    const value = cfg[key];
+    if (typeof value !== 'string') continue;
+    const bytes = Buffer.byteLength(value);
+    if (bytes > JID_PART_MAX_BYTES) {
+      throw bad(
+        key,
+        `is ${bytes} bytes — over the ${JID_PART_MAX_BYTES}-byte limit on the JID part it becomes, ` +
+          'which the server answers with jid-malformed on every stanza addressed through it',
+      );
+    }
+  }
   const mucService = cfg['muc_service'];
   const folded =
     typeof mucService === 'string'
@@ -168,18 +184,6 @@ export function validateBackendConfig(config: BackendConfig): XmppBackendConfig 
         'case-insensitive and NFKC-normalized, and every room answers from the folded form, so no ' +
         'answer would match the room this bridge addressed. Write it in lowercase NFKC form',
     );
-  }
-  for (const key of JID_SIZED_KEYS) {
-    const value = cfg[key];
-    if (typeof value !== 'string') continue;
-    const bytes = Buffer.byteLength(value);
-    if (bytes > JID_PART_MAX_BYTES) {
-      throw bad(
-        key,
-        `is ${bytes} bytes — over the ${JID_PART_MAX_BYTES}-byte limit on the JID part it becomes, ` +
-          'which the server answers with jid-malformed on every stanza addressed through it',
-      );
-    }
   }
   const nick = cfg['nick'];
   if (typeof nick === 'string' && nick.includes('/')) {

@@ -122,13 +122,20 @@ for (let cp = 0xfe00; cp <= 0xfe0f; cp++) B1.push(cp);
 const C12 = [0xa0, 0x1680, 0x202f, 0x205f, 0x3000];
 for (let cp = 0x2000; cp <= 0x200b; cp++) C12.push(cp);
 
+/**
+ * RFC 3454 B.2 entries that `toLowerCase` + NFKC leaves alone: B.2 is full case folding, so it maps
+ * ß and ẞ to "ss", final ς to σ, and the iota-subscript Greek letters to a letter plus ι.
+ */
+const B2_BEYOND_LOWERCASE = [0xdf, 0x1e9e, 0x3c2, 0x345, 0x1f80, 0x1fb3, 0x1fbc, 0x1fc3, 0x1ff3];
+
 const has = (s: string, table: number[]): boolean =>
   Array.from(s).some((ch) => table.includes(ch.codePointAt(0) as number));
 
 /** What the server keeps as written; anything else it folds, and answers from the folded form. */
 const KEPT: Record<'nick' | 'muc_service', (s: string) => boolean> = {
   nick: (s) => s === s.normalize('NFKC') && !has(s, B1) && !has(s, C12),
-  muc_service: (s) => s === s.normalize('NFKC').toLowerCase() && !has(s, B1),
+  muc_service: (s) =>
+    s === s.normalize('NFKC').toLowerCase() && !has(s, B1) && !has(s, B2_BEYOND_LOWERCASE),
 };
 
 /** Deterministic, so a red row names a value that reproduces. */
@@ -150,7 +157,7 @@ const probes = [
     const ch = String.fromCodePoint(cp);
     return ch !== ch.normalize('NFKC') || ch !== ch.toLowerCase();
   }).map((cp) => `a${String.fromCodePoint(cp)}b`),
-  ...[...B1, ...C12].map((cp) => `a${String.fromCodePoint(cp)}b`),
+  ...[...B1, ...C12, ...B2_BEYOND_LOWERCASE].map((cp) => `a${String.fromCodePoint(cp)}b`),
   // Each of these is stable alone and composes with the letter before it.
   ...Array.from({ length: 0x70 }, (_, i) => `e${String.fromCodePoint(0x300 + i)}x`),
   ...sample(4000)
@@ -182,10 +189,20 @@ describe('XMPP refuses every backend_config value the server folds before answer
     ['nick', '\u65e5\u672c'],
     ['muc_service', 'm\u00fcc.example'],
     ['muc_service', 'muc.parley.local'],
+    ['muc_service', 'conference.ızmir.example'],
   ])('%s = %s, which the server keeps, is admitted', (key, value) => {
     expect(KEPT[key as keyof typeof KEPT](value)).toBe(true);
     expect(verdict(key, value)).toBe('accepted');
   });
+
+  it.each(['muc_service', 'nick'])(
+    'an oversize %s that the server would also fold is refused by its size',
+    (key) => {
+      expect(() => validateBackendConfig({ ...VALID, [key]: 'Aß'.repeat(1000) })).toThrow(
+        /byte limit/,
+      );
+    },
+  );
 });
 
 const serverUp = await canAuth(BASE);
