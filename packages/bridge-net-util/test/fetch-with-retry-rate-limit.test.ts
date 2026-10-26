@@ -237,6 +237,19 @@ describe('fetchWithRetry', () => {
 
   // A floor of 500 is satisfied by 500, 5 000 or 50 000 alike, so the one wait this module invents
   // for itself is also pinned exactly — including its ceiling.
+  it.each([
+    ['takes the whole remaining budget', 5, 0],
+    ['leaves a second of budget for the retry', 4, 1],
+  ])('a stated wait that %s is slept only if a retry can follow it', async (_label, secs, sleeps) => {
+    stubForever(() => res(429, '', { 'retry-after': String(secs) }));
+    const waits = captureWaits();
+    const err = await rejects(
+      fetchWithRetry('https://x/y', {}, loop({ maxAttempts: 2, deadlineMs: 5_000, now: () => 0 })),
+    );
+    expect(api.statusOf(err)).toBe(429);
+    expect(waits).toHaveLength(sleeps);
+  });
+
   it('waits exactly the default backoff for a 429 with no hint of any kind', async () => {
     stubFetch([res(429, 'slow down'), res(200, 'ok')]);
     const waits = captureWaits();

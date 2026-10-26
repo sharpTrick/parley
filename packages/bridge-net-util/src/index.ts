@@ -201,7 +201,7 @@ export async function fetchWithRetry(
     const stated = hinted !== undefined;
     const wait = hinted ?? DEFAULT_BACKOFF_MS;
     const elapsed = now() - started;
-    const overDeadline = elapsed + wait > deadlineMs;
+    const overDeadline = elapsed + wait >= deadlineMs;
     if (attempt >= maxAttempts || overDeadline) {
       throw new HttpStatusError(
         opts.label,
