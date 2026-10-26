@@ -91,6 +91,18 @@ could not serve it, and `subscribe` states the lossiness it always had. Read **U
 4. **The first boot after the upgrade emits less.** Catch-up is bounded by what the driver has
    already paged rather than by the whole unread backlog, and a topic that was never read is no
    longer advanced by `from: 'recent'`.
+5. **Some configs that loaded under 0.9.0 are now load errors**, each naming its key:
+   - Discord: a `gateway_dialers` above 1000. The bridge now enforces Discord's daily IDENTIFY
+     quota itself, and above 1000 dialers each one's share is zero.
+   - XMPP: a `nick` or `muc_service` that the server's stringprep would rewrite. That covers
+     uppercase or non-NFKC text, zero-width characters, and non-ASCII spaces (in a nick).
+     Previously the room answered under the rewritten name and every call timed out.
+6. **Postgres no longer runs DDL on every start.** Once the table and trigger exist, a role with
+   DML rights alone can run the bridge. A first start without the privilege it needs fails with
+   an error that names that privilege.
+7. **A Telegram store lock left by a crashed run under the same pid is reclaimed.** A container
+   restarted as PID 1 used to refuse its own leftover lock forever. It now takes the lock over
+   once the dead run's 30 s lease has lapsed.
 
 ## 0.9.0 — `block_ms`
 
