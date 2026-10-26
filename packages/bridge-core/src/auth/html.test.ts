@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { escapeHtml } from './html.js';
 
-// CX-04: exactly one escapeHtml for the auth layer's consent browser flow. This locks its contract
+// Exactly one escapeHtml serves the auth layer's consent browser flow. This locks its contract
 // so the two render sites (consent page + 403 error page) can never silently diverge again.
-describe('escapeHtml (single auth-layer HTML escaper — CX-04)', () => {
+describe('escapeHtml — the single auth-layer HTML escaper', () => {
   it('maps the five HTML-significant characters to their entities', () => {
     expect(escapeHtml('&<>"\'')).toBe('&amp;&lt;&gt;&quot;&#39;');
   });

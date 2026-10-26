@@ -9,19 +9,17 @@
  *   1. STABLE, UNIQUE `backendMsgId` per message — the dedup key.
  *   2. MONOTONIC, IN-ORDER, EXCLUSIVE-`since` cursor delivery — order is a PLUGIN guarantee.
  *      `fetchRecent` returns messages pre-sorted ascending by cursor; `subscribe`'s handler
- *      is invoked in ascending order. Core never compares cursor values (DESIGN §6).
+ *      is invoked in ascending order. Core never ORDERS or PARSES a cursor (DESIGN §6) — but it
+ *      does compare two for byte equality, as the no-progress brake in `catchUpTopic`. A cursor
+ *      naming a position must therefore be byte-stable across calls.
+ *   3. The two paths carry DIFFERENT obligations. `fetchRecent` is COMPLETE: every message above
+ *      `since` is returned, page by page. `subscribe` is LOSSY: what it delivers is a SUBSET of the
+ *      post-subscribe tail — in cursor order, never twice, never anything from before the
+ *      subscribe — and what it leaves out is reached by the next `fetchRecent`. A backend whose
+ *      delivery window cannot cover a burst is conformant; one whose live path delivers nothing at
+ *      all is not.
  */
 import type { BackendMsgId, Cursor, Handle, Message, Topic } from './message.js';
-
-/** Thrown by a plugin whose `fetchRecent`/`subscribe` target topic has no backend
- *  representation yet (e.g. a chat channel that does not exist). Core maps ONLY this to
- *  "topic absent" — all other rejections are real failures and propagate. */
-export class NoSuchTopicError extends Error {
-  constructor(public readonly topic: string) {
-    super(`no such topic: ${JSON.stringify(topic)}`);
-    this.name = 'NoSuchTopicError';
-  }
-}
 
 /**
  * Opaque per-backend configuration, passed verbatim from `config.backend_config`.
@@ -53,14 +51,15 @@ export interface FetchRecentArgs {
   /** Max messages to return in this page. */
   limit?: number;
   /**
-   * Long-poll HINT (ms). When set and the exclusive `since` query is empty, a plugin MAY block
-   * internally up to `blockMs` waiting for the topic cursor to advance past `since`, then return
-   * whatever arrived (possibly an empty page). It is only a hint: a plugin that ignores it (or
-   * returns early/empty) is still correct — core's generic long-poll wrapper polls the remaining
-   * budget on the MCP `fetch_recent` path, so every backend blocks with or without native support.
-   * Omit / `0` = return immediately (the durable catch-up semantics). Blocking only engages
-   * relative to a `since`; with no `since` the default recent window returns at once. The value
-   * is capped server-side before it reaches a plugin (issue #20).
+   * Long-poll budget (ms). A plugin that cannot park a caller throws
+   * `BlockingFetchUnsupportedError` on any `blockMs > 0`, before the read reaches the wire and
+   * whatever the queried window holds. One that can blocks internally up to `blockMs` waiting for
+   * the topic cursor to advance past `since`, then returns whatever arrived (possibly an empty
+   * page). Ignoring it silently is not conformant.
+   * Omit / `0` = return immediately (the durable catch-up semantics). Blocking engages whenever the
+   * queried window comes back EMPTY, with or without a `since`: a since-less read of a topic that
+   * already has messages returns them at once, but on an empty topic it waits out the budget like
+   * any other. The value is capped server-side before it reaches a plugin.
    */
   blockMs?: number;
 }
@@ -73,7 +72,7 @@ export interface FetchRecentResult {
   nextCursor: Cursor;
 }
 
-/** Live-path callback: fires once per inbound message, in ascending cursor order per topic. */
+/** Live-path callback: fires at most once per inbound message, in ascending cursor order per topic. */
 export type MessageHandler = (msg: Message) => void;
 
 /**
@@ -88,17 +87,26 @@ export interface BackendPlugin {
   disconnect(): Promise<void>;
 
   /**
-   * Register interest in a topic. `handler` fires once per inbound message on the live path,
-   * IN ASCENDING CURSOR ORDER per topic. The plugin decides HOW the handler is driven
-   * (poll loop for SQLite; blocking event source for Redis/Matrix/…); core decides WHAT
-   * happens (emit a `<channel>` event). `disconnect()` tears down all subscriptions
-   * (DESIGN §4/§9).
+   * Register interest in a topic. `handler` fires AT MOST ONCE per inbound message on the live
+   * path, IN ASCENDING CURSOR ORDER per topic, and only for messages that arrive after this call.
+   * It is not required to fire for all of them: delivery is a subset, and `fetchRecent` resuming
+   * from the caller's cursor is what closes the gap (conformance clause 3 above). The plugin
+   * decides HOW the handler is driven (poll loop for SQLite; blocking event source for
+   * Redis/Matrix/…); core decides WHAT happens (emit a `<channel>` event). `disconnect()` tears
+   * down all subscriptions (DESIGN §4/§9).
+   *
+   * A plugin that cannot represent the topic yet MAY throw `NoSuchTopicError` here, as in
+   * `fetchRecent` below: that costs the ONE topic its live path and the rest of the attach
+   * proceeds. Every other rejection is a real failure and fails the attach.
    */
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
 
   /**
-   * Single centralized durable write path. Writes `content` to `topic` as `identity`,
-   * optionally threaded to `inReplyTo`. Returns the new message's stable backend id.
+   * Single centralized durable write path. Writes `content` to `topic`, optionally threaded to
+   * `inReplyTo`. Returns the new message's stable backend id. `identity` is the handle core asks
+   * the write to be attributed to; a backend whose transport authenticates as an account of its own
+   * stamps the sender from that account and ignores it, so per-instance attribution there comes
+   * from giving each instance its own account rather than from this argument.
    * This is the single place write-notifications originate (DESIGN §4/§7).
    */
   post(
@@ -115,9 +123,8 @@ export interface BackendPlugin {
    *
    * A topic that has NEVER been posted to returns an EMPTY PAGE (`messages: []`) with a
    * REPLAYABLE `nextCursor` — passing that `nextCursor` back as `since` again yields `[]`
-   * and the same cursor (the SQLite reference backend returns `{ messages: [], nextCursor:
-   * '0' }`). A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
-   * that does not exist) MAY throw {@link NoSuchTopicError} instead; core treats that as
+   * and the same cursor. A plugin that genuinely cannot represent an absent topic (e.g. a chat channel
+   * that does not exist) MAY throw `NoSuchTopicError` instead; core treats that as
    * "topic not present yet", distinct from a real backend failure (which propagates).
    */
   fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult>;

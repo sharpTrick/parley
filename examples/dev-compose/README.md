@@ -57,7 +57,8 @@ sequence numbers are the cursor; a pull consumer with an expiry backs the native
 ## Postgres (v0.6) — ready to run
 
 `postgres:16-alpine` on `localhost:5432`, user/db `parley`/`parley` (password `parley`).
-`BIGSERIAL` seq is the cursor; `LISTEN`/`NOTIFY` drives both `subscribe` and the native `block_ms`.
+`BIGSERIAL` seq is the cursor; `LISTEN`/`NOTIFY` drives `subscribe` (this backend has no read
+primitive to park a budget on, so it refuses `block_ms` rather than serving it).
 The suite probes `postgres://parley:parley@127.0.0.1:5432/parley` (`PARLEY_PG_URL`) and self-skips
 when no server is up. No Docker handy? A plain `apt install postgresql` cluster with the same
 user/db works identically.
@@ -107,8 +108,9 @@ Doing it by hand takes three careful steps, because two Synapse defaults break a
      -u parley -p parleypass -a -c /data/homeserver.yaml http://localhost:8008
    ```
 
-`server_name=parley.local`, C–S API on `localhost:8008`. Room → topic, sync token → cursor; a
-bounded room-filtered `/sync` backs the native `block_ms`.
+`server_name=parley.local`, C–S API on `localhost:8008`. Room → topic, `event_id` → cursor; a
+bounded room-filtered `/sync` drives `subscribe` (this backend has no read primitive to park a
+budget on, so it refuses `block_ms` rather than serving it).
 
 ## Zulip (v0.6) — upstream compose, not authored here
 
@@ -133,8 +135,9 @@ throwaway **`parley` realm** from `keycloak/parley-realm.json`:
 - public client `parley-test` with direct-access grants, used by the gated test to mint tokens.
 
 The gated suite `packages/bridge-core/src/auth/keycloak.e2e.test.ts` probes
-`http://127.0.0.1:8080/realms/parley` (override with `PARLEY_KEYCLOAK_URL`) and self-skips when
-the realm isn't up. Admin console: `admin` / `admin`.
+`http://127.0.0.1:8080/realms/parley` (override with `PARLEY_KEYCLOAK_URL`) and FAILS, after a 30s
+wait, when the realm isn't up — set `PARLEY_E2E=0` to opt out deliberately. Admin console:
+`admin` / `admin`.
 
 JSON can't carry comments, so one note that belongs in the realm file lives here instead: the
 import intentionally does **not** configure client-registration (DCR) trusted-hosts policies —

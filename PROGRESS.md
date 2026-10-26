@@ -6,6 +6,240 @@
 
 ## Status
 
+- **Phase (adversarial review — the Careening experiment):** rounds 1–11 complete and pushed on
+  `claude/next-steps-q1540r`. Full suite **12173 tests, 4 skipped, green**, against real Redis, NATS,
+  Postgres, Prosody, Synapse and Keycloak (all six bound to loopback only).
+
+  Findings per round (14 targets each, 0 errored every round):
+
+  | round | findings | CONFIRMED | blocking | self-induced | blocking self-induced |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 139 | 124 | 61 | — (not gradeable) | — |
+  | 2 | 136 | 130 | 49 | 26% | 27% |
+  | 3 | 119 | 115 | 38 | 39% | 34% |
+  | 4 | 120 | 113 | 45 | 57% | 56% |
+  | 5 | 129 | 117 | 39 | 60% | 72% |
+  | 6 | 90 | 86 | 26 | 80% | 81% |
+  | 7 | 79 | 75 | 23 | 66% | 57% |
+  | 8 | 73 | 71 | 25 | 56% | 62% |
+  | 9 | 71 | 68 | 28 | 63% | 61% |
+  | 10 | 75 | 72 | 29 | 75% | 72% |
+
+  Round 6 was the first round where every count fell at once — findings 129→90, CONFIRMED 117→86,
+  blocking 39→26 — while self-induction rose to 80%, and I read that as the loop running out of
+  original codebase. **Round 7 refutes that reading.** Self-induction fell 80% → 66%, blocking
+  self-induction fell 81% → 57%, and pre-existing findings ROSE 18 → 27 (blocking 5 → 10). The loop
+  found twice as many original blocking defects in round 7 as in round 6, including a malformed
+  gateway frame that kills the whole MCP server process. The five-round monotone rise
+  (27 → 34 → 56 → 72 → 81) simply does not continue.
+
+  The oracle was re-run over rounds 5 and 6 before this was believed, and reproduced their recorded
+  60%/72% and 80%/81% exactly — so the reversal is in the data, not the instrument. Whatever round 6
+  measured, it was not saturation.
+
+  Suite series: **460 → 1428 → 2545 → 3926 → 5241 → 6806 → 7580 → 8847 → 9706 → 10968 → 11836 → 12173**.
+
+  **Round 11 was a DECOMPOSITION round, not a review round** — a deliberate regime boundary, on
+  Patrick's call after observing that source had doubled per backend while the file count had not.
+  Eleven targets, all net-negative on source, every suite passing UNMODIFIED. Biggest source file
+  **1499 → 1014**; packages carrying a >900-line file **9 of 10 → 2**; 24 files → 78.
+
+  **The finding is that our own ratchet had been cementing the monoliths, in five distinct ways:**
+  a split BLOCKED (postgres counts a regex over `src/index.ts`; slack requires every `api()` call
+  site in it; nats pins two prose strings into it); a guard SILENTLY HOLLOWED (matrix's negative
+  assertions still pass but now grade a file that no longer holds the code they were written
+  about); a debt made INVISIBLE (net-util's fork registry keyed by file path and scanned only
+  importing files, so a split could retire a recorded security debt with the suite green); a SHAPE
+  lock (redis's test asserts a private field is an Array, so the `ReaderPool` the scope asked for
+  failed 20 tests on shape, not behaviour); and a lint with a HOLE (zulip's export-surface regex
+  misses `export async function`, proven by a real export it failed to flag).
+
+  Ten rounds of ratcheting made the code harder to simplify, and nothing in the protocol noticed.
+  Re-anchoring those assertions from one path to a glob over `src/**` is the highest-value change
+  still available — and it touches TESTS, which the net-negative-on-source rule deliberately frees.
+
+  Honest caveat: margins were thin (xmpp −3, shared −5). A multi-file split costs 30–50 lines of
+  irreducible import ceremony, and the reductions came mostly from duplication the split REVEALED —
+  four copies of one `ws.close()`, two throttled reporters, one hazard comment stated three times —
+  not from the move itself.
+
+  **Halfway reading (round 10).** Neither series has converged and neither is monotone.
+  Pre-existing BLOCKING findings ran 36 → 25 → 20 → 11 → 5 through round 6, then RECOVERED to
+  10, 9, 11, 8 and have sat in that band for four rounds. This is a STEADY STATE, not the
+  two-regime decay ouroboros described: ten rounds in, on a codebase nine prior full-surface
+  sweeps have covered, the loop still finds 8–11 original blocking defects per round while about
+  two thirds of its blocking output is against its own prior work. Where saturation appears it is
+  package-local and shows up as MUTATION COST rather than finding count — core-auth needed 27
+  mutations in round 8 to establish it had no vacuous tests and 52 in round 9 to surface two.
+
+  **Round 10's theme: critics find well and prescribe badly, and the separation is what catches
+  it.** Five remediations in round 9 and five more here would have introduced or blessed a defect
+  if implemented as written. zulip was told to use `topic.trim()` — the wrong Unicode set in both
+  directions (JS `trim` excludes U+0085 and includes U+FEFF; pydantic's is the reverse). nats was
+  told to delete a clamp whose comment was wrong but whose code was load-bearing for a different
+  reason. slack's finding 2 would have returned a parked caller at the deadline in exactly the
+  case an existing test pins as returning on the loss. xmpp's test upgrade asked for a row a real
+  Prosody refutes — it strips the stanza the row would have injected. And a proposed comment lint
+  did not fire on the five instances it was written for.
+
+  **Three agents used mutation testing to SUBTRACT**, in three consecutive rounds: matrix built
+  the `noAuth` flag its finding specified, watched the mutation survive, and deleted it; slack
+  implemented a read floor, measured it working, could not state an invariant it satisfied that
+  the ladder did not, and reverted it; postgres implemented a listener clear, mutated it away
+  alone, saw every cell pass, and left it out.
+  Note the series stops being a clean proxy at round 9: telegram's count FELL 527 → 523 while its
+  coverage rose (per-field cells collapsed from one-case-per-breakage to one-case-per-field looping
+  its breakages — 4 fields to 9, 15 breakage cells to 37, each gaining a cold-restart post-condition).
+
+  **Round 9's dominant theme: the proposed remediation was itself defective, five times.** xmpp's
+  empty-page fix would have violated a frozen conformance clause the suite cannot currently exercise;
+  xmpp's `<delay>` guard was told to compare the room's BARE JID, which an occupant's full JID
+  satisfies, admitting exactly the forgery it was written to stop; redis's socket-leak finding
+  measured its own probe server (a paused readable never sees EOF — `s.resume()` and the leak is
+  zero); telegram's proposed lint would have PASSED on the saturating assertion that motivated it;
+  and slack's session-scope fix, written as specified, captures the NEW session because the first
+  fetch is what straddles the boundary. Critics are now reliable at finding defects and unreliable at
+  prescribing fixes — which is an argument for keeping remediation a separate reasoning pass rather
+  than folding it into review.
+
+  **Two agents subtracted rather than added.** nats reverted a defence-in-depth guard it had already
+  written when the mutation survived; core-engine withheld four barrel exports the finding asked it
+  to add, because an earlier round had deliberately trimmed them. Mutation discipline used to shrink
+  the diff, not just to justify it.
+
+  **Round 8 changed the frozen seam for the first time**, on Patrick's adjudication. `seam.ts` said
+  `blockMs` engages "only relative to a `since`"; core's long-poll wrapper, the `parley_fetch_recent`
+  tool description and the conformance suite all said the opposite, and eight of ten backends already
+  behaved the other way. The frozen file was the minority report. It matters because a since-less read
+  is the FIRST call of every session — the one an agent makes before it holds a cursor.
+
+  **Round 8's saturation signal is package-local, not global.** core-auth's critic ran 27 mutations
+  over its whole surface — unbinding `redirect_uri` at `/token`, dropping the RFC 8707 audience check,
+  deleting the empty-passphrase guard, 24 more — and the existing suite caught **all 27**, so it filed
+  no test-integrity and no test-hygiene finding at all. That is what a package with no vacuous tests
+  looks like under this protocol, on the deepest security surface in the repo, after eight rounds.
+
+  **Two more process defects, both produced BY this protocol's own advice.** The stash stack lives in
+  the common git dir, so two agents restored each other's work into the wrong worktrees; and
+  `git checkout -- <file>`, which the protocol recommended for undoing a mutation, restores from the
+  round base and wiped three agents' in-progress fixes. Both are round 7's `index.ts.bak` collision
+  one level down: isolation that holds for the working tree and silently does not below it.
+
+  **A measurement trap worth remembering.** A matrix conformance timing failure looked like it was
+  caused by the seam change; it reproduced identically at HEAD without the change, and vanished on a
+  recreated Synapse. The shared homeserver degrades from accumulated EVENTS, not just joined rooms —
+  the joined-room count used as a proxy in round 7 read a healthy 10 throughout. Recreate the server and
+  re-measure before attributing a live-server timing change to a diff.
+
+  **Round 7's themes.** Fixture fidelity persisted from round 6 and stayed the most productive lens:
+  nats' fake modelled foreignness with a boolean instead of the subject, so deleting `filter_subject`
+  from all three `consumers.add` calls left the fake-backed suite green at 190/190 while a live
+  wildcard stream leaked a sibling topic into the handler; zulip's fake echoed `content` verbatim
+  while the real server strips edges, refuses empty bodies and truncates at 10 000 chars — modelling
+  it turned a FROZEN conformance clause red, because the plugin took neither arm.
+
+  New in round 7: **a suite that had already noticed a defect and frozen it as correct.** Slack's
+  `envelope-robustness` asserted `liveSockets === 2` under the label `orphaned sockets`. That is why
+  the socket leak survived six rounds — not that no one looked, but that the test named the bug and
+  blessed it.
+
+  **Three agents' guards failed their own first mutation** and each fixed the test rather than
+  reporting success: discord's fault boundary (the only unwrapped statement was the waiter fan-out),
+  shared's credential table (the `path segment` location echoed the whole path, so the pathname rule
+  claimed it whatever the token looked like — it graded the shape of nothing), and telegram's docs
+  cell (one served chat never exceeded the cap, so load-time eviction never bit). Mutation testing
+  is the only reason those three ratchets are real.
+
+  **Cross-target collisions are now a recurring cost.** Round 6 had none; round 7 had three. Core's
+  new `set()` validation contradicted a matrix table titled "every cursor form a read-state file can
+  hold" — matrix's row was the wrong one, since `load()` has always refused an empty cursor. Core's
+  new `MAX_BLOCK_MS` ceiling made slack's README cite an unreachable configuration. And the shared
+  target's tightened since-less bound reddened matrix, which answers that read in 4.1-4.8 s against
+  a live Synapse — a real provisioning cost, not a park.
+
+  **A process defect the worktrees do not cover.** Worktrees isolate each agent's repository; the
+  scratchpad is shared. Two agents independently wrote `index.ts.bak` there, and matrix's restore
+  pulled bridge-slack's source into `bridge-matrix/src/index.ts`. Both recovered from git. Recorded
+  in `docs/REVIEW_PROTOCOL.md` with the fix: per-target scratch paths, or better, `git checkout --`
+  instead of a backup at all.
+
+  **Stop rule: two consecutive wake-all rounds with zero CONFIRMED findings, or round 20.** Offered
+  the blocking-gated alternative at round 3 and deliberately declined it, to keep comparability with
+  ouroboros's acting rule; the shadow metric is still recorded. Quiescence has never fired — all 14
+  targets have returned confirmed findings in all seven rounds — and that null result is the finding.
+
+  **Before launching a round: `node scripts/careening-preflight.mjs`** (exit 1 = do not start). The
+  docker daemon died mid-round in rounds 3, 4 and 5; round 5's six service-backed targets reviewed
+  with no servers at all, so its pre-existing count is a floor. Restart with
+  `dockerd &` then `./examples/dev-compose/dev-infra.sh up all`.
+
+  Per-round data and the full writeup live in
+  `docs/findings/critical-review/2026-07-29-careening/`. Round N's procedure: re-pin worktrees
+  (`node scripts/careening-worktrees.mjs setup <sha>`), then
+  `Workflow({scriptPath: ".claude/workflows/careening-review.js", args: {round, quiesced: [],
+  changed: [], wakeAll: true}})` — **by scriptPath, never by name**: a named workflow resolves to a
+  snapshot registered at session start, and round 3 silently ran the round-1 script that way.
+
+  Then one remediation agent per target, each in its own worktree, staged and uncommitted; the
+  orchestrator extracts with `git diff --cached` and commits per package. 14 patches per round have
+  applied with zero real conflicts, because targets are disjoint packages. Worktrees exist because
+  mutation testing is mandatory and a mutation on a shared tree is another agent's phantom failure.
+
+  **Four defects this experiment created and later found**, worth knowing about because they are
+  the substance of the iatrogenesis number: a round-3 helper (`isNoSuchTopicError`) that shipped as
+  dead code with all five call sites still on `instanceof`; a round-2 ID-token rule that rejected any
+  `nonce` and so permanently 401'd Keycloak deployments the README recommends; a round-3 stream
+  incarnation read from cached state, so an unobserved re-provision still minted a duplicate id; and
+  a round-2 read-state flush that spread the whole in-memory map over a re-read, clobbering a
+  sibling instance's more-advanced cursor. All four passed their own round's tests.
+
+  **And one of a different species, found in round 6: a remediation that never applied.** Round 5's
+  nats `tailSequence` repair keyed on `getMessage(stream, {last_by_subj})`, which NATS 2.10 answers
+  with "no message found" whenever that subject's newest message has been deleted — confirmed by
+  direct probe for deletes of `{12}`, `{11,12}` and `{5..12}`. The repair therefore never fires on a
+  real server for the case it was written for; the widening loop has always carried it. The fake
+  concealed this by answering from surviving records. Making the fake faithful turned three existing
+  window rows from vacuous into real. Count this separately from iatrogenesis: not a defect
+  introduced, a fix that was inert from the day it landed.
+
+  **Round 6's dominant theme was fixture fidelity** — five of ten targets found a fake that could
+  not express the failure being guarded against. postgres: eleven `vi.mock('pg')` Pool fakes stubbed
+  `on: vi.fn()`, so the process-killing `error` event was unraisable by construction. xmpp: the fake
+  carried one connection-wide nick, so all three conflict-revert rows passed vacuously. slack:
+  `FakeSlack` broadcast every Socket Mode envelope to every socket, while Slack's docs say a payload
+  "may be sent to any of the connections" — the README's fanout claim was true in test and false in
+  production. zulip: `injectRaw`'s non-comparable ids never reach the read window, so the drop
+  assertions pass whether the plugin drops them or never sees them. nats: as above.
+
+  **A live-server failure that was cumulative state, not flake.** matrix conformance degraded 3.4 s
+  → 10.3 s → >15 s within one session and started failing 11 of 32 cases: `existingRoom()` joins and
+  the fixture never leaves, so the `parley` account's joined-room set grows without bound and every
+  `/sync` slows. Recreating Synapse fixed it. The instinct to loosen the timeout would have buried a
+  real resource leak in the test fixture.
+
+## Status (pre-review, retained)
+
+- **Phase (consolidation → 1.0-ready):** ✅ Published at **v0.9.0**, `main` green, no open issues
+  or PRs. Everything in `TASKS.md` is checked. The current branch closes the gap between what the
+  repo *claims* and what it *does*, ahead of a deliberate 1.0 (`docs/1.0-readiness.md`):
+  - **All ten backends are runnable.** Every package ships a `parley-<name>` bin. The `backend:`
+    config key was parsed and read by *nothing*, so `backend: matrix` ran whatever binary you
+    launched — removed and rejected at load. `skip_permissions` got the same treatment: a security
+    knob nothing reads is now a load error, not a silent no-op.
+  - **CI runs every backend for real** via `dev-infra.sh up all` (redis, nats, postgres, xmpp,
+    matrix, keycloak) and **fails if any test file skips itself**. Seven of 57 files used to skip
+    on every green build, including the conformance suites for the two largest plugins. Now
+    **460 tests, 58 files, none skipped**.
+  - Fixed: a raw NUL byte in `bridge-matrix/src/index.ts` made the file `data` to `file(1)` and
+    made ripgrep refuse to print matches — the largest plugin was invisible to every grep-based
+    search. Now an escape.
+  - Fixed: `bridge-net-util` (the shared 429 loop behind five HTTP backends) had zero tests, and
+    was the one package missing from `vitest.config.ts`'s hand-written alias map — so its first
+    tests silently graded stale `dist/` output and passed against a deliberately broken build. The
+    map is now derived from `packages/`.
+  - Fixed: read-state is keyed by instance+topic but not by backend, so repointing an instance at
+    a different backend replayed a foreign cursor and died deep in a driver. Now an actionable
+    error naming the state file.
 - **Phase (v0.6):** ✅ **Five more backends landed** — Postgres, Zulip, Discord, Telegram, Slack —
   built by five parallel agents (one per plugin package), integrated serially by the lead. All
   green on the shared conformance suite; **zero `bridge-core` changes** (verified by
@@ -166,7 +400,7 @@ new-plugin-only, ZERO `bridge-core` changes (`git diff` must show none), conform
 
 **Conformance contract a backend must satisfy:** stable-unique `backendMsgId` AND monotonic,
 in-order, **exclusive-`since`** cursor delivery (fetchRecent returns pre-sorted ascending). Order is
-the plugin's guarantee; core never compares cursor values. Dedup is on `backendMsgId`, never timestamp.
+the plugin's guarantee; core never orders by a cursor value. Dedup is on `backendMsgId`, never timestamp.
 
 **If a backend seems to need a core change → STOP and surface it (the seam is wrong; fix the seam,
 not core).** That has not happened in v0.1 or v0.2 and is the design's whole bet.
@@ -178,7 +412,33 @@ notes MAM); re-scan prior art by function (DESIGN §17); update the main README 
 
 - Real `claude --channels` fakechat loopback (P-5 live half) needs an interactive Claude Code session
   (v2.1.80+, claude.ai/Console auth). Automated substitute = headless InMemoryTransport harness +
-  `examples/fakechat-loopback/MANUAL-CHECKLIST.md`.
+  `examples/fakechat-loopback/MANUAL-CHECKLIST.md`. **Still the one open item** — Tier-2 live push
+  has never been demonstrated in a real interactive session, and `README.md` says so.
+- CI cannot be exercised from a branch without a PR, so `ci.yml` gained a `workflow_dispatch`
+  trigger; run it against a ref from the Actions tab.
+
+## Post-v1: presence, block_ms, releases (landed since the v0.6 note below)
+
+- **Releases are automated** (#3, #4, #17, #18): merge to `main` → test gate → `semantic-release`
+  picks the bump from the PR title, tags, and publishes all 13 packages in lockstep with provenance
+  via OIDC trusted publishing. Two hard-won constraints, both encoded in the workflows: npm 12
+  (2026-07-08) stopped building better-sqlite3 under `npm ci`, so the gate runs on Node 22's bundled
+  npm and the publish upgrades only to `^11.5.1`; and a pre-merge preflight exists because OIDC
+  cannot bootstrap a brand-new package, so a PR adding one would go green then split the registry.
+- **Transport on `McpServer`** (#8): migrated off the low-level `Server`.
+- **Presence** (#6, #7, #11, #15): one shared reserved topic carries hello/heartbeat/goodbye;
+  `parley_list_users` is derived above the seam, so it works on every backend with **no new seam
+  method**. Offline-aware roster, instance-scoped liveness, beats advertise `post_topics` reach,
+  records versioned. Note it is **on by default and writes to the configured backend** — on a real
+  Matrix/Zulip account that is a room created on first beat.
+  **Removed since:** presence, the roster and `parley_list_users` no longer ship; the paragraph above
+  describes a feature the code no longer has.
+- **71-finding audit remediation** (#16) across core and every backend.
+- **`block_ms`** (#21): long-poll on `fetchRecent`. The seam gained one optional field and core
+  learned no backend names — a capability added *after* the freeze without bending it.
+  **Changed since:** it is native on TWO backends (Redis and NATS, which have a read primitive to
+  park on) and REFUSED by the other eight; there is no generic fallback in core, and none of the
+  eight emulates the wait.
 
 ## Post-v1: optional retention/pruning (`retention_days`)
 

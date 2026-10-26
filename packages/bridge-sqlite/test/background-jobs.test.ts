@@ -1,0 +1,642 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { asHandle, asTopic } from '@sharptrick/parley-core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { SqlParam } from '../src/driver.js';
+import {
+  backoffMs,
+  ESCALATE_AFTER,
+  MAX_POLL_INTERVAL_MS,
+  MIN_POLL_INTERVAL_MS,
+  POLL_BATCH,
+  PRUNE_BATCH,
+  PRUNE_INTERVAL_MS,
+  SqlitePlugin,
+} from '../src/index.js';
+import { SQL } from '../src/schema.js';
+
+/**
+ * The plugin runs two background jobs — the per-topic poll loop and the retention prune — and both
+ * decide, per error, between staying quiet, backing off, and giving up. These cases pin that
+ * decision table for every error class rather than for the one class that happened to be tried:
+ * a *healable* failure must never end live push, and a non-lock failure must never be silent.
+ */
+
+const T = asTopic('ctx');
+const me = asHandle('alice');
+const dbFile = () => join(mkdtempSync(join(tmpdir(), 'parley-bg-')), 'p.db');
+
+interface ErrorSpec {
+  name: string;
+  /** The message SQLite itself puts on this condition, whichever driver surfaces it. */
+  message: string;
+  /** better-sqlite3's per-condition code; `undefined` for an error carrying no code at all. */
+  code: string | undefined;
+  /** Whether a burst of this error must leave the loop able to deliver again by itself. */
+  healable: boolean;
+  /** Lock-classed errors are the sanctioned silent case; everything else must be diagnosed. */
+  quiet: boolean;
+}
+
+interface ErrorCase {
+  name: string;
+  make: () => Error;
+  healable: boolean;
+  quiet: boolean;
+}
+
+const ERROR_SPECS: ErrorSpec[] = [
+  { name: 'SQLITE_BUSY', message: 'database is locked', code: 'SQLITE_BUSY', healable: true, quiet: true },
+  { name: 'SQLITE_LOCKED', message: 'database table is locked', code: 'SQLITE_LOCKED', healable: true, quiet: true },
+  { name: 'SQLITE_IOERR', message: 'disk I/O error', code: 'SQLITE_IOERR', healable: true, quiet: false },
+  { name: 'SQLITE_CANTOPEN', message: 'unable to open database file', code: 'SQLITE_CANTOPEN', healable: true, quiet: false },
+  { name: 'SQLITE_READONLY', message: 'attempt to write a readonly database', code: 'SQLITE_READONLY', healable: true, quiet: false },
+  { name: 'SQLITE_FULL', message: 'database or disk is full', code: 'SQLITE_FULL', healable: true, quiet: false },
+  { name: 'unclassified', message: 'something nobody anticipated', code: undefined, healable: true, quiet: false },
+  { name: 'SQLITE_CORRUPT', message: 'database disk image is malformed', code: 'SQLITE_CORRUPT', healable: false, quiet: false },
+  { name: 'no such table', message: 'no such table: messages', code: 'SQLITE_ERROR', healable: false, quiet: false },
+];
+
+/**
+ * The two shapes a driver error actually reaches these loops in. better-sqlite3 puts the condition
+ * in `code`; node:sqlite — which this package ships and falls back to whenever there is no prebuilt
+ * native module — stamps `ERR_SQLITE_ERROR` on every class alike and leaves the message as the only
+ * signal, so only the second shape exercises the classifier's message arms at all.
+ */
+const ERROR_SHAPES: Record<string, (s: ErrorSpec) => Error> = {
+  'better-sqlite3': (s) =>
+    s.code === undefined
+      ? new Error(s.message)
+      : Object.assign(new Error(s.message), { code: s.code }),
+  'node:sqlite': (s) =>
+    Object.assign(new Error(s.message), { code: 'ERR_SQLITE_ERROR', errstr: s.message }),
+};
+
+const ERROR_CASES: ErrorCase[] = Object.entries(ERROR_SHAPES).flatMap(([shape, build]) =>
+  ERROR_SPECS.map((s) => ({
+    name: `${s.name} (${shape} shape)`,
+    make: () => build(s),
+    healable: s.healable,
+    quiet: s.quiet,
+  })),
+);
+
+let open: SqlitePlugin[] = [];
+async function plugin(): Promise<SqlitePlugin> {
+  const p = new SqlitePlugin();
+  await p.connect({ db_path: dbFile(), poll_interval_ms: MIN_POLL_INTERVAL_MS });
+  open.push(p);
+  return p;
+}
+afterEach(async () => {
+  await Promise.all(open.map((p) => p.disconnect()));
+  open = [];
+});
+
+interface Stmt {
+  all(...a: unknown[]): unknown[];
+  get(...a: unknown[]): unknown;
+  run(...a: unknown[]): unknown;
+}
+
+/**
+ * Make the poll loop's SELECT throw `e` for the next `failures` ticks, then work again.
+ * Returns how many ticks have hit the broken statement so far.
+ */
+function breakSelect(p: SqlitePlugin, failures: number, e: Error): () => number {
+  const holder = p as unknown as { selectAfterStmt: Stmt };
+  const real = holder.selectAfterStmt;
+  let attempts = 0;
+  holder.selectAfterStmt = {
+    all: (...a: unknown[]) => {
+      if (attempts++ < failures) throw e;
+      return real.all(...a);
+    },
+    get: (...a: unknown[]) => real.get(...a),
+    run: (...a: unknown[]) => real.run(...a),
+  };
+  return () => attempts;
+}
+
+// A burst long enough to cross the escalation threshold with room to spare, so the "keeps probing
+// past escalation" behaviour — not just "tolerates a few misses" — is what is being measured.
+const BURST = 13;
+
+/**
+ * A burst that ends is a different question from a failure that does not, and only the second
+ * depends on the error's CLASS. Driven over one representative spec per outcome rather than over
+ * all seven: with escalation disabled every healable row of the full cross still passed, so the
+ * other twelve measured the classifier a second time and the recovery itself is pinned on fake
+ * timers in poll-ladder.test.ts. The two DRIVER SHAPES stay on both axes — that is the one
+ * thing a row here can see that the classifier's own tests cannot.
+ */
+const BURST_REPRESENTATIVES = ['SQLITE_BUSY', 'SQLITE_CORRUPT'];
+
+describe('poll loop error-class matrix', () => {
+  for (const c of ERROR_CASES.filter((e) => BURST_REPRESENTATIVES.some((n) => e.name.startsWith(`${n} `)))) {
+    it(`${c.name}: a burst of ${BURST} then recovery ${c.healable ? 'still delivers' : 'stops the loop'}`, async () => {
+      const p = await plugin();
+      const got: string[] = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      try {
+        await p.subscribe(T, (m) => got.push(m.content));
+        const attempts = breakSelect(p, BURST, c.make());
+
+        if (c.healable) {
+          await vi.waitFor(() => expect(attempts()).toBeGreaterThanOrEqual(BURST), {
+            timeout: 8000,
+            interval: 5,
+          });
+          await p.post(T, me, 'after-recovery');
+          await vi.waitFor(() => expect(got).toEqual(['after-recovery']), {
+            timeout: 8000,
+            interval: 10,
+          });
+        } else {
+          await vi.waitFor(
+            () =>
+              expect(
+                spy.mock.calls.map(([l]) => String(l)).some((l) => /stopped after/.test(l)),
+              ).toBe(true),
+            { timeout: 3000, interval: 5 },
+          );
+          await p.post(T, me, 'after-recovery');
+          await new Promise((r) => setTimeout(r, 100));
+          expect(got).toEqual([]);
+        }
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  }
+
+  for (const c of ERROR_CASES) {
+    it(`${c.name}: a persistent failure is ${c.quiet ? 'silent' : 'diagnosed'} on stderr and ${c.healable ? 'keeps probing' : 'ends the loop'}`, async () => {
+      const p = await plugin();
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let lines: string[] = [];
+      let probedAfterEscalation = false;
+      try {
+        await p.subscribe(T, () => {});
+        const attempts = breakSelect(p, Number.POSITIVE_INFINITY, c.make());
+        await vi.waitFor(() => expect(attempts()).toBeGreaterThanOrEqual(ESCALATE_AFTER), {
+          timeout: 3000,
+          interval: 5,
+        });
+        // Give the loop time to run well past the escalation threshold either way.
+        const atEscalation = attempts();
+        await new Promise((r) => setTimeout(r, 200));
+        probedAfterEscalation = attempts() > atEscalation;
+        lines = spy.mock.calls.map(([l]) => String(l));
+      } finally {
+        spy.mockRestore();
+      }
+      const diags = lines.filter((l) => /poll error|poll loop/.test(l));
+      if (c.quiet) {
+        expect(diags).toEqual([]);
+      } else {
+        expect(diags.length).toBeGreaterThan(0);
+        // Rate-limited: a persistent failure must not write one line per poll interval.
+        expect(diags.length).toBeLessThanOrEqual(3);
+      }
+      // Silent is not healthy: whatever the class, a run of ticks that read nothing escalates —
+      // a healable store is probed forever, and only unrecoverable damage ends the loop, loudly.
+      expect(probedAfterEscalation).toBe(c.healable);
+      expect(lines.some((l) => /stopped after/.test(l))).toBe(!c.healable);
+    });
+  }
+});
+
+/**
+ * The matrix above only ever breaks the SELECT, so the loop's error path is graded for database
+ * failures alone. The other thing that runs inside a tick is the consumer's handler, and its
+ * exceptions reach the same catch: core's push loop emits into an MCP stdio transport that can be
+ * closed under it. Classified as a database error, one broken consumer would be diagnosed as a
+ * store outage and, past the escalation threshold, back the topic off toward 30 s — throttling live
+ * push for a store that is perfectly healthy.
+ */
+describe('a throwing handler is a consumer fault, not a store outage', () => {
+  const HANDLER_FAULTS: Array<{ name: string; fails: (nth: number) => boolean }> = [
+    { name: 'throws on the first message only', fails: (nth) => nth === 0 },
+    { name: 'throws on a burst, then recovers', fails: (nth) => nth < BURST },
+    { name: 'throws on every message it is ever given', fails: () => true },
+  ];
+
+  const SENT = Array.from({ length: BURST + 3 }, (_u, i) => `m${i}`);
+
+  for (const f of HANDLER_FAULTS) {
+    it(`${f.name}: keeps delivering at full cadence, and stays silent`, async () => {
+      const p = await plugin();
+      const offered: string[] = [];
+      const survived: string[] = [];
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let lines: string[] = [];
+      try {
+        let seen = 0;
+        await p.subscribe(T, (m) => {
+          const nth = seen++;
+          offered.push(m.content);
+          if (f.fails(nth)) throw new Error(`consumer blew up on ${m.content}`);
+          survived.push(m.content);
+        });
+        for (const c of SENT) await p.post(T, me, c);
+        await vi.waitFor(() => expect(offered).toEqual(SENT), { timeout: 8000, interval: 10 });
+        // Well past the escalation threshold, so a throw that was swallowed but still COUNTED shows.
+        await new Promise((r) => setTimeout(r, 200));
+        lines = spy.mock.calls.map(([l]) => String(l));
+      } finally {
+        spy.mockRestore();
+      }
+      expect(survived).toEqual(SENT.filter((_c, nth) => !f.fails(nth)));
+      expect(lines.filter((l) => /poll error|poll loop/.test(l))).toEqual([]);
+
+      // Full cadence, not a backed-off one: a handler fault counted as a store failure would have
+      // escalated well inside this burst, and the next message would wait out the backoff instead.
+      await p.post(T, me, 'after-the-faults');
+      await vi.waitFor(() => expect(offered).toContain('after-the-faults'), {
+        timeout: 2000,
+        interval: 10,
+      });
+    });
+  }
+});
+
+/**
+ * The degraded loop keeps probing forever, so its delay is the only thing bounding how long a topic
+ * whose store was briefly unreachable stays dark. The README promises 30 s. Every expectation here
+ * is a literal rather than a re-derivation from the constant, so raising or removing the ceiling —
+ * which the error-class matrix above cannot see, since a 13-failure burst never reaches it — turns
+ * this table red instead of shipping a multi-day recovery.
+ *
+ * The ceiling bounds recovery latency only for intervals BELOW it. Above it, capping is what would
+ * do damage: an interval of 60 s capped to 30 s makes escalation read a store that is already
+ * failing twice as often as a healthy one, which is why the rows past the ceiling expect the
+ * configured interval back rather than the cap.
+ */
+describe('the degraded poll delay is bounded by the documented ceiling', () => {
+  const CEILING_MS = 30_000;
+
+  const DELAYS: Array<{ pollIntervalMs: number; failures: number; expected: number }> = [
+    { pollIntervalMs: MIN_POLL_INTERVAL_MS, failures: 10, expected: 20 },
+    { pollIntervalMs: MIN_POLL_INTERVAL_MS, failures: 14, expected: 320 },
+    { pollIntervalMs: 1000, failures: 10, expected: 2000 },
+    { pollIntervalMs: 1000, failures: 13, expected: 16_000 },
+    { pollIntervalMs: 1000, failures: 14, expected: CEILING_MS },
+    { pollIntervalMs: 1000, failures: 40, expected: CEILING_MS },
+    { pollIntervalMs: 1000, failures: 1000, expected: CEILING_MS },
+    { pollIntervalMs: CEILING_MS, failures: 10, expected: CEILING_MS },
+    { pollIntervalMs: CEILING_MS, failures: 1000, expected: CEILING_MS },
+    { pollIntervalMs: 60_000, failures: 10, expected: 60_000 },
+    { pollIntervalMs: 60_000, failures: 1000, expected: 60_000 },
+    { pollIntervalMs: MAX_POLL_INTERVAL_MS, failures: 11, expected: MAX_POLL_INTERVAL_MS },
+  ];
+
+  for (const { pollIntervalMs, failures, expected } of DELAYS) {
+    it(`${pollIntervalMs} ms interval after ${failures} failures waits ${expected} ms`, () => {
+      expect(backoffMs(pollIntervalMs, failures)).toBe(expected);
+    });
+  }
+
+  /**
+   * The class: a cadence transform that can move AGAINST its configured base. Asserting only the
+   * upper bound leaves "backoff" free to become a speed-up for any interval above the ceiling —
+   * more read pressure on a store that is already failing, forever, which is the opposite of what
+   * backing off is for. The lower bound is the half that catches it, and it is asserted per point
+   * rather than over the series so the report names the interval that broke it.
+   */
+  it('never polls more often than the configured interval, however many failures accumulate', () => {
+    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, CEILING_MS, 60_000, MAX_POLL_INTERVAL_MS]) {
+      for (let failures = ESCALATE_AFTER - 1; failures <= 5 * ESCALATE_AFTER; failures++) {
+        expect(
+          backoffMs(pollIntervalMs, failures),
+          `backoffMs(${pollIntervalMs}, ${failures}) polls faster than the configured interval`,
+        ).toBeGreaterThanOrEqual(pollIntervalMs);
+      }
+    }
+  });
+
+  it('never decreases as failures accumulate, and never exceeds the ceiling or the interval', () => {
+    for (const pollIntervalMs of [MIN_POLL_INTERVAL_MS, 250, 1000, CEILING_MS, 60_000, MAX_POLL_INTERVAL_MS]) {
+      const series = Array.from({ length: 60 }, (_u, i) => backoffMs(pollIntervalMs, i + 10));
+      expect(series).toEqual([...series].sort((a, b) => a - b));
+      expect(Math.max(...series)).toBeLessThanOrEqual(Math.max(CEILING_MS, pollIntervalMs));
+      expect(Math.min(...series)).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('retention prune error visibility', () => {
+  for (const c of ERROR_CASES) {
+    it(`${c.name}: a failing prune is ${c.quiet ? 'silent' : 'diagnosed'}`, async () => {
+      const p = new SqlitePlugin();
+      open.push(p);
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let lines: string[] = [];
+      try {
+        await p.connect({
+          db_path: dbFile(),
+          poll_interval_ms: MIN_POLL_INTERVAL_MS,
+          retention_days: 30,
+        });
+        const holder = p as unknown as { pruneStmt: Stmt; prune(): void };
+        holder.pruneStmt = {
+          all: () => [],
+          get: () => undefined,
+          run: () => {
+            throw c.make();
+          },
+        };
+        holder.prune();
+        lines = spy.mock.calls.map(([l]) => String(l));
+      } finally {
+        spy.mockRestore();
+      }
+      const diags = lines.filter((l) => /retention prune failed/.test(l));
+      expect(diags.length).toBe(c.quiet ? 0 : 1);
+      if (!c.quiet) expect(diags[0]).toContain(c.make().message);
+    });
+  }
+});
+
+/**
+ * Both background jobs run synchronous statements against a file that peers are writing. Work
+ * that scales with the store — an unindexed scan, an unbounded delete — holds the single write
+ * lock and the event loop for that whole span, and past a peer's busy_timeout their `post()`
+ * throws SQLITE_BUSY: the one failure WAL + busy_timeout are advertised to prevent.
+ */
+describe('background jobs do bounded work per statement', () => {
+  async function fill(p: SqlitePlugin, topic = T, rows = 1): Promise<void> {
+    for (let i = 0; i < rows; i++) await p.post(topic, me, `m${i}`);
+  }
+
+  /**
+   * Planned from `SQL` — the same map `connect()` prepares from — so that the statement this grades
+   * is the statement that runs. A plan check against SQL restated in the test certifies a copy, and
+   * every degradation it exists to catch (a predicate the index cannot serve, a dropped LIMIT
+   * subquery, a reordered term) ships green.
+   */
+  const PLANNED: Array<{ name: keyof typeof SQL; params: SqlParam[]; index: RegExp | null }> = [
+    { name: 'selectAfter', params: [T, 0, POLL_BATCH], index: /idx_messages_topic_id/ },
+    { name: 'selectRecent', params: [T, 100], index: /idx_messages_topic_id/ },
+    { name: 'maxId', params: [T], index: /idx_messages_topic_id/ },
+    { name: 'prune', params: [new Date().toISOString(), PRUNE_BATCH], index: /idx_messages_ts/ },
+    { name: 'seq', params: [], index: null },
+  ];
+  const NO_PLAN: Array<keyof typeof SQL> = ['insert'];
+
+  it('every statement the plugin prepares is either planned below or an insert', () => {
+    expect([...PLANNED.map((s) => s.name), ...NO_PLAN].sort()).toEqual(Object.keys(SQL).sort());
+  });
+
+  for (const { name, params, index } of PLANNED) {
+    it(`${name} resolves through an index, not a table scan`, async () => {
+      const p = await plugin();
+      await fill(p, T, 50);
+      const holder = p as unknown as { driver: { prepare(sql: string): Stmt } };
+      const plan = holder.driver.prepare(`EXPLAIN QUERY PLAN ${SQL[name]}`).all(...params) as Array<{
+        detail: string;
+      }>;
+      const steps = plan.map((r) => r.detail);
+      const onMessages = steps.filter((s) => /\bmessages\b/.test(s));
+      if (index === null) {
+        expect(onMessages).toEqual([]);
+        return;
+      }
+      // Keep this matching on SEARCH rather than on the index name, so that a COVERING INDEX *scan*
+      // — which still walks the whole store — cannot pass as index use.
+      expect(onMessages.length).toBeGreaterThan(0);
+      for (const step of onMessages) {
+        expect(step).toMatch(/^SEARCH messages USING (COVERING INDEX|INDEX|INTEGER PRIMARY KEY)/);
+      }
+      expect(steps.join(' | ')).toMatch(index);
+    });
+  }
+
+  it('a prune larger than one batch yields to the event loop between batches', async () => {
+    const path = dbFile();
+    const writer = new SqlitePlugin();
+    await writer.connect({ db_path: path, poll_interval_ms: 20 });
+    const rows = 2 * PRUNE_BATCH + 100;
+    const stmt = (writer as unknown as { insertStmt: Stmt }).insertStmt;
+    const old = new Date(Date.now() - 86_400_000).toISOString();
+    for (let i = 0; i < rows; i++) stmt.run(T, me, `m${i}`, old, null);
+    await writer.disconnect();
+
+    let ticks = 0;
+    const beat = setInterval(() => ticks++, 2);
+    const p = new SqlitePlugin();
+    open.push(p);
+    await p.connect({ db_path: path, poll_interval_ms: 20, retention_days: 1 / 24 });
+
+    await vi.waitFor(
+      async () => {
+        const { messages } = await p.fetchRecent({ topic: T, limit: 1 });
+        expect(messages).toEqual([]);
+      },
+      { timeout: 8000, interval: 10 },
+    );
+    clearInterval(beat);
+    // Batches are separate turns of the loop, so the heartbeat ran while the store was draining.
+    expect(ticks).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Both background jobs take a cadence from configuration, and validating one is not observing it.
+ * Every latency assertion in this file is an UPPER bound, so a loop that ignored `poll_interval_ms`
+ * and rescheduled at 0 — re-querying the shared file per topic per process about a thousand times a
+ * second, contending for the WAL read lock with every peer's `post()` — would pass all of them, and
+ * pass them harder. These two tables grade the interval a configured value actually produces: for
+ * the poll loop, that ticks track the configured cadence in BOTH directions; for the prune, that
+ * the timer firing prunes again rather than merely existing with the right argument.
+ */
+
+interface Cadence {
+  pollIntervalMs: number;
+  /** Rows written after `subscribe`, drained before the quiet window is measured. */
+  backlog: number;
+}
+
+/**
+ * `MAX_POLL_INTERVAL_MS` is in the table because the ceiling exists to keep `setTimeout` from
+ * silently clamping an over-32-bit delay to 1 ms: raising it turns the slowest configurable poll
+ * into the hot loop it is there to prevent, which shows up here as ticks in a quiet window.
+ */
+const CADENCE: Cadence[] = [
+  { pollIntervalMs: MIN_POLL_INTERVAL_MS, backlog: 0 },
+  { pollIntervalMs: 50, backlog: 0 },
+  { pollIntervalMs: 200, backlog: 0 },
+  { pollIntervalMs: 200, backlog: POLL_BATCH },
+  { pollIntervalMs: 250, backlog: POLL_BATCH + 1 },
+  { pollIntervalMs: 60_000, backlog: 0 },
+  { pollIntervalMs: MAX_POLL_INTERVAL_MS, backlog: 0 },
+];
+
+describe('the poll loop runs at the interval it was configured with', () => {
+  const WINDOW_MS = 600;
+
+  /** One tick = one `selectAfter`, so counting the statement counts ticks. */
+  function countSelects(p: SqlitePlugin): () => number {
+    const holder = p as unknown as { selectAfterStmt: Stmt };
+    const real = holder.selectAfterStmt;
+    let calls = 0;
+    holder.selectAfterStmt = {
+      all: (...a: unknown[]) => {
+        calls++;
+        return real.all(...a);
+      },
+      get: (...a: unknown[]) => real.get(...a),
+      run: (...a: unknown[]) => real.run(...a),
+    };
+    return () => calls;
+  }
+
+  for (const { pollIntervalMs, backlog } of CADENCE) {
+    it(`${pollIntervalMs} ms with ${backlog} rows pending: ticks track the interval`, async () => {
+      const p = new SqlitePlugin();
+      open.push(p);
+      await p.connect({ db_path: dbFile(), poll_interval_ms: pollIntervalMs });
+
+      const got: string[] = [];
+      let firstAt = 0;
+      await p.subscribe(T, (m) => {
+        firstAt ||= Date.now();
+        got.push(m.content);
+      });
+      const selects = countSelects(p);
+
+      if (backlog > 0) {
+        const stmt = (p as unknown as { insertStmt: Stmt }).insertStmt;
+        const ts = new Date().toISOString();
+        const expected = Array.from({ length: backlog }, (_u, i) => `m${i}`);
+        for (const c of expected) stmt.run(T, me, c, ts, null);
+        await vi.waitFor(() => expect(got).toHaveLength(backlog), { timeout: 10_000, interval: 5 });
+        expect(got).toEqual(expected);
+        await new Promise((r) => setTimeout(r, 5));
+        // A tick that fills its batch drains again at once, so the whole backlog lands in one
+        // burst and a full batch is always followed by another query before the interval elapses.
+        expect(Date.now() - firstAt).toBeLessThan(pollIntervalMs);
+        expect(selects()).toBeGreaterThanOrEqual(Math.floor(backlog / POLL_BATCH) + 1);
+      }
+
+      const before = selects();
+      await new Promise((r) => setTimeout(r, WINDOW_MS));
+      const ticks = selects() - before;
+      const nominal = WINDOW_MS / pollIntervalMs;
+      expect(ticks).toBeLessThanOrEqual(Math.floor(nominal) + 2);
+      expect(ticks).toBeGreaterThanOrEqual(Math.floor(nominal / 2));
+    });
+  }
+});
+
+/**
+ * `retention_days` is what an operator sets; {@link PRUNE_INTERVAL_MS} is how often the promise is
+ * kept. index.test.ts pins the argument handed to `setInterval` — which a timer that fires into a
+ * no-op, or a one-shot that prunes only at connect, satisfies just as well. What an operator
+ * observes is a row that goes stale AFTER a prune and is gone by the next one.
+ */
+describe('the retention prune re-runs on its cadence, not only at connect', () => {
+  const windowMs = PRUNE_INTERVAL_MS / 2;
+
+  async function contents(p: SqlitePlugin): Promise<string[]> {
+    return (await p.fetchRecent({ topic: T })).messages.map((m) => m.content);
+  }
+
+  for (const nth of [1, 2, 3]) {
+    it(`a row written after prune #${nth - 1} survives until prune #${nth} and no longer`, async () => {
+      vi.useFakeTimers();
+      const p = new SqlitePlugin();
+      open.push(p);
+      try {
+        await p.connect({
+          db_path: dbFile(),
+          poll_interval_ms: 1000,
+          retention_days: windowMs / 86_400_000,
+        });
+        await vi.advanceTimersByTimeAsync((nth - 1) * PRUNE_INTERVAL_MS);
+        await p.post(T, me, 'written-between-prunes');
+
+        await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS - 1);
+        expect(await contents(p)).toEqual(['written-between-prunes']);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await contents(p)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+});
+
+/**
+ * A background job that outlives `disconnect()` runs against a closed driver: it deletes from a
+ * store the host has already torn the bridge down over, or writes a failure line naming a plugin
+ * that is gone. Both jobs must therefore be dead in every order teardown can reach them in — the
+ * poll loop's orders are graded in test/lifecycle.test.ts, and the prune's are here. Each row
+ * asserts the same observable pair: the store stops changing, and nothing more is written.
+ */
+describe('the retention prune stops with the plugin', () => {
+  async function remaining(path: string): Promise<string[]> {
+    const reader = new SqlitePlugin();
+    await reader.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS });
+    const { messages } = await reader.fetchRecent({ topic: T, limit: 10_000 });
+    await reader.disconnect();
+    return messages.map((m) => m.content);
+  }
+
+  it('a prune re-entered after disconnect touches neither the store nor stderr', async () => {
+    const path = dbFile();
+    const seed = new SqlitePlugin();
+    await seed.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS });
+    const insert = (seed as unknown as { insertStmt: Stmt }).insertStmt;
+    insert.run(T, me, 'aged-out', new Date(Date.now() - 10 * 86_400_000).toISOString(), null);
+    insert.run(T, me, 'inside-window', new Date().toISOString(), null);
+    await seed.disconnect();
+
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let lines: string[] = [];
+    try {
+      const p = new SqlitePlugin();
+      await p.connect({ db_path: path, poll_interval_ms: MIN_POLL_INTERVAL_MS, retention_days: 1 });
+      await p.disconnect();
+      spy.mockClear();
+      (p as unknown as { prune(): void }).prune();
+      lines = spy.mock.calls.map(([l]) => String(l));
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await remaining(path)).toEqual(['inside-window']);
+    expect(lines).toEqual([]);
+  });
+});
+
+/**
+ * `poll_interval_ms` is documented as a pure latency knob. It stops being one if a tick that fills
+ * its batch then waits a whole interval: throughput would be capped at POLL_BATCH per interval and
+ * a producer above that falls behind without bound, silently.
+ */
+describe('a full poll batch reschedules immediately', () => {
+  for (const backlog of [POLL_BATCH - 1, POLL_BATCH, 3 * POLL_BATCH]) {
+    it(`delivers a backlog of ${backlog} within one poll interval`, async () => {
+      const interval = 1500;
+      const p = new SqlitePlugin();
+      open.push(p);
+      await p.connect({ db_path: dbFile(), poll_interval_ms: interval });
+
+      const got: string[] = [];
+      await p.subscribe(T, (m) => got.push(m.content));
+
+      const stmt = (p as unknown as { insertStmt: Stmt }).insertStmt;
+      const ts = new Date().toISOString();
+      const expected = Array.from({ length: backlog }, (_u, i) => `m${i}`);
+      for (const c of expected) stmt.run(T, me, c, ts, null);
+
+      const started = Date.now();
+      await vi.waitFor(() => expect(got).toHaveLength(backlog), { timeout: 10_000, interval: 20 });
+      expect(got).toEqual(expected);
+      expect(Date.now() - started).toBeLessThan(2 * interval);
+    });
+  }
+});

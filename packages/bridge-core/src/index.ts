@@ -7,7 +7,7 @@ export { CORE_VERSION } from './version.js';
 // The seam + normalized Message (DESIGN §4/§5/§6).
 export type { Topic, Handle, BackendMsgId, Cursor, Message, BuildMessageInput } from './message.js';
 export { asTopic, asHandle, asBackendMsgId, asCursor, buildMessage } from './message.js';
-export { safeName } from './topic-name.js';
+export { safeName, MIN_HASH_LEN, DEFAULT_HASH_LEN, MAX_HASH_LEN } from './topic-name.js';
 export type {
   BackendPlugin,
   BackendConfig,
@@ -16,7 +16,20 @@ export type {
   FetchRecentResult,
   MessageHandler,
 } from './seam.js';
-export { NoSuchTopicError } from './seam.js';
+export { safeDeliver } from './safe-deliver.js';
+export { boundedLine, MAX_NAMED_FRAGMENT } from './bounded-line.js';
+export { isArmableDelay, MAX_TIMER_MS } from './timer-bounds.js';
+export { isNoSuchTopicError, NoSuchTopicError } from './no-such-topic.js';
+export {
+  assertBlockMsUnsupported,
+  BlockingFetchUnsupportedError,
+  isBlockingFetchUnsupportedError,
+} from './blocking-unsupported.js';
+export {
+  assertKnownConfigKeys,
+  type BackendConfigKeys,
+  isPlainObject,
+} from './backend-config-keys.js';
 
 // Shared helpers (used by plugins and core alike).
 export { parseMentions } from './mentions.js';
@@ -32,38 +45,63 @@ export {
   parseConfig,
   loadConfig,
   instanceIdOf,
+  MAX_BLOCK_MS,
+  MAX_TOPIC_LEN,
 } from './config.js';
 
 // Security: topic allowlist (DESIGN §14).
-export { Allowlist, allowlistFor, TopicNotAllowedError, type AllowlistOptions } from './allowlist.js';
+export {
+  Allowlist,
+  allowlistFor,
+  TopicNotAllowedError,
+  UnsafePatternError,
+  type AllowlistOptions,
+} from './allowlist.js';
+// The length past which a `post_topics` pattern stops widening post/fetch — a documented capacity an
+// operator has to design topic names around, so it ships nameable rather than as a hardcoded 64.
+export { MAX_MATCH_INPUT } from './regex-safety.js';
 
 // Engine: dedup / ordering / catch-up / read-state (DESIGN §6/§7).
 export { SeenSet } from './engine/seen-set.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
-export { fetchRecentBlocking, type BlockingFetchOptions } from './engine/blocking-fetch.js';
-// Presence: the reachability roster derived above the seam via hello/heartbeat/goodbye (DESIGN §7).
+// The run-time half of the seam's live-delivery clause: a push path that delivers NOTHING is
+// otherwise invisible to a deployment, because catch-up covers for it silently.
+// An out-of-tree composition root assembling `ToolDeps` by hand needs both: the ledger the tool
+// reads, and the one derivation of when it must refuse to answer.
 export {
-  DEFAULT_PRESENCE_TOPIC,
-  type PresenceKind,
-  type PresenceRecord,
-  type RosterEntry,
-  type RosterOptions,
-} from './engine/presence.js';
+  LiveDeliveryLedger,
+  liveDeliveryBlockers,
+  type LiveDeliveryBlocker,
+  type LiveDeliveryPreconditions,
+} from './engine/live-delivery.js';
+export {
+  fetchRecentBlocking,
+  FetchAbortedError,
+  isFetchAbortedError,
+  type BlockingFetchOptions,
+} from './engine/blocking-fetch.js';
 
 // Transport: reactive MCP tools (DESIGN §8/§9) + the dual-role channel server (push half).
-export { registerTools, type ToolDeps } from './transport/tools.js';
+export { registerTools, toolDepsFor, TOOL_TEXT, type ToolDeps } from './transport/tools.js';
+// The one entrypoint every backend `bin` runs: argv, config, bridge, teardown. The plugin arrives
+// as an argument, so nothing here depends on a backend.
+export {
+  installShutdown,
+  parseArgs,
+  runBackendCli,
+  usageFor,
+  type BackendCliOptions,
+  type ParseArgsOptions,
+  type ParsedArgs,
+  type ShutdownHost,
+} from './cli/backend-cli.js';
 export {
   emitChannel,
   channelMeta,
   CHANNEL_NOTIFICATION_METHOD,
 } from './transport/channel-emit.js';
 export { startPushLoop, type PushLoopOptions } from './transport/push-loop.js';
-export {
-  startPresenceLoop,
-  type PresenceLoop,
-  type PresenceLoopOptions,
-} from './transport/presence-loop.js';
 export {
   buildBridge,
   createStdioBridge,

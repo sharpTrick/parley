@@ -13,13 +13,13 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 
 | Seam concept              | Zulip mapping |
 | ------------------------- | ------------- |
-| `connect(config)`         | No session to establish — Zulip auth is per-request HTTP Basic (`email:api_key`). `connect` captures config; a bad URL/key surfaces on the first call. |
+| `connect(config)`         | No session to establish — Zulip auth is per-request HTTP Basic (`email:api_key`), so `connect` issues no request: it validates and captures config. A **malformed** value — a `site_url` that is not a bare absolute http(s) URL, an empty `email`/`api_key`/`stream`, an unusable `events_timeout_ms` — is a `connect()` error naming the key. What cannot be checked without asking the server — a well-formed URL pointing at the wrong host, a well-formed but wrong `api_key` — surfaces on the first call (401, or a transport error). Calling it again over a live connection disconnects that one first (its queues are deleted against the site it was made with); a rejected config leaves the live connection running. |
 | topic → stream + topic    | ONE configured Zulip **stream** (default `parley`) carries all Parley traffic; each Parley topic is a Zulip **topic** within it. |
 | `post`                    | `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) with `{ type: "stream", to: <stream>, topic, content }` → returns the new message `id`. |
-| `backendMsgId` = `cursor` | The Zulip **message `id`** — a globally monotonic integer (hence per-topic monotonic); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
-| `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&num_before=N` → the most recent window, ascending. |
+| `backendMsgId` = `cursor` | The Zulip **message `id`** — a global integer, allocated in increasing order (hence per-topic increasing) but not made visible in that order (see [below](#a-window-catch-up-cannot-close-ids-commit-out-of-order)); serves as both the dedup key and the order key. Zero cursor is `'0'`. |
+| `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&include_anchor=true&num_before=N` → the most recent window, ascending. Zulip resolves `newest` to a sentinel larger than any message id, so no row can be the anchor and `include_anchor` decides nothing on this read; it is sent explicitly all the same, because it is the value that stays correct if that ever changes. Zulip caps a request at 5000 messages, so a larger `limit` is paginated transparently rather than returned as a 400. |
 | `fetchRecent` (`since`)   | `anchor=<since>&include_anchor=false&num_before=0&num_after=N` — the anchor itself is excluded, so `since` is strictly **exclusive** server-side. Zulip returns ascending by id; no client-side reordering. |
-| `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (its birth IS the tail — only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and **gap-fills** the dead-queue window through the catch-up path, deduped by last delivered id. `disconnect()` aborts in-flight polls and best-effort deletes the queues. |
+| `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. A message that reaches the server while no queue of ours exists — before `register` lands, or between a garbage-collected queue and its replacement — reaches no queue at all: live push is a **subset** of the post-subscribe tail (the seam's contract), and that window is left to the next `parley_fetch_recent`. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and resumes; a `register` mints an *empty* queue and reports `last_event_id: -1`, so the replacement can never re-serve what the dead one already delivered. A duplicate is still forbidden, and the loop holds that with a last-delivered-id watermark: an event whose id it cannot ack leaves the queue position where it was, and the server re-serves the message behind it on every poll until the fault clears. `disconnect()` aborts in-flight polls and best-effort deletes the queues. Only a body the server actually sent counts as evidence the queue is alive — our own cap ends a healthy idle poll and a black-holed one identically — so the poll issued after a cap asks for the queue as it stands (`dont_block=true`). Progress is measured by the ACK, not by bytes: a poll that asked to park and came back with nothing — or with events whose ids leave the ack where it was, so the very same answer is served again — is a wake that never came, and is backed off and named on stderr rather than re-issued forever. |
 | `resolveIdentity`         | `GET /api/v1/users`, matched on `email` or `full_name` → `backendRef` = the Zulip `user_id`; miss (or error) degrades to `{ handle, backendRef: handle }`. |
 
 `senderHandle` ← `message.sender_email`, `content` ← raw `message.content` (`apply_markdown=false`
@@ -27,36 +27,104 @@ everywhere — the bridge wants source text, not rendered HTML), `timestamp` ←
 `new Date(message.timestamp * 1000).toISOString()` (informational only — never used for ordering
 or dedup).
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time. Zulip
-serves this natively via the `/api/v1/events` event-queue long-poll. Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `block_ms` here.** `fetchRecent` reads `/api/v1/messages` and has no wait to spend a caller's
+budget on, so it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, over
+the `/api/v1/events` event queue.
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Zulip stamps the
-> sender from the authenticated bot account — see "Multiple concurrent sessions". **`inReplyTo` is
-> ignored too:** Zulip has no per-message reply parent; it threads *by topic*, and the topic is
-> already Parley's addressing unit.
+> sender from the authenticated bot account, so a message's `senderHandle` is always that bot's
+> **email**, never your `identity.handle` — see "Multiple concurrent sessions" for what that costs
+> transcripts. **`inReplyTo` is ignored too:** Zulip has no per-message reply parent; it threads
+> *by topic*, and the topic is already Parley's addressing unit.
+
+## Topic names: case-folded, 60 characters, validated
+
+Zulip's topic namespace is not quite Parley's, so the plugin maps between them explicitly:
+
+- **Case is folded.** Zulip matches topics case-insensitively (`ops` and `OPS` are one topic), so
+  the plugin lower-cases the topic on the wire — your Parley topic `Ops` is Zulip topic `ops`, and
+  a third party posting to `OPS` lands in the same Parley topic rather than a hidden second one.
+  Two configured topics that differ only in case are **rejected** (they would share one history).
+- **60 characters, hard.** Zulip truncates longer subjects on send, which would make the topic
+  write-only — posts land under a name the read narrow never matches. The plugin refuses such a
+  topic with a clear error at `post`/`fetchRecent`/`subscribe` instead.
+- **No whitespace on the ends.** Zulip removes leading and trailing whitespace from a send's
+  `topic` while decoding the request; reads (`subject__iexact`) and event-queue narrows compare the
+  operand exactly as it arrived. So `ops ` is write-only for the same reason an over-long name is —
+  and it silently shares `ops`'s history. Refused at the same three calls. What Zulip removes is
+  Unicode `White_Space`, not quite JavaScript's `trim()`: U+0085 goes, U+FEFF stays.
+
+## Message bodies: 10 000 characters, no ragged edges
+
+Zulip normalizes every body it accepts (`zerver/lib/message.py::normalize_body`) before storing it,
+so a payload it would rewrite is refused at `post` rather than acknowledged with an id and stored
+as something else:
+
+- **10 000 characters, hard** (code points). A longer body is truncated on send and marked
+  `[message truncated]` — for a context hand-off, silently. `post` refuses it, naming the measured
+  length; split the hand-off instead.
+- **Trailing whitespace and leading newlines are stripped** by the server, so a body carrying
+  either is refused. Leading *spaces* and all interior whitespace survive untouched.
+- **An empty (or whitespace-only) body and a body containing a NUL are rejected** by the server;
+  `post` refuses them up front with the reason.
 
 ## The one inexactness: topics are mutable
 
 Zulip topics are **mutable namespaces** — admins (and, under the default org policy, members) can
 move or rename messages between topics after the fact. Message **ids and cursors survive a move**
 (they are global, not per-topic), but topic *membership* can drift: a moved message silently
-leaves one Parley topic's history and appears in another's. Practically: dedup and ordering are
-rock-solid; topic isolation is only as strong as your server's
+leaves one Parley topic's history and appears in another's. Practically: dedup is exact; topic
+isolation is only as strong as your server's
 [message-move policy](https://zulip.com/help/restrict-moving-messages). For a dedicated Parley
 stream with only bots posting, this never happens on its own.
+
+## A window catch-up cannot close: ids commit out of order
+
+Zulip draws a message's id from a Postgres sequence when `do_send_messages`
+(`zerver/actions/message_send.py`) inserts it, then writes every recipient's `UserMessage` row and
+only then commits; the `message` event goes out on commit. Two sends in flight at once can therefore
+become visible in the reverse of their id order. A `fetchRecent` landing between those two commits
+returns the higher id and a cursor past the lower one, so no later `since` read returns the lower one,
+and live push — which delivers in cursor order — drops it too. A read without `since` still returns
+it while it is inside the window asked for. It takes two sends in flight at once — two bridges, a
+person and a bridge, or overlapping `post` calls; sends issued one after another cannot produce it,
+because `post` returns only after its send has committed. The server exposes no commit-ordered position to resume from, so this is left
+open rather than narrowed by a timing guess. Not measured: this repo has no live Zulip.
 
 ## Config (`backend_config`)
 
 | key                 | default                  | meaning |
 | ------------------- | ------------------------ | ------- |
-| `site_url`          | `http://127.0.0.1:9991`  | Zulip server base URL (docker-zulip dev default port). |
+| `site_url`          | `http://127.0.0.1:9991`  | Zulip server base URL (docker-zulip dev default port). **Use `https://` for anything but loopback** — the bot `email:api_key` goes out as an HTTP Basic header on every request; a plaintext non-loopback URL is warned about at `connect`. |
 | `email`             | `parley-bot@localhost`   | Bot email for HTTP Basic auth. |
 | `api_key`           | `parley-api-key`         | Bot API key for HTTP Basic auth. |
-| `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. |
-| `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). |
+| `stream`            | `parley`                 | The one Zulip stream carrying all Parley topics. It reaches the wire three ways — `post`'s `to`, the read narrow, and the event-queue narrow — and only the first is decoded: Zulip reads a send's `to` as a stream *indicator*, JSON first. So a name that is valid JSON (`2024`, `true`, `"parley"`, `["parley"]`) would address a stream **ID**, or a differently spelled name, on writes while every read narrowed on the literal name — a post reporting a durable id for a message no `fetchRecent` can return. Such a name is a `connect()` error. |
+| `events_timeout_ms` | `25000`                  | Client-side cap on each `/events` long-poll before it is aborted and reissued (un-acked events survive). Clamped to `[250, 600000]` ms, so no value can make the loop spin uncapped. **Sizing it is a rate decision, not a latency one:** every cap spends `2` requests per subscribed topic — the parked poll, then the `dont_block=true` probe that tells a healthy idle cap from a black-holed server — so one topic costs `2 × 60000 / events_timeout_ms` requests a minute (≈5/min at the default; 480/min at the `250` floor) and N topics cost N times that. Zulip bills those against a per-**user** budget whose documented default is `200` requests/minute, so keep `topics × 2 × 60000 / events_timeout_ms` under your server's limit. The floor stops a runaway loop; it does not make every value above it affordable. |
+
+A key `backend_config` does not declare is a **load error** naming it and the accepted set — a
+typo'd `api_kye` would otherwise be a silent no-op that authenticates every request with the
+built-in default key. Every declared key is validated at `connect()`, which throws naming the
+offending key: `site_url` must be a
+bare absolute `http(s)` base URL — no `user:password@` (Zulip authenticates from `email`/`api_key`,
+and a credential in the URL would be echoed by every diagnostic that names the site) and no query or
+fragment. What is captured is the origin and path that check READ, not the string it was given, so a
+character the URL parser normalizes away but a string concatenation keeps — a delimiter carrying
+nothing, a `\`, a stray control byte — cannot survive into the path of every request; a value
+carrying an actual query or fragment is still a `connect()` error. `email`/`api_key`/`stream` must be
+non-empty, `stream` must additionally be a name the
+server's stream-indicator decoder leaves alone (see the table above), and `events_timeout_ms` must be
+a positive, finite number (`0` is an error, not "no cap"). A key that is present but empty (a bare
+`site_url:` in YAML) is reported rather than silently replaced by its default.
+
+A rejection echoes the offending value only when its type is the one the key declares; any other type
+is reported by shape, so a credential pasted into the wrong key is not disclosed. `site_url` never
+echoes its value at all: a URL's content is not the diagnostic — the requirement and the key name are
+— and every shape a mis-pasted secret arrives in is a `site_url` rejection, whether as an unparseable
+URL or as a URL whose *scheme* is the secret's first `:`-separated token. A `stream` the indicator
+decoder would reinterpret is likewise reported by what the server would address instead, not by the
+name, because a name that is valid JSON is exactly the shape a numeric credential arrives in.
 
 Secrets live in `backend_config` / `.env`, never in code.
 
@@ -91,6 +159,12 @@ provision a **distinct bot per session** if you want per-session attribution in 
 the same role `identity.handle` plays for SQLite/Redis/NATS, just carried in `backend_config`.
 `events_timeout_ms` is safe to vary per session.
 
+### What this costs, and what it does not
+
+What it costs is **transcript attribution**: every message a session posts reads as its bot's email,
+so with one shared bot you cannot tell two sessions apart in the history. A distinct bot per session
+buys that back; naming the bots after your handles makes the transcript read like your config.
+
 ## Retention (server-side, not configured by this plugin)
 
 Zulip supports organization- and stream-level
@@ -119,6 +193,22 @@ upstream-Zulip gotchas — see
   configured `EXTERNAL_HOST`; in Docker, a network alias for that hostname is the simplest fix.
   Configure `EXTERNAL_HOST` rather than hand-widening host validation in custom settings.
 
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-zulip --config parley.config.yaml
+# or: node packages/bridge-zulip/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-zulip
+parley-zulip --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another site url, bot email and api key, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Tests
 
 ```
@@ -130,4 +220,6 @@ The shared seam conformance suite (`@sharptrick/parley-conformance`) always runs
 long-polled event queues with heartbeats and a `gcQueues()` lever for the `BAD_EVENT_QUEUE_ID`
 recovery test). Set `PARLEY_ZULIP_URL`, `PARLEY_ZULIP_EMAIL`, and `PARLEY_ZULIP_API_KEY`
 (optionally `PARLEY_ZULIP_STREAM`, default `parley`) to additionally run the same suite against a
-real server — fresh topics in the configured stream are free, so no cleanup is needed.
+real server — fresh topics in the configured stream are free, so no cleanup is needed. Setting them
+is a request, not a hint: if one is missing, or the configured server does not answer the probe,
+the run FAILS naming what was wrong rather than skipping green.

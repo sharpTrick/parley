@@ -1,14 +1,33 @@
-import { spawn } from 'node:child_process';
-import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { MAX_PAGE } from './index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const pkgDir = join(here, '..');
+const repoRoot = join(pkgDir, '..', '..');
 // The built CLI (dist/cli.js) — the real orphaning drive runs the compiled entrypoint as a child.
-const CLI = join(here, '..', 'dist', 'cli.js');
+const CLI = join(pkgDir, 'dist', 'cli.js');
+
+/**
+ * A test that executes `dist/` grades whatever the last build left behind, so build it here rather
+ * than assuming a prior `npm run build`. `tsc -b` decides whether the artifact matches `src/`;
+ * `--force` is only for the case it gets wrong, a deleted `dist/` under a tsbuildinfo that still
+ * reports the project up to date.
+ */
+beforeAll(() => {
+  execFileSync('npx', ['tsc', '-b', 'packages/bridge-sqlite'], { cwd: repoRoot, stdio: 'pipe' });
+  if (!existsSync(CLI)) {
+    execFileSync('npx', ['tsc', '-b', 'packages/bridge-sqlite', '--force'], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+    });
+  }
+  expect(existsSync(CLI), `run \`npm run build\`: ${CLI} is missing`).toBe(true);
+}, 180_000);
 
 const tmpDirs: string[] = [];
 function tmp(): string {
@@ -20,42 +39,32 @@ afterAll(() => {
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
 });
 
-// BUG-38 (unit): the CLI's stdin EOF/close wiring must run shutdown() and must be idempotent under
-// the shuttingDown guard — 'end' + 'close' (or a signal racing EOF) must call shutdown ONCE. This
-// mirrors the exact wiring in cli.ts against a stdin stub.
-describe('stdin EOF shutdown wiring is idempotent (BUG-38, unit)', () => {
-  it('runs shutdown exactly once across end + close', async () => {
-    const stdin = new EventEmitter();
-    let shutdownCalls = 0;
-    // Replicate cli.ts's guarded shutdown wiring verbatim.
-    let shuttingDown = false;
-    const shutdown = (): void => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      shutdownCalls++;
-    };
-    stdin.on('end', shutdown);
-    stdin.on('close', shutdown);
+/**
+ * The argv table this file used to carry lives in `@sharptrick/parley-core`'s CLI module, where the
+ * one parser all ten bins run is graded once, and the spawned half — every bin, `--help`,
+ * `--version` and a refusal naming the flag — is a row per manifest in
+ * `@sharptrick/parley-conformance`. What stays here is what is about SQLITE: a config value this
+ * plugin constrains, a stale persisted cursor against this store, and the orphan drive.
+ */
 
-    stdin.emit('end');
-    stdin.emit('close'); // second event must be a no-op thanks to the guard
-    expect(shutdownCalls).toBe(1);
-  });
-});
-
-function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
+function writeConfig(
+  dir: string,
+  extra: Record<string, unknown> = {},
+  topLevel: string[] = [],
+): string {
   const cfgPath = join(dir, 'parley.config.yaml');
   const cfg = [
+    ...topLevel,
     'identity:',
     '  handle: eof-agent',
+    // Pin read-state inside this test's tmp dir, so that a run cannot resume from the previous
+    // run's cursor: instance_id defaults to the handle, so the default XDG path is shared across
+    // runs while `db_path` is fresh each time — and a cursor minted by a deleted store is fatal.
+    `state_path: ${join(dir, 'read-state.json')}`,
     'topics:',
     '  - ctx',
     'live_push:',
     '  enabled: true',
-    'presence:',
-    '  enabled: true',
-    '  heartbeat_ms: 500',
-    '  ttl_ms: 2000',
     'backend_config:',
     `  db_path: ${join(dir, 'eof.db')}`,
     '  poll_interval_ms: 100',
@@ -65,10 +74,121 @@ function writeConfig(dir: string, extra: Record<string, unknown> = {}): string {
   return cfgPath;
 }
 
-// BUG-38 (end-to-end): spawn the built CLI with a piped stdin, wait for "bridge up", then close the
+/** Start the built CLI on `cfgPath` and report whether it came up or died before it could. */
+async function runBridge(
+  cfgPath: string,
+): Promise<{ verdict: 'up' | 'exited'; code: number | null; stderr: string }> {
+  const child = spawn(process.execPath, [CLI, '--config', cfgPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  const outcome = await new Promise<{ verdict: 'up' | 'exited'; code: number | null }>(
+    (resolve, reject) => {
+      const to = setTimeout(() => reject(new Error(`no verdict in 15s: ${stderr}`)), 15_000);
+      child.stderr.on('data', (d: Buffer) => {
+        stderr += d.toString();
+        if (stderr.includes('bridge up')) {
+          clearTimeout(to);
+          resolve({ verdict: 'up', code: null });
+        }
+      });
+      child.on('exit', (code) => {
+        clearTimeout(to);
+        resolve({ verdict: 'exited', code });
+      });
+    },
+  );
+  child.stdin.end();
+  child.kill('SIGKILL');
+  return { ...outcome, stderr };
+}
+
+/**
+ * Core validates `catchup.limit` as any positive integer and this plugin refuses a page above
+ * MAX_PAGE, so a config core certifies as valid can still stop the bridge — after connect() has
+ * opened the store. Either outcome is defensible; a rejection that does not name the key the
+ * operator has to change is not, because the only other way to find it is reading plugin source.
+ */
+describe('a core config value this plugin constrains starts or is refused by name (e2e)', () => {
+  const CASES = [
+    { limit: 1, starts: true },
+    { limit: MAX_PAGE, starts: true },
+    { limit: MAX_PAGE + 1, starts: false },
+  ];
+
+  for (const { limit, starts } of CASES) {
+    it(`catchup.limit ${limit} ${starts ? 'starts the bridge' : 'is refused by name'}`, async () => {
+      const dir = tmp();
+      const { verdict, stderr } = await runBridge(writeConfig(dir, {}, ['catchup:', `  limit: ${limit}`]));
+
+      if (starts) {
+        expect(verdict).toBe('up');
+        return;
+      }
+      expect(verdict).toBe('exited');
+      expect(stderr).not.toMatch(/bridge up/);
+      expect(stderr).toMatch(/parley-sqlite: fatal/);
+      // The operator's lever, named where they will read it.
+      expect(stderr).toContain('catchup.limit');
+      expect(stderr).toContain(String(MAX_PAGE));
+    });
+  }
+});
+
+/**
+ * The README tells an operator what a stale persisted cursor costs. Stated smaller than the price
+ * the process actually pays, it sends them hunting for one lost page while the bridge is refusing
+ * to start at all — so the prose and the process verdict are graded in the same row, and a change
+ * to either that desynchronizes them turns this red.
+ */
+describe('the documented cost of a stale persisted cursor is the cost the CLI pays (e2e)', () => {
+  const README = readFileSync(join(pkgDir, 'README.md'), 'utf8').replace(/\s+/g, ' ');
+
+  const CASES: Array<{ name: string; cursor: string; starts: boolean; documented: RegExp }> = [
+    {
+      name: 'an unparseable cursor left behind by another backend',
+      cursor: 's123_456',
+      starts: false,
+      documented: /the bridge exits non-zero on every start until the stale read-state is cleared/,
+    },
+    {
+      name: 'a foreign but numeric cursor',
+      cursor: '123456789',
+      starts: true,
+      documented: /merely \*numeric\*[^.]{0,160}replays instead of stopping the bridge/,
+    },
+  ];
+
+  for (const c of CASES) {
+    it(`${c.name} ${c.starts ? 'replays and the bridge starts' : 'stops the bridge until read-state is cleared'}`, async () => {
+      expect(README).toMatch(c.documented);
+
+      const dir = tmp();
+      const cfgPath = writeConfig(dir);
+      const statePath = join(dir, 'read-state.json');
+      writeFileSync(statePath, JSON.stringify({ ctx: c.cursor }));
+
+      const { verdict, code, stderr } = await runBridge(cfgPath);
+
+      if (c.starts) {
+        expect(verdict).toBe('up');
+        return;
+      }
+      expect(verdict).toBe('exited');
+      expect(code).not.toBe(0);
+      expect(stderr).not.toMatch(/bridge up/);
+      expect(stderr).toMatch(/parley-sqlite: fatal/);
+      expect(stderr).toMatch(/malformed cursor/);
+      // The one file an operator has to touch to get the bridge back.
+      expect(stderr).toContain(statePath);
+    });
+  }
+});
+
+// End-to-end: spawn the built CLI with a piped stdin, wait for "bridge up", then close the
 // parent's write end (EOF WITHOUT a signal — the orphaned-parent scenario). The child must run
-// shutdown() and EXIT promptly, rather than lingering with the live poll loop + presence heartbeat.
-describe('orphaned stdio bridge exits on stdin EOF (BUG-38, e2e)', () => {
+// shutdown() and EXIT promptly, rather than lingering with the live poll loop.
+describe('orphaned stdio bridge exits on stdin EOF (e2e)', () => {
   it('exits within a short timeout after the parent closes stdin (no signal)', async () => {
     const dir = tmp();
     const cfgPath = writeConfig(dir);
@@ -76,7 +196,7 @@ describe('orphaned stdio bridge exits on stdin EOF (BUG-38, e2e)', () => {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Wait for the bridge to be fully up (poll loop + presence heartbeat live) before EOF.
+    // Wait for the bridge to be fully up (poll loop live) before EOF.
     await new Promise<void>((resolve, reject) => {
       let buf = '';
       const to = setTimeout(() => reject(new Error('bridge did not start: ' + buf)), 10_000);
@@ -107,7 +227,7 @@ describe('orphaned stdio bridge exits on stdin EOF (BUG-38, e2e)', () => {
 
     if (result === 'timeout') {
       child.kill('SIGKILL');
-      throw new Error('CLI did not exit on stdin EOF within 5s — it kept heart-beating (ghost peer)');
+      throw new Error('CLI did not exit on stdin EOF within 5s — its poll loop kept the process alive');
     }
     // Exited with no signal → it ran its own clean shutdown() from the EOF handler.
     expect(result.signal).toBeNull();

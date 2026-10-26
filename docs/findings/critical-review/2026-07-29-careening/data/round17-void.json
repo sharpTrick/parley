@@ -1,0 +1,34 @@
+{
+  "round": "17-void",
+  "status": "VOID — not a measurement. Recorded so the run's token accounting stays honest and the failure is not repeatable.",
+  "whatHappened": "All fifteen critics reviewed /tmp/careening/worktrees/<target> pinned at b5cd4b8, a round-13-era commit, so the tree they graded was missing every fix from rounds 13, 14, 15 and 16. They returned 107 findings, 103 confirmed, 40 blocking, 0 errored — a result indistinguishable in shape from a valid round.",
+
+  "cost": {
+    "subagentTokens": 3120232,
+    "toolCalls": 921,
+    "wallMs": 11160803,
+    "note": "Plus a container reprovision that killed the first launch four minutes in, before any journal was written."
+  },
+
+  "rootCause": "The runner cannot create or inspect a worktree — a workflow script has no filesystem access — so it only tells a critic which directory to cd into. Worktree creation was an unwritten operator step. It was done by hand before round 16 and forgotten before round 17, and the stale directories from an earlier round were still on disk.",
+
+  "whyItLookedValid": "Every signal the round produces was healthy. Fifteen of fifteen ran, none errored, the finding counts and per-lens distribution sat inside the range of the previous four rounds, and each critic's `checked` field described a real, thorough review — of the wrong tree. Nothing in the returned record references a base commit, so nothing in the record could contradict it. It was caught only because one critic happened to quote its base sha in prose.",
+
+  "classification": "The same failure this experiment has been cataloguing at package scale, committed by the operator at harness scale: a self-report that does not survive being checked. In the code it was `agent()` returning null read as 'found nothing'. Here it was a full round of plausible findings read as 'the current tree'.",
+
+  "guardsAdded": [
+    "scripts/careening-preflight.mjs fails when any worktree is off HEAD, naming each and the sha it is actually at. Verified against the live failure rather than a synthetic one — which is how the second defect below was found.",
+    "Each critic is handed the expected base and told to rev-parse FIRST and return errored=true on a mismatch, so a round that starts anyway fails loudly instead of reviewing the wrong code. The runner cannot check this itself, so the check lives with the only actor that can.",
+    "packages/conformance/test/repo-contract.test.ts holds the runner's TARGETS and careening-worktrees.mjs's TARGETS to agreeing, comparing them against each other rather than pinning either, with a floor so a scan that stops matching cannot pass by finding nothing."
+  ],
+
+  "secondDefectFound": "careening-worktrees.mjs created FOURTEEN worktrees while the runner reviews FIFTEEN. The `repo` target was added to the runner at round 13 and never to the worktree script, so for four rounds the repo critic entered whatever a previous round had left in that directory. Two hand-maintained lists of the same thing — the class this experiment files repeatedly at package scale, sitting unexamined in its own harness the whole time.",
+
+  "whatWasNotDone": "The 107 findings were not salvaged. Some are certainly still live on the current tree and some were fixed in rounds 13-16, but separating them costs more than re-running the round, and a partially-verified set would contaminate the per-round series it would be filed into.",
+
+  "operatorErrorsThisSession": [
+    "Waited on three subagents that had died with a container reprovision, reading silence as work. Fixed by arming a staleness backstop at dispatch rather than after noticing.",
+    "Launched a round against stale worktrees. Fixed above.",
+    "Relaunched with a FABRICATED full sha for the base check — caught before the critics acted on it, by checking the value rather than trusting it. Had it stood, the new guard would have failed all fifteen critics loudly, which is the intended behaviour."
+  ]
+}

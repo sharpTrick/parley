@@ -27,7 +27,11 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "parley-slack": "./dist/cli.js"
   },
   "files": [
     "dist"
@@ -35,16 +39,17 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "typecheck:test": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@sharptrick/parley-core": "^0.1.0",
     "@sharptrick/parley-net-util": "^0.1.0",
+    "@types/ws": "^8.5.13",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@sharptrick/parley-conformance": "^0.1.0",
-    "@types/ws": "^8.5.13"
+    "@sharptrick/parley-conformance": "^0.1.0"
   },
   "keywords": [
     "mcp",

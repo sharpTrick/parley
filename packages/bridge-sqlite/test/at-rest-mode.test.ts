@@ -1,0 +1,330 @@
+import { chmodSync, existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { type openDriver as OpenDriver, openDriver } from '../src/driver.js';
+
+const hoisted = vi.hoisted(() => ({ chmodFails: false }));
+vi.mock('node:fs', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...real,
+    default: real,
+    chmodSync: (p: string, m: number) => {
+      if (hoisted.chmodFails) {
+        throw Object.assign(new Error('EPERM: operation not permitted, chmod'), { code: 'EPERM' });
+      }
+      real.chmodSync(p, m);
+    },
+  };
+});
+
+/**
+ * At-rest permissions across the states a store is actually found in — brand new, already locked
+ * down, or left group/world-readable by an older version. The mode must end at 0600 in every case,
+ * and any time the store is (or stays) readable by another account the operator must be told,
+ * never silently.
+ *
+ * Every case OWNS its umask rather than inheriting the runner's, because the umask is what decides
+ * how much of this is graded: under 0077 the driver's own create is already 0600, so the entire
+ * pre-creation window can be deleted with every assertion here still passing. Nothing in
+ * `.github/workflows/ci.yml` or `vitest.config.ts` pins one.
+ */
+
+const mode = (f: string): number => statSync(f).mode & 0o777;
+const dir = () => mkdtempSync(join(tmpdir(), 'parley-mode-'));
+
+const UMASKS = [0o000, 0o022, 0o077];
+const oct = (m: number): string => `0${m.toString(8).padStart(3, '0')}`;
+
+let previousUmask: number | undefined;
+const controls = dir();
+let controlsWritten = 0;
+/**
+ * Establish the umask this case needs, and prove it took — on a file the fixture creates fresh,
+ * never on one the host's own umask decides, so that a run under a hardened umask still grades the
+ * narrowing rather than reporting the host. Keep the name unique per call, so that re-opening an
+ * earlier case's file (which keeps the mode it was created with) cannot stand in for this one.
+ */
+function withUmask(mask: number): void {
+  previousUmask ??= process.umask(mask);
+  const control = join(controls, `control-${controlsWritten++}`);
+  writeFileSync(control, '');
+  expect(mode(control), `umask ${oct(mask)} did not take effect`).toBe(0o666 & ~mask);
+}
+afterEach(() => {
+  if (previousUmask !== undefined) process.umask(previousUmask);
+  previousUmask = undefined;
+  vi.doUnmock('node:module');
+  vi.resetModules();
+});
+
+/**
+ * A copy of the driver whose native constructor records what was on disk at the instant it ran.
+ * The pre-creation claim is about a WINDOW, and the final mode cannot see one: the only moment the
+ * window is observable is the driver's own open.
+ */
+async function loadRecordingDriver(): Promise<{
+  openDriver: typeof OpenDriver;
+  atOpen: () => { existed: boolean; mode?: number };
+  opens: () => number;
+}> {
+  const seen: Array<{ existed: boolean; mode?: number }> = [];
+  vi.resetModules();
+  vi.doMock('node:module', async (importOriginal) => {
+    const real = await importOriginal<typeof import('node:module')>();
+    return {
+      ...real,
+      default: real,
+      createRequire: (from: string | URL) => {
+        const inner = real.createRequire(from);
+        const recording = ((id: string) => {
+          const mod: unknown = inner(id);
+          if (id !== 'better-sqlite3') return mod;
+          return new Proxy(mod as new (p: string) => object, {
+            construct: (target, args) => {
+              const path = String(args[0]);
+              seen.push(
+                existsSync(path) ? { existed: true, mode: mode(path) } : { existed: false },
+              );
+              return Reflect.construct(target, args) as object;
+            },
+          });
+        }) as unknown as NodeJS.Require;
+        return Object.assign(recording, inner);
+      },
+    };
+  });
+  const driver = await import('../src/driver.js');
+  return {
+    openDriver: driver.openDriver,
+    atOpen: () => seen[0] ?? { existed: false },
+    opens: () => seen.length,
+  };
+}
+
+describe('the store is claimed at 0600 before the driver can create it', () => {
+  for (const umask of UMASKS) {
+    it(`umask ${oct(umask)}: the file the driver opens already exists at 0600`, async () => {
+      withUmask(umask);
+      const { openDriver: recording, atOpen } = await loadRecordingDriver();
+      const d = recording(join(dir(), 'p.db'));
+      d.close();
+      expect(
+        atOpen(),
+        'nothing was recorded: the native constructor never ran, so this graded no window at all',
+      ).toEqual({ existed: true, mode: 0o600 });
+    });
+  }
+});
+
+/**
+ * Whether a path names a file is a question about what the OPEN did, never about the shape of the
+ * string: the two drivers disagree about what a path means — node:sqlite resolves SQLite URIs,
+ * better-sqlite3 opens a file literally named after one — so any classification of the string alone
+ * exempts some form from a hardening it never looked at, and does so silently, on a real store.
+ *
+ * Each row states only the path and what was lying at it beforehand. Every expectation is read back
+ * from the directory afterwards, so a form nobody has thought of yet is graded the moment somebody
+ * adds it, and a driver that starts or stops putting one on disk moves the grading with it rather
+ * than going vacuous. `:memory:` is in the table for the other direction: the one path that must
+ * NOT be forced onto the on-disk arm, where the WAL gate would refuse it.
+ *
+ * A file the open never touched is not this package's to narrow — planting one at `:memory:` proves
+ * nothing about `:memory:` — so which files are graded is derived too: a file is the store's if the
+ * open created it or wrote to it, never if it was left where it lay. Without the pre-existing arm
+ * the whole table can pass on the pre-creation alone, since SQLite takes the sidecars' mode from
+ * the database file it already found at 0600, and the repair path is graded by nothing.
+ */
+const PATHS = [
+  ':memory:',
+  'p.db',
+  './p.db',
+  'p.db?x=1',
+  'file::memory:',
+  'file::memory:?cache=shared',
+  'file:p.db',
+  'file:p.db?mode=ro',
+];
+
+let previousCwd: string | undefined;
+function inScratchDir(): void {
+  previousCwd ??= process.cwd();
+  process.chdir(dir());
+}
+afterEach(() => {
+  if (previousCwd !== undefined) process.chdir(previousCwd);
+  previousCwd = undefined;
+});
+
+const FOUND: Array<{ name: string; planted?: number }> = [
+  { name: 'nothing there yet' },
+  { name: 'left 0644 by an older build', planted: 0o644 },
+  { name: 'left 0666 by an older build', planted: 0o666 },
+];
+
+describe.each(UMASKS.map(oct))('every path form is hardened by what it put on disk (umask %s)', (label) => {
+  const umask = Number.parseInt(label, 8);
+  for (const spec of PATHS) {
+    for (const found of FOUND) {
+      it(`${JSON.stringify(spec)}, ${found.name}: nothing this open touched is readable beyond its owner`, async () => {
+        withUmask(umask);
+        inScratchDir();
+        const here = process.cwd();
+        if (found.planted !== undefined) {
+          writeFileSync(spec, '');
+          chmodSync(spec, found.planted);
+        }
+        const preExisted = existsSync(spec);
+        const before = new Map(
+          readdirSync(here).map((f) => [f, statSync(join(here, f)).size] as const),
+        );
+        const { openDriver: recording, atOpen, opens } = await loadRecordingDriver();
+        const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        let touched: Array<[string, string]> = [];
+        let lines: string[] = [];
+        let storeGrew = false;
+        let store: ReturnType<typeof openDriver> | undefined;
+        try {
+          try {
+            store = recording(spec);
+            store.exec('CREATE TABLE t (x)');
+            store.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+          } catch {
+            // A form the driver refuses still has to leave nothing exposed behind it.
+          }
+          // Read the directory before close(): the checkpoint on close removes the sidecars.
+          touched = readdirSync(here)
+            .sort()
+            .filter((f) => statSync(join(here, f)).size !== before.get(f))
+            .map((f) => [f, oct(mode(join(here, f)))]);
+          storeGrew = existsSync(spec) && statSync(spec).size > 0;
+          lines = spy.mock.calls.map(([l]) => String(l));
+        } finally {
+          store?.close();
+          spy.mockRestore();
+        }
+
+        expect(opens(), 'the driver constructor never ran: this row graded no open at all').toBe(1);
+        expect(
+          touched.filter(([, m]) => (Number.parseInt(m, 8) & 0o077) !== 0),
+          `openDriver(${JSON.stringify(spec)}) left part of the store readable by other accounts`,
+        ).toEqual([]);
+
+        if (!preExisted && existsSync(spec)) {
+          expect(
+            atOpen(),
+            `openDriver(${JSON.stringify(spec)}) put a file on disk that the driver, not the ` +
+              `pre-creation, created: it was world-readable for the width of the open`,
+          ).toEqual({ existed: true, mode: 0o600 });
+        }
+
+        // Pre-creation cannot narrow a file it did not create — SQLite copies the sidecars' mode
+        // from the database file it found — so a store adopted from an older build is repaired by
+        // the chmod path or not at all, and only the report proves that path ran.
+        if (preExisted && storeGrew) {
+          expect(
+            lines.filter((l) => /tightened/.test(l)).join(''),
+            `openDriver(${JSON.stringify(spec)}) adopted a 0${(found.planted ?? 0).toString(8)} ` +
+              `store without narrowing it`,
+          ).toMatch(/tightened/);
+        }
+      });
+    }
+  }
+});
+
+/**
+ * The store is three files, and the message content lives in the `-wal` as much as in the `.db`.
+ * An unclean shutdown of a looser build leaves a sidecar behind at its own mode, so each file has
+ * to be inspected on its own — a sidecar SQLite happens to create by inheriting the tightened
+ * `.db` mode proves nothing about one already on disk.
+ */
+const SUFFIX = { db: '', wal: '-wal', shm: '-shm' } as const;
+type StoreFile = keyof typeof SUFFIX;
+const FILES: StoreFile[] = ['db', 'wal', 'shm'];
+
+const PRE_EXISTING: Array<{
+  name: string;
+  setup: Partial<Record<StoreFile, number>>;
+  narrowed: StoreFile[];
+}> = [
+  { name: 'absent', setup: {}, narrowed: [] },
+  { name: 'db 0600', setup: { db: 0o600 }, narrowed: [] },
+  { name: 'db 0640', setup: { db: 0o640 }, narrowed: ['db'] },
+  { name: 'db 0644', setup: { db: 0o644 }, narrowed: ['db'] },
+  { name: 'db 0660', setup: { db: 0o660 }, narrowed: ['db'] },
+  { name: 'db 0666', setup: { db: 0o666 }, narrowed: ['db'] },
+  { name: 'db 0600, wal 0644', setup: { db: 0o600, wal: 0o644 }, narrowed: ['wal'] },
+  { name: 'db 0644, wal 0600', setup: { db: 0o644, wal: 0o600 }, narrowed: ['db'] },
+  { name: 'db 0600, shm 0666', setup: { db: 0o600, shm: 0o666 }, narrowed: ['shm'] },
+  {
+    name: 'db 0600, wal 0640, shm 0660',
+    setup: { db: 0o600, wal: 0o640, shm: 0o660 },
+    narrowed: ['wal', 'shm'],
+  },
+  {
+    name: 'all three 0644',
+    setup: { db: 0o644, wal: 0o644, shm: 0o644 },
+    narrowed: ['db', 'wal', 'shm'],
+  },
+];
+
+describe.each(UMASKS.map(oct))('at-rest mode for every pre-existing store state (umask %s)', (label) => {
+  const umask = Number.parseInt(label, 8);
+  for (const c of PRE_EXISTING) {
+    it(`${c.name}: every file ends at 0600, each change reported once`, () => {
+      withUmask(umask);
+      const path = join(dir(), 'p.db');
+      for (const f of FILES) {
+        const preset = c.setup[f];
+        if (preset === undefined) continue;
+        writeFileSync(`${path}${SUFFIX[f]}`, '');
+        chmodSync(`${path}${SUFFIX[f]}`, preset);
+      }
+      const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      let lines: string[] = [];
+      let modes: number[] = [];
+      try {
+        const d = openDriver(path);
+        d.exec('CREATE TABLE t (x)');
+        d.prepare('INSERT INTO t (x) VALUES (?)').run(1);
+        lines = spy.mock.calls.map(([l]) => String(l));
+        // Read the sidecars before close(): the checkpoint on close removes them.
+        modes = FILES.map((f) => mode(`${path}${SUFFIX[f]}`));
+        d.close();
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(modes).toEqual([0o600, 0o600, 0o600]);
+
+      const tightened = lines
+        .map((l) => /tightened (\S+) from/.exec(l)?.[1])
+        .filter((f): f is string => f !== undefined);
+      expect(tightened).toEqual(c.narrowed.map((f) => `${path}${SUFFIX[f]}`));
+      expect(lines.filter((l) => /cannot restrict/.test(l))).toEqual([]);
+    });
+  }
+
+  it('a store that cannot be tightened is reported, not silently left open', () => {
+    withUmask(umask);
+    const path = join(dir(), 'p.db');
+    writeFileSync(path, '');
+    chmodSync(path, 0o644);
+    const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let lines: string[] = [];
+    try {
+      // Stands in for the multi-UID deployment: a store owned by another account, where chmod
+      // fails with EPERM and the process must not assume the store is protected.
+      hoisted.chmodFails = true;
+      const d = openDriver(path);
+      lines = spy.mock.calls.map(([l]) => String(l));
+      d.close();
+    } finally {
+      hoisted.chmodFails = false;
+      spy.mockRestore();
+    }
+    expect(lines.some((l) => /cannot restrict/.test(l) && l.includes(path))).toBe(true);
+  });
+});

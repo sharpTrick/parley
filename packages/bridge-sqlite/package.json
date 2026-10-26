@@ -5,7 +5,7 @@
   "description": "Parley SQLite backend: zero-infra, polling-only seam implementation. The seam-proving reference backend.",
   "license": "MIT",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.5.0"
   },
   "repository": {
     "type": "git",
@@ -27,7 +27,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "parley-sqlite": "./dist/cli.js"
@@ -37,15 +38,19 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -b tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@sharptrick/parley-core": "^0.1.0",
+    "@sharptrick/parley-core": "^0.1.0"
+  },
+  "optionalDependencies": {
     "better-sqlite3": "^12"
   },
   "devDependencies": {
     "@sharptrick/parley-conformance": "^0.1.0",
+    "@sharptrick/parley-net-util": "^0.1.0",
     "@types/better-sqlite3": "^7"
   },
   "keywords": [

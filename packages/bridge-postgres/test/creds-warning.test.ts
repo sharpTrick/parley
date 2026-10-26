@@ -1,54 +1,247 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { type ConfigRisk, configRisks, DEFAULT_URL, describeRisk } from '../src/config.js';
 import { PostgresPlugin } from '../src/index.js';
 
-// SEC-06 — Postgres must not silently connect with the repo-public default DSN
+// Postgres must not silently connect with the repo-public default DSN
 // (postgres://parley:parley@…). connect() opens a pool and runs the idempotent schema bootstrap,
 // so mock `pg` to a no-op pool/client; the warning fires before `new Pool(...)`. The mock lets the
 // whole connect() resolve so the gate sits on the happy path, not an incidental connection failure.
-vi.mock('pg', () => {
-  const makeClient = () => ({
-    query: vi.fn(async () => ({ rows: [] })),
-    release: vi.fn(),
-    on: vi.fn(),
-    connect: vi.fn(async () => undefined),
-    end: vi.fn(async () => undefined),
-  });
+//
+// Each risk is graded as the VALUE `configRisks` returns, never as words of the sentence: a warning
+// reworded to say the password never crosses the network in the clear still says `url`, `TLS off`
+// and `sslmode=require`. Of the sentence, only DELIVERY is graded: a SECURITY line on the risk's own
+// channel, rendered from that risk, naming every part of it.
+vi.mock('pg', async () => {
+  const { FakeIdleClient, fakePool } = await import('./fake-pg.js');
+
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => makeClient()),
-      query: vi.fn(async () => ({ rows: [] })),
-      end: vi.fn(async () => undefined),
-    })),
-    Client: vi.fn(() => makeClient()),
+    Pool: vi.fn(() => fakePool()),
+    Client: FakeIdleClient,
   };
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-describe('Postgres default-credential warning (SEC-06)', () => {
-  it('warns once, naming the backend and the key to set, when url is omitted', async () => {
+const DEFAULT_USER = 'parley';
+const DEFAULT_PASSWORD = 'parley';
+
+const DEFAULT_RISK: ConfigRisk = { key: 'url', sharedDefault: `${DEFAULT_USER}:${DEFAULT_PASSWORD}` };
+const isDefaultRisk = (risk: ConfigRisk): boolean => 'sharedDefault' in risk;
+
+/** One line, marked as a security finding, rendered FROM the risk and naming every part of it. */
+const expectDelivered = (lines: readonly string[], risk: ConfigRisk, tag: string): void => {
+  const shown = lines.filter((l) => l.includes(describeRisk(risk)));
+  expect(shown, 'no warning renders the risk').toHaveLength(1);
+  expect(shown[0]).toContain(`${tag} SECURITY`);
+  for (const part of Object.values(risk).flatMap((v: unknown) => (Array.isArray(v) ? v : [v]))) {
+    expect(shown[0], `never names ${String(part)}`).toContain(String(part));
+  }
+};
+
+// The warning must key on the CREDENTIALS PG WILL ACTUALLY AUTHENTICATE WITH, not on a literal DSN
+// string and not on the userinfo alone: the README tells the operator to provision exactly
+// parley/parley, so every spelling that delivers that pair to the server is the same published
+// password. `new Pool({connectionString})` parses with pg-connection-string, which honours the libpq
+// `?user=`/`?password=` query parameters and percent-decodes userinfo — so a DSN can carry the
+// published pair with an empty userinfo and authenticate fine.
+const DSN_CASES: [label: string, url: string | undefined, warns: boolean][] = [
+  ['url omitted (falls back to the default)', undefined, true],
+  ['the exact default DSN', 'postgres://parley:parley@127.0.0.1:5432/parley', true],
+  ['default creds via localhost', 'postgres://parley:parley@localhost:5432/parley', true],
+  ['default creds via a docker-network host', 'postgres://parley:parley@db/parley', true],
+  ['default creds, port omitted', 'postgres://parley:parley@127.0.0.1/parley', true],
+  ['default creds, different database', 'postgres://parley:parley@127.0.0.1:5432/other', true],
+  ['default creds, postgresql:// scheme', 'postgresql://parley:parley@db.internal:6432/app', true],
+  ['default creds as libpq query params', 'postgres://127.0.0.1:5432/parley?user=parley&password=parley', true],
+  ['default creds as query params, other params too', 'postgres://db/parley?application_name=x&user=parley&password=parley&sslmode=disable', true],
+  ['default user in userinfo, default password as a query param', 'postgres://parley@db:5432/parley?password=parley', true],
+  ['default creds percent-encoded in the userinfo', 'postgres://%70arley:%70arley@127.0.0.1/parley', true],
+  ['default user, real password', 'postgres://parley:hunter2@127.0.0.1:5432/parley', false],
+  ['real user, default password', 'postgres://app:parley@127.0.0.1:5432/parley', false],
+  ['a real DSN', 'postgres://app:s3cret@db.example.com:5432/prod', false],
+  ['real user as a query param, default password', 'postgres://db/parley?user=app&password=parley', false],
+  ['default user as a query param, real password', 'postgres://db/parley?user=parley&password=s3cret', false],
+];
+
+describe('Postgres default-credential warning (default DSN)', () => {
+  it.each(DSN_CASES)('%s', async (_label, url, warns) => {
+    const warn = spyWarn();
+    await new PostgresPlugin().connect(url === undefined ? {} : { url });
+    expect(warn).toHaveBeenCalledTimes(warns ? 1 : 0);
+    expect(configRisks(url ?? DEFAULT_URL).filter(isDefaultRisk)).toEqual(warns ? [DEFAULT_RISK] : []);
+  });
+
+  it('is delivered as the default-credential risk on console.warn', async () => {
     const warn = spyWarn();
     await new PostgresPlugin().connect({});
-    expect(warn).toHaveBeenCalledTimes(1);
-    const msg = String(warn.mock.calls[0]?.[0]);
-    expect(msg).toContain('parley-postgres');
-    expect(msg).toContain('url');
+    expect(configRisks(DEFAULT_URL)).toEqual([DEFAULT_RISK]);
+    expectDelivered(
+      warn.mock.calls.map((c) => String(c[0])),
+      DEFAULT_RISK,
+      '[parley-postgres]',
+    );
+  });
+});
+
+// The table above is a hand-listed set, and a hand-listed set only ever grades the spellings someone
+// thought of. So the same property is also generated: place each (user, password) pair into each
+// spelling pg accepts, and drive the expectation off the pair that was PUT IN rather than off the
+// parser the implementation uses — otherwise the test agrees with the code by construction.
+type Carrier = (user: string, password: string) => string;
+
+const HOST = 'db.internal:6432/parley';
+const encodeFirst = (v: string): string =>
+  `%${v.charCodeAt(0).toString(16)}${v.slice(1)}`;
+
+const CARRIERS: [name: string, build: Carrier][] = [
+  ['userinfo', (u, p) => `postgres://${u}:${p}@${HOST}`],
+  ['libpq query params', (u, p) => `postgres://${HOST}?user=${u}&password=${p}`],
+  ['userinfo user + query password', (u, p) => `postgres://${u}@${HOST}?password=${p}`],
+  ['query user + userinfo password', (u, p) => `postgres://:${p}@${HOST}?user=${u}`],
+  ['percent-encoded userinfo', (u, p) => `postgres://${encodeFirst(u)}:${encodeFirst(p)}@${HOST}`],
+  ['postgresql:// scheme, query params', (u, p) => `postgresql://${HOST}?user=${u}&password=${p}`],
+];
+
+const USERS = [DEFAULT_USER, 'app'];
+const PASSWORDS = [DEFAULT_PASSWORD, 'hunter2'];
+
+const GENERATED = CARRIERS.flatMap(([carrier, build]) =>
+  USERS.flatMap((user) =>
+    PASSWORDS.map((password) => ({
+      label: `${carrier}: ${user}/${password}`,
+      url: build(user, password),
+      warns: user === DEFAULT_USER && password === DEFAULT_PASSWORD,
+    })),
+  ),
+);
+
+describe('every spelling that delivers the published pair warns, and only those', () => {
+  it.each(GENERATED.map((c) => [c.label, c] as const))('%s', async (_label, cell) => {
+    const warn = spyWarn();
+    await new PostgresPlugin().connect({ url: cell.url });
+    expect(warn, cell.url).toHaveBeenCalledTimes(cell.warns ? 1 : 0);
+    expect(configRisks(cell.url).filter(isDefaultRisk)).toEqual(cell.warns ? [DEFAULT_RISK] : []);
   });
 
-  it('warns when url is set literally to the well-known default DSN', async () => {
+  // Pin the carrier list by value as well: a table generated from it cannot notice a spelling
+  // being dropped out of it, and dropping the query-param carrier is exactly the miss this covers.
+  it('grades every spelling pg honours', () => {
+    expect(CARRIERS.map(([name]) => name)).toEqual([
+      'userinfo',
+      'libpq query params',
+      'userinfo user + query password',
+      'query user + userinfo password',
+      'percent-encoded userinfo',
+      'postgresql:// scheme, query params',
+    ]);
+  });
+});
+
+// A DSN can carry no credentials at all and still authenticate as parley/parley: pg falls back to
+// PGUSER/PGPASSWORD, so the effective credentials are not always in the string.
+const ENV_CASES: [label: string, user: string, password: string, warns: boolean][] = [
+  ['PGUSER and PGPASSWORD both default', DEFAULT_USER, DEFAULT_PASSWORD, true],
+  ['PGUSER real, PGPASSWORD default', 'app', DEFAULT_PASSWORD, false],
+  ['PGUSER default, PGPASSWORD real', DEFAULT_USER, 's3cret', false],
+];
+
+describe('credentials taken from the environment are graded too', () => {
+  it.each(ENV_CASES)('%s', async (_label, user, password, warns) => {
+    vi.stubEnv('PGUSER', user);
+    vi.stubEnv('PGPASSWORD', password);
     const warn = spyWarn();
-    await new PostgresPlugin().connect({ url: 'postgres://parley:parley@127.0.0.1:5432/parley' });
-    expect(warn).toHaveBeenCalledTimes(1);
+    await new PostgresPlugin().connect({ url: `postgres://${HOST}` });
+    expect(warn).toHaveBeenCalledTimes(warns ? 1 : 0);
+  });
+});
+
+// CLASS: a configurable endpoint that carries a SECRET and can be dialled without encryption. Every
+// other backend classifies its own; this one did not, and it is the backend whose published default
+// DSN embeds a password. Postgres has no encrypted SCHEME to key on — `postgres://` is TLS or not
+// according to `sslmode`/`ssl` — so the axis is (host spelling × the SSL settings pg itself reads),
+// and the warning must name the KEY and the ORIGIN and neither the password nor the database.
+// It stays a WARNING, not a load error: the loopback dev server is plaintext by construction.
+
+const stderrLines = async (config: Record<string, unknown>): Promise<string[]> => {
+  const spy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  await new PostgresPlugin().connect(config);
+  return spy.mock.calls
+    .map((c) => String(c[0]))
+    .filter((line) => line.startsWith('parley-postgres: SECURITY'));
+};
+
+const plaintextRisks = (url: string): ConfigRisk[] => configRisks(url).filter((r) => !isDefaultRisk(r));
+
+const SECRET = 'hunter2';
+
+/**
+ * Hosts that LOOK like a loopback spelling without being one, and loopback spellings that look
+ * remote. Where the classification cannot PROVE loopback it warns, because over-warning is the safe
+ * side of a credential that is about to cross a network.
+ */
+const TRANSPORT_HOSTS: [host: string, loopback: boolean][] = [
+  ['127.0.0.1:5432', true],
+  ['localhost', true],
+  ['[::1]:5432', true],
+  ['127.0.0.2', true],
+  ['db.example.com:5432', false],
+  ['10.0.0.4', false],
+  ['127.0.0.1.nip.io', false],
+  ['localhost.evil.com', false],
+  ['db', false],
+];
+
+describe('Postgres plaintext-credential warning classifies the transport, not the scheme', () => {
+  it.each(TRANSPORT_HOSTS)('%s', async (host, loopback) => {
+    const url = `postgres://app:${SECRET}@${host}/prod`;
+    const flagged = await stderrLines({ url });
+    const expected: ConfigRisk[] = loopback
+      ? []
+      : [{ key: 'url', origin: `postgres://${host}`, exposes: ['url'] }];
+    expect(plaintextRisks(url)).toEqual(expected);
+    expect(flagged).toHaveLength(expected.length);
+    for (const risk of expected) expectDelivered(flagged, risk, 'parley-postgres:');
   });
 
-  it('does NOT warn when a real DSN is supplied', async () => {
-    const warn = spyWarn();
-    await new PostgresPlugin().connect({ url: 'postgres://app:s3cret@db.example.com:5432/prod' });
-    expect(warn).not.toHaveBeenCalled();
+  it('never puts the credential or the database in the line it prints', async () => {
+    const flagged = await stderrLines({ url: `postgres://app:${SECRET}@db.example.com:5432/prod` });
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0]).not.toContain(SECRET);
+    expect(flagged[0]).not.toContain('app');
+    expect(flagged[0]).not.toContain('prod');
+  });
+
+  /** What pg reads as "encrypted", and what it reads as a credential to lose. */
+  const TRANSPORT_CASES: [label: string, url: string, warns: boolean][] = [
+    ['no ssl setting at all', `postgres://app:${SECRET}@db.example.com/prod`, true],
+    ['sslmode=disable', `postgres://app:${SECRET}@db.example.com/prod?sslmode=disable`, true],
+    ['sslmode=require', `postgres://app:${SECRET}@db.example.com/prod?sslmode=require`, false],
+    ['sslmode=verify-full', `postgres://app:${SECRET}@db.example.com/prod?sslmode=verify-full`, false],
+    ['ssl=true', `postgres://app:${SECRET}@db.example.com/prod?ssl=true`, false],
+    ['no credential to lose', 'postgres://db.example.com/prod', false],
+    ['a credential in libpq query params', `postgres://db.example.com/prod?user=app&password=${SECRET}`, true],
+    ['a password with no user', `postgres://:${SECRET}@db.example.com/prod`, true],
+    ['a user with no password', 'postgres://app@db.example.com/prod', true],
+    ['the postgresql:// spelling', `postgresql://app:${SECRET}@db.example.com/prod`, true],
+  ];
+
+  it.each(TRANSPORT_CASES)('%s', async (_label, url, warns) => {
+    const expected: ConfigRisk[] = warns
+      ? [{ key: 'url', origin: 'postgres://db.example.com', exposes: ['url'] }]
+      : [];
+    expect(plaintextRisks(url)).toEqual(expected);
+    const flagged = await stderrLines({ url });
+    expect(flagged).toHaveLength(expected.length);
+    for (const risk of expected) expectDelivered(flagged, risk, 'parley-postgres:');
+  });
+
+  it('the default DSN, which is loopback, stays silent about transport', async () => {
+    expect(plaintextRisks(DEFAULT_URL)).toEqual([]);
+    expect(await stderrLines({})).toEqual([]);
   });
 });

@@ -1,0 +1,21 @@
+{
+  "round": 20,
+  "base": "c34eab5",
+  "converged": false,
+  "blockingClean": false,
+  "wakeAll": false,
+  "wakeAllNote": "All 15 critics ran and none was skipped — quiescedTargets is empty, 15 done, 0 errored, which is the condition the wakeAll flag exists to guarantee. The flag itself was not passed on the invocation, so the round is RECORDED as not convergence-eligible. It does not change the verdict (99 confirmed, far from 0), but it is an operator invocation defect and it is recorded rather than argued away: convergence is computed, not judged.",
+  "counts": { "total": 101, "confirmed": 99, "plausible": 2, "blocking": 26, "errored": 0 },
+  "ranTargets": 15,
+  "quiescedTargets": 0,
+  "findingsByTarget": {
+    "core-seam": 5, "core-engine": 8, "core-auth": 7,
+    "sqlite": 8, "redis": 8, "postgres": 8, "matrix": 6, "xmpp": 6, "nats": 4,
+    "zulip": 4, "discord": 7, "slack": 8, "telegram": 8,
+    "shared": 6, "repo": 8
+  },
+  "tokens": 3044919,
+  "toolUses": 912,
+  "durationMs": 5968230,
+  "environmentNote": "Round 20's matrix and cross-package critics reviewed against a Synapse reset immediately before the round, after the round-19 gate investigation found one room holding 84% of the server's events. That is the correct state — it is what a deployment's server looks like on day one — but it is a CHANGED CONDITION between rounds 19 and 20, and any cross-round claim about matrix findings has to say so."
+}

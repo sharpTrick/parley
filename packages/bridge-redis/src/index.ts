@@ -5,74 +5,137 @@ import {
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
-  buildMessage,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
-  type Message,
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
-import { createClient } from 'redis';
+import {
+  createRedisClient,
+  openCommandClient,
+  type RedisClient,
+  serverRefusal,
+  unreachable,
+  withDeadline,
+} from './client.js';
+import { type RedisBackendConfig, resolveConfig, type ResolvedConfig } from './config.js';
+import {
+  errorText,
+  fromCaller,
+  fromServer,
+  isPluginError,
+  pluginError,
+  reportPlaintextCredential,
+} from './diagnostics.js';
+import { type Entry, rowToMessage } from './entry.js';
+import { assertMintedCursor, compareIds, MAX_ENTRY_ID, streamTail } from './entry-id.js';
+import { runReadLoop } from './read-loop.js';
 
-type RedisClient = ReturnType<typeof createClient>;
+export { createRedisClient } from './client.js';
+export { CONFIG_KEYS, DEFAULT_URL, type RedisBackendConfig } from './config.js';
 
-/** Plugin-specific backend_config. */
-export interface RedisBackendConfig {
-  /** Connection URL. Default `redis://127.0.0.1:6379`. */
-  url?: string;
-  /** Stream key prefix. Default `parley:`. One Redis Stream per topic: `<prefix><topic>`. */
-  key_prefix?: string;
-  /** XREAD BLOCK timeout (ms) — the loop re-checks for shutdown each interval. Default 2000. */
-  block_ms?: number;
-  /**
-   * Optional retention window in days: entries older than this are (approximately) trimmed on
-   * every `post` via `XADD`'s own `MINID` trim option — no separate job or connection. Omit for
-   * the default — keep every entry forever. A topic with no new posts isn't trimmed until its
-   * next post (trimming is opportunistic, tied to write activity, not a background timer).
-   */
-  retention_days?: number;
-}
+/**
+ * How many long-polling `fetchRecent` calls may hold a dedicated reader connection at once. Keep
+ * the cap, so that concurrent long-polls cannot exhaust the `maxclients` of a Redis every peer
+ * session shares: `XREAD BLOCK` holds its connection for the whole wait, and core neither limits
+ * `fetch_recent` concurrency nor cancels an abandoned one. `subscribe` readers are deliberately NOT
+ * counted: those are one per subscribed topic, bounded by the config.
+ */
+export const MAX_BLOCKING_READERS = 8;
+
+/**
+ * How often a long poll past that cap re-reads its window. It buys the wait with a small `XRANGE`
+ * on the shared command client instead of a socket of its own, so the cost of a caller past the cap
+ * is one cheap read per tick rather than one connection for the whole budget — and the wake latency
+ * it trades for that is bounded by this figure rather than by the caller's whole `block_ms`.
+ */
+const CAPPED_POLL_INTERVAL_MS = 100;
 
 /**
  * Redis Streams backend (DESIGN §6/§9) — the FIRST event-driven push backend. A Stream entry id
  * (`XADD *`, e.g. `1700-0`) is monotonic per stream and serves as BOTH `backendMsgId` (dedup key)
- * and `cursor` (order key). `fetchRecent` = `XRANGE` (exclusive `(since`); `subscribe` = an
- * `XREAD BLOCK` loop on a dedicated connection driven by REAL events, not a poll timer. Stream ids
- * are not lexically comparable, but core never compares cursors — Redis returns entries in order.
+ * and `cursor` (order key). `fetchRecent` = `XRANGE` (exclusive `(since`, except that a `since`
+ * past the stream's last generated id is treated as unset and replays the recent window, so
+ * catch-up self-heals); `subscribe` = an `XREAD BLOCK` loop on a dedicated connection driven by
+ * REAL events, not a poll timer. Stream ids are not lexically comparable, but core never compares
+ * cursors.
  */
 export class RedisPlugin implements BackendPlugin {
   private client?: RedisClient;
-  private prefix = 'parley:';
-  private blockMs = 2000;
-  private retentionDays?: number;
+  private cfg: ResolvedConfig = resolveConfig({});
   /**
-   * Per-connect generation token. Bumped on every `connect()`/`disconnect()`; each `subscribe()`
-   * captures the current value and gates its read loop on `gen === this.generation`. Because it
-   * only ever increases, a torn-down (or superseded) loop can never be revived by a later
-   * `connect()` — unlike a shared mutable boolean that a reconnect could reset (BUG-37).
+   * Per-connect generation token. Bumped on every `connect()`/`disconnect()`; each reader captures
+   * it and gates its continuations on `gen === this.generation`. Because it only ever increases, a
+   * superseded loop can never be revived by a later `connect()`, unlike a boolean a reconnect
+   * resets.
    */
   private generation = 0;
   private readonly readers: RedisClient[] = [];
+  /**
+   * Readers whose `connect()` has not settled yet. Keep the exclusion in `tearDown`, so that a
+   * reader is never disconnected mid-handshake: node-redis assigns its socket only once the TCP
+   * connect resolves, so a `disconnect()` before that flips the client to closed WITHOUT a socket
+   * to destroy, the handshake then completes onto a live socket, and every later `disconnect()`
+   * throws `ClientClosedError` — an orphan nothing can close. Whoever awaits the connect closes it
+   * instead.
+   */
+  private readonly connecting = new Set<RedisClient>();
+  private blockingReaders = 0;
+  /**
+   * Serializes `connect`/`disconnect`. Keep it, so that two overlapping lifecycle calls cannot both
+   * open a command client: each reads `this.client` before the other assigns it, and the loser's
+   * socket is then referenced by nothing and can never be closed — a leak that also holds the event
+   * loop open at shutdown.
+   */
+  private lifecycle: Promise<unknown> = Promise.resolve();
 
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as RedisBackendConfig;
-    this.prefix = cfg.key_prefix ?? 'parley:';
-    this.blockMs = cfg.block_ms ?? 2000;
-    this.retentionDays = cfg.retention_days;
-    this.generation++; // re-baseline the generation so a fresh connect can't revive a prior loop
-    const client = createClient({ url: cfg.url ?? 'redis://127.0.0.1:6379' });
-    client.on('error', () => {
-      /* transient connection errors surface via command rejections; don't crash the process */
-    });
-    await client.connect();
-    this.client = client;
+    return this.serialize(() => this.open(config as RedisBackendConfig));
   }
 
   async disconnect(): Promise<void> {
-    this.generation++; // supersede every in-flight/straggler subscribe loop so they exit deterministically
+    return this.serialize(() => this.tearDown());
+  }
+
+  /**
+   * Keep every backend refusal labelled, so that a repurposed key or a revoked ACL reaches the
+   * operator naming the plugin, the topic and the Redis key rather than as a bare RESP line
+   * (`WRONGTYPE Operation against a key holding the wrong kind of value`) that names none of them.
+   */
+  private async labelled<T>(topic: Topic, key: string, work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (err) {
+      if (isPluginError(err)) throw err;
+      const text = fromServer(this.cfg.url, errorText(err));
+      throw pluginError(
+        `parley-redis: ${text} (topic '${fromCaller(topic)}', key '${fromCaller(key)}')`,
+      );
+    }
+  }
+
+  private serialize<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.lifecycle.then(work, work); // whichever way the previous call settled
+    this.lifecycle = run.catch(() => undefined);
+    return run;
+  }
+
+  private async open(cfg: RedisBackendConfig): Promise<void> {
+    const resolved = resolveConfig(cfg);
+    reportPlaintextCredential(resolved.url);
+    // Tear the previous connection down first, so that a re-connect cannot orphan a live socket per
+    // call until Redis hits maxclients. It also re-baselines the generation, killing prior loops.
+    await this.tearDown();
+    this.cfg = resolved;
+    this.client = await openCommandClient(resolved.url, resolved.connectTimeoutMs);
+  }
+
+  private async tearDown(): Promise<void> {
+    this.generation++;
     for (const reader of this.readers.splice(0)) {
+      if (this.connecting.has(reader)) continue;
       await reader.disconnect().catch(() => undefined);
     }
     if (this.client !== undefined) {
@@ -87,191 +150,204 @@ export class RedisPlugin implements BackendPlugin {
     content: string,
     opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    const id = await this.require().xAdd(
-      this.key(topic),
-      '*',
-      {
-        sender: identity,
-        content,
-        ts: new Date().toISOString(),
-        in_reply_to: opts?.inReplyTo ?? '',
-      },
-      this.retentionDays !== undefined
-        ? {
-            TRIM: {
-              strategy: 'MINID',
-              strategyModifier: '~',
-              threshold: Date.now() - this.retentionDays * 86_400_000,
-            },
-          }
-        : undefined,
+    const key = this.key(topic);
+    const { retentionDays } = this.cfg;
+    const id = await this.labelled(topic, key, () =>
+      this.require().xAdd(
+        key,
+        '*',
+        {
+          sender: identity,
+          content,
+          ts: new Date().toISOString(),
+          in_reply_to: opts?.inReplyTo ?? '',
+        },
+        retentionDays !== undefined
+          ? {
+              TRIM: {
+                strategy: 'MINID',
+                strategyModifier: '~',
+                // Keep the floor, so that a window whose millisecond product is not whole (30/7,
+                // 1e-6 — both accepted by the validator) cannot reach Redis as a fractional stream
+                // id and make EVERY post fail against a `connect()` that already resolved.
+                threshold: Math.floor(Date.now() - retentionDays * 86_400_000),
+              },
+            }
+          : undefined,
+      ),
     );
     return asBackendMsgId(id);
   }
 
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
     const key = this.key(args.topic);
+    return this.labelled(args.topic, key, () => this.readWindow(args, key));
+  }
+
+  private async readWindow(args: FetchRecentArgs, key: string): Promise<FetchRecentResult> {
     const limit = args.limit ?? 100;
-    let entries: Array<{ id: string; message: Record<string, string> }>;
-    if (args.since === undefined) {
-      // Default window: the most recent `limit` entries, returned ascending by cursor.
+    if (args.since !== undefined) assertMintedCursor(args.topic, args.since);
+    let since: string | undefined = args.since;
+    let entries: Entry[];
+    if (since === undefined) {
       entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
     } else {
-      // Exclusive: strictly after `since`, ascending. `(` makes XRANGE start exclusive.
-      entries = await this.require().xRange(key, `(${args.since}`, '+', { COUNT: limit });
-      // Native long-poll (issue #20): the canonical XRANGE was empty and the caller granted a
-      // budget → wait up to `blockMs` for entries strictly after `since`. XREAD BLOCK is itself
-      // the bounded wait, and a Stream entry id IS the cursor, so `XREAD ... STREAMS key <since>`
-      // returns exactly the entries a repeated exclusive XRANGE would — same {id, message} shape,
-      // same ascending order — mapped identically below. No waiter map, no re-run of XRANGE.
-      // Gate on the FLOORED budget: `blockMs` is typed `number`, so a sub-ms hint (e.g. 0.5)
-      // passes `> 0` yet floors to 0 — and `XREAD BLOCK 0` blocks FOREVER. Flooring first makes
-      // such budgets correctly degrade to "return immediately, empty" (core polls the remainder).
+      // `(` makes XRANGE start exclusive. Keep the ceiling out of it, so that a cursor at the top
+      // of the id space still reaches the heal below: `(<max>-<max>` is refused outright (`ERR
+      // invalid start ID for the interval`), which would wedge the topic — the one thing the heal
+      // exists to prevent. Keep the comparison NUMERIC, so that another spelling of that id
+      // (`018446744073709551615-…`, well-formed to the validator) cannot slip past and reach it.
+      entries =
+        compareIds(since, MAX_ENTRY_ID) >= 0
+          ? []
+          : await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
+      // A cursor sorting past the stream's last generated id was minted against a different Redis,
+      // a re-created dataset or a skewed clock; it is treated exactly like `since === undefined`,
+      // for both the query AND the returned cursor, so that on-start catch-up SELF-HEALS. Echoing
+      // the dead cursor back instead wedges this topic forever: every later fetch returns the same
+      // empty page, with no error to retry and nothing to tell it from "nothing new". Checked only
+      // once XRANGE came back empty.
+      if (entries.length === 0 && compareIds(since, await streamTail(this.require(), key)) > 0) {
+        since = undefined;
+        entries = (await this.require().xRevRange(key, '+', '-', { COUNT: limit })).reverse();
+      }
+    }
+    // A window read with no `since` (never given, or dropped by the heal) came back empty only
+    // because the stream holds nothing, so everything that lands next sorts after `0-0`.
+    const after = since ?? '0-0';
+    if (entries.length === 0) {
+      // Native long-poll: the window was empty and the caller granted a budget → wait up to
+      // `blockMs` for entries strictly after `after`. A Stream entry id IS the cursor, so XREAD
+      // returns exactly the entries a repeated exclusive XRANGE would. Gate on the FLOORED budget:
+      // a sub-ms hint (0.5) passes `> 0` yet floors to 0, and `XREAD BLOCK 0` blocks FOREVER.
       const block = Math.floor(args.blockMs ?? 0);
-      if (entries.length === 0 && block > 0) {
-        entries = await this.blockingRead(key, args.since, block, limit);
+      if (block > 0) {
+        entries = await this.blockingRead(key, after, block, limit);
       }
     }
     const messages = entries.map((e) => rowToMessage(args.topic, e.id, e.message));
     const last = messages.at(-1);
-    const nextCursor = last !== undefined ? last.cursor : (args.since ?? asCursor('0-0'));
+    const nextCursor = last !== undefined ? last.cursor : asCursor(after);
     return { messages, nextCursor };
   }
 
   /**
-   * Bounded blocking wait for entries strictly after `since`, on a DEDICATED reader connection.
-   * A dedicated connection is mandatory, not an optimization: `XREAD BLOCK` holds its connection
-   * for the whole wait, so running it on the shared command client would stall every concurrent
-   * `post` (XADD) — including a post racing in on the SAME plugin instance that is meant to wake
-   * this very wait — turning the long-poll into a deadlock.
-   *
-   * The reader is registered in `this.readers` BEFORE the blocking call so a concurrent
-   * `disconnect()` finds and tears it down (breaking the blocking read), and the loop is gated on
-   * the connect generation so a disconnect/reconnect racing this window can never revive it. On
-   * any early exit — timeout, teardown, or error — we return `[]`, which is always safe: the empty
-   * page carries `nextCursor === since` and core polls the remaining budget on the MCP path.
+   * Bounded blocking wait for entries strictly after `since`, on a DEDICATED reader connection. The
+   * dedicated connection is mandatory, not an optimization: `XREAD BLOCK` holds its connection for
+   * the whole wait, so running it on the shared command client would stall every concurrent `post`
+   * (XADD) — including the post meant to wake this very wait — into a deadlock. A timeout, a
+   * teardown or a transient fault ends the wait with `[]`, and the empty page then carries
+   * `nextCursor === since`. Past {@link MAX_BLOCKING_READERS} the same wait is served by
+   * {@link polledRead} instead of by a ninth socket.
    */
   private async blockingRead(
     key: string,
     since: string,
     blockMs: number,
     limit: number,
-  ): Promise<Array<{ id: string; message: Record<string, string> }>> {
-    // Defensive floor: `XREAD BLOCK 0` blocks FOREVER, so a non-positive budget must never reach
-    // Redis regardless of caller. The XRANGE path already returned the immediate answer ([]).
-    if (blockMs <= 0) return [];
+  ): Promise<Entry[]> {
+    if (this.blockingReaders >= MAX_BLOCKING_READERS) {
+      return this.polledRead(key, since, blockMs, limit);
+    }
     const gen = this.generation;
-    const reader = this.require().duplicate();
-    reader.on('error', () => undefined);
-    // Register BEFORE connecting so a disconnect() racing this window can always find and close the
-    // reader (mirrors the subscribe() pattern); registering after connect leaks a fresh duplicate.
-    this.readers.push(reader);
+    const reader = this.newReader();
+    this.blockingReaders++;
     try {
-      await reader.connect();
-      if (gen !== this.generation) return []; // disconnect() won the race during connect()
+      await this.connectReader(reader);
+      if (gen !== this.generation) return [];
       // `id: since` (a concrete cursor, not '$') means XREAD returns everything strictly after
-      // `since` — including an entry that landed in the XRANGE→XREAD gap — with no missed-message
-      // window. Waits at most `blockMs`; a wake returns immediately, a timeout returns null.
+      // `since`, including an entry that landed in the XRANGE→XREAD gap.
       const res = await reader.xRead({ key, id: since }, { BLOCK: blockMs, COUNT: limit });
       if (gen !== this.generation || res === null) return [];
       return res[0]?.messages ?? [];
-    } catch {
-      // Timeout is null (handled above); a throw here is teardown or a transient socket drop.
-      // Returning [] is safe (core polls the remainder) and never masks a real fault — the
-      // canonical XRANGE above already succeeded against the live connection.
+    } catch (err) {
+      // Keep the refusal rethrow, so that a NOPERM/WRONGTYPE ending the long poll is not silent
+      // while `subscribe` reports the identical fault: core answers an empty page by napping and
+      // retrying, so a swallowed refusal burns the whole budget opening doomed readers.
+      if (gen === this.generation && serverRefusal(err) !== undefined) throw err;
       return [];
     } finally {
-      this.dropReader(reader);
-      await reader.disconnect().catch(() => undefined);
+      this.blockingReaders--;
+      await this.retireReader(reader);
     }
   }
 
   /**
-   * Live path = an `XREAD BLOCK` loop on a dedicated connection (DESIGN §9 — genuine events, not a
-   * poll timer). Starts at `$` (new entries only; history is owned by catch-up). `disconnect()`
-   * tears the reader down, which breaks the blocking read.
+   * The wait a caller past {@link MAX_BLOCKING_READERS} gets: the same budget, honoured by
+   * re-reading the exclusive window on {@link CAPPED_POLL_INTERVAL_MS} instead of by holding a
+   * connection open. Keep it a WAIT. Answering at once with the empty page this call already has is
+   * indistinguishable to the caller from a long poll that timed out empty — the one outcome
+   * `blockMs` exists to make impossible — and through the tool it is worse than the socket it saved:
+   * core re-drives the whole of the caller's budget against this Redis at its own cadence.
    */
-  async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
-    // Capture the generation this subscribe belongs to; every continuation below is gated on it
-    // still being current, so a disconnect()/reconnect that ran meanwhile tears this loop down.
+  private async polledRead(
+    key: string,
+    since: string,
+    blockMs: number,
+    limit: number,
+  ): Promise<Entry[]> {
     const gen = this.generation;
-    const reader = this.require().duplicate();
-    reader.on('error', () => undefined);
-    // Register BEFORE connecting so a disconnect() racing this window can always find and close
-    // the reader (BUG-37); registering after connect leaks a freshly-connected duplicate.
-    this.readers.push(reader);
+    const deadline = Date.now() + blockMs;
+    for (;;) {
+      const nap = Math.min(CAPPED_POLL_INTERVAL_MS, deadline - Date.now());
+      if (nap <= 0) return [];
+      await delay(nap);
+      // Re-read the generation AFTER the nap: a `disconnect()` that landed inside it has already
+      // discarded the command client, and `require()` would raise a fault where the caller is owed
+      // the empty page every other end of this wait hands back.
+      if (gen !== this.generation) return [];
+      const entries = await this.require().xRange(key, `(${since}`, '+', { COUNT: limit });
+      if (entries.length > 0) return entries;
+    }
+  }
+
+  async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
+    return this.labelled(topic, this.key(topic), () => this.startReadLoop(topic, handler));
+  }
+
+  private async startReadLoop(topic: Topic, handler: MessageHandler): Promise<void> {
+    const gen = this.generation;
+    const reader = this.newReader();
     try {
-      await reader.connect();
+      await this.connectReader(reader);
     } catch (err) {
-      this.dropReader(reader);
-      await reader.disconnect().catch(() => undefined);
+      await this.retireReader(reader);
       throw err;
     }
     if (gen !== this.generation) {
-      // disconnect() won the race during connect() → tear the reader down instead of leaking it,
-      // and start no loop for this superseded connection.
-      this.dropReader(reader);
-      await reader.disconnect().catch(() => undefined);
+      await this.retireReader(reader); // disconnect() won the race; start no loop for it
       return;
     }
     const key = this.key(topic);
 
     // Capture the stream tail *before* subscribe() resolves, so a post() (XADD) racing in right
-    // after can't be missed. Starting the read loop at '$' is unsafe: '$' only resolves to "the
-    // last id" when the first blocking XREAD actually registers server-side, and subscribe()
-    // returns without awaiting that read (`void loop()` below). A message added in that window
-    // gets an id below the resolved '$' and is dropped forever. A concrete id has no such gap —
-    // XREAD returns everything strictly after it, including messages added during startup.
-    let lastId = '0';
+    // after can't be missed. '$' is unsafe: it only resolves to "the last id" when the first
+    // blocking XREAD registers server-side, and subscribe() returns without awaiting that read, so
+    // a message added in that window gets an id below it and is dropped forever.
+    let from: string;
     try {
-      lastId = (await reader.xInfoStream(key)).lastGeneratedId;
+      from = await streamTail(reader, key);
     } catch (err) {
-      if (gen !== this.generation) {
-        // disconnect() raced in during the probe; it already tore the registered reader down.
-        this.dropReader(reader);
-        await reader.disconnect().catch(() => undefined);
-        return;
-      }
-      // Only a genuinely missing stream means "no history to skip" (node-redis surfaces
-      // `ERR no such key` for XINFO STREAM on a non-existent key). Any OTHER failure (socket drop,
-      // LOADING during a restart, READONLY after failover, NOPERM on XINFO) must NOT be seeded as
-      // '0' — that would XREAD from the start and replay the whole retained history as live
-      // <channel> push (BUG-11). Surface it so core observes the failure instead of flooding.
-      if (!/no such key/i.test(String((err as Error)?.message ?? err))) {
-        this.dropReader(reader);
-        await reader.disconnect().catch(() => undefined);
-        throw err;
-      }
-      // stream doesn't exist yet → '0' delivers everything from here on
+      await this.retireReader(reader);
+      // A disconnect() racing the probe leaves a superseded subscription, not a fault to surface.
+      if (gen !== this.generation) return;
+      throw err;
     }
 
-    const loop = async (): Promise<void> => {
-      while (gen === this.generation) {
-        let res:
-          | Array<{ name: string; messages: Array<{ id: string; message: Record<string, string> }> }>
-          | null;
-        try {
-          res = await reader.xRead({ key, id: lastId }, { BLOCK: this.blockMs, COUNT: 256 });
-        } catch {
-          if (gen !== this.generation) break; // torn down/superseded → exit, never spin-retry (BUG-37)
-          await delay(100);
-          continue;
-        }
-        if (gen !== this.generation) break;
-        if (res === null) continue; // BLOCK timed out with no new entries
-        for (const stream of res) {
-          for (const entry of stream.messages) {
-            lastId = entry.id;
-            try {
-              handler(rowToMessage(topic, entry.id, entry.message));
-            } catch {
-              /* handler is best-effort; never break the loop (DESIGN §6) */
-            }
-          }
-        }
-      }
-    };
-    void loop();
+    const { url, blockMs } = this.cfg;
+    void runReadLoop(
+      {
+        reader,
+        topic,
+        key,
+        url,
+        blockMs,
+        from,
+        isCurrent: () => gen === this.generation,
+        retire: () => this.retireReader(reader),
+      },
+      handler,
+    );
   }
 
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
@@ -279,13 +355,36 @@ export class RedisPlugin implements BackendPlugin {
   }
 
   private key(topic: Topic): string {
-    return `${this.prefix}${topic}`;
+    return `${this.cfg.prefix}${topic}`;
   }
 
-  /** Remove a specific reader from the registry (used when a subscribe tears its own reader down). */
-  private dropReader(reader: RedisClient): void {
+  /**
+   * A registered but not yet connected reader. Built from the same fail-fast options as the command
+   * client rather than `duplicate()`d from it, so that a reader opened while Redis is unreachable
+   * rejects instead of retrying forever and hanging `subscribe()`. Registered BEFORE the handshake,
+   * so that a `disconnect()` racing this window finds and closes it.
+   */
+  private newReader(): RedisClient {
+    this.require();
+    const reader = createRedisClient(this.cfg.url, this.cfg.connectTimeoutMs);
+    this.readers.push(reader);
+    return reader;
+  }
+
+  private async connectReader(reader: RedisClient): Promise<void> {
+    const { url, connectTimeoutMs } = this.cfg;
+    this.connecting.add(reader);
+    try {
+      await withDeadline(reader.connect(), connectTimeoutMs, unreachable(url, connectTimeoutMs));
+    } finally {
+      this.connecting.delete(reader);
+    }
+  }
+
+  private async retireReader(reader: RedisClient): Promise<void> {
     const i = this.readers.indexOf(reader);
     if (i !== -1) this.readers.splice(i, 1);
+    await reader.disconnect().catch(() => undefined);
   }
 
   private require(): RedisClient {
@@ -294,14 +393,4 @@ export class RedisPlugin implements BackendPlugin {
     }
     return this.client;
   }
-}
-
-function rowToMessage(topic: Topic, id: string, fields: Record<string, string>): Message {
-  return buildMessage({
-    topic,
-    sender: fields.sender ?? '',
-    content: fields.content ?? '',
-    timestamp: fields.ts ?? '',
-    id,
-  });
 }

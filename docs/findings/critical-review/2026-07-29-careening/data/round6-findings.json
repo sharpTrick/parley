@@ -1,0 +1,1541 @@
+[
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "glob-matcher-semantics",
+    "class": "greedy-literal-preempts-star-registration",
+    "file": "packages/bridge-core/src/identity-filter.ts",
+    "line": 31,
+    "summary": "globMatch checks the literal/`?` arm BEFORE the `*` arm, so a `*` in the pattern that lines up with a literal `*` in the value is consumed as a literal and never registered as a backtrack point. The matcher then contradicts its own docstring (\"`*` = any run (including empty)\").",
+    "failure": "matchGlob('*', '*ops') === false (must be true); matchGlob('a*', 'a*b') === false; filterHandles([{handle:'*ops'}], '*') === [] . Reproduced: a length<=4 corpus over the alphabet {a,*,?} on BOTH sides yields 546 pattern x value disagreements against the exhaustive reference matcher already present in identity-filter.test.ts. Reachable via parley_list_users({filter:'*'}): a peer whose identity.handle contains '*' (config only requires min length 1) is silently dropped from a glob-filtered roster, i.e. it reads as unreachable.",
+    "remediation": "Swap the two arms of the loop so `pattern[p] === '*'` is tested first: `if (p < P && pattern[p] === '*') { lastStar = p; starEnd = s; p++; } else if (p < P && (pattern[p] === '?' || pattern[p] === value[s])) { p++; s++; }`. Verified in the worktree: the one-line reorder drives all 546 disagreements to zero and leaves identity-filter.test.ts and stated-bounds.test.ts green.",
+    "testUpgrade": "The class is \"a metacharacter appearing as a LITERAL in the matched value\". The existing exhaustive-reference test is the right instrument but its VALUES alphabet is ['a','b'] and so can never contain '*' or '?'. Widen the generator to words(['a','b','*','?'], 4) on the value side as well as the pattern side (and keep the pattern side at ['a','b','*','?']); assert zero disagreements with referenceMatch over the full cross product. Add the same widening to the hand table rows (['*','*a',true], ['a*','a*b',true], ['*','**',true]) so a failure names the shape."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "allowlist-guard-unpinned",
+    "class": "security-wiring-function-ungraded",
+    "file": "packages/bridge-core/src/allowlist.ts",
+    "line": 130,
+    "summary": "`allowlistFor` is the single function that turns a ParleyConfig into the runtime security boundary (it is what every composition root calls), and NO test exercises it. Two independent mutations to it leave the entire bridge-core suite green.",
+    "failure": "Mutation 1: delete `reserved: [cfg.presence.topic]`. Result: 38 files / 1873 tests PASS. With that line gone, a config carrying `post_topics: ['.*']` makes `parley_post({topic:'parley-presence', content:'{\"kind\":\"hello\",...}'})` succeed, so any caller — or a prompt-injected agent acting on untrusted inbound content — can forge presence beats and spoof the parley_list_users roster; the class docstring's promise that \"a peer cannot spoof the presence roster\" silently stops holding. Mutation 2: `new Allowlist([...cfg.topics, ...cfg.post_topics], {...})`. Result: 1873 tests PASS, even though it puts raw regex sources into the EXPLICIT set that subscribe/catch-up/presence iterate — exactly the \"patterns never widen subscribe\" invariant the docstring states. Allowlist's own class-level tests pass `reserved`/`postPatterns` by hand and therefore cannot see either.",
+    "remediation": "Add a test module for `allowlistFor` that drives it from parseConfig output only: (a) with `post_topics: ['.*']`, assert `has(cfg.presence.topic) === false` and `assert(presenceTopic)` throws TopicNotAllowedError; (b) assert `topics()` equals `cfg.topics` exactly (no pattern source leaks in) for a config with several post_topics; (c) assert a pattern-matched topic is `has`-true but absent from `topics()`.",
+    "testUpgrade": "Guard the CLASS \"config -> boundary wiring\" rather than these two lines: build a table of configs (no patterns / one pattern / broad `.*` / custom presence.topic / presence.enabled false) and for each assert the three-way partition as a property — every topic in `cfg.topics` is in `topics()`; `topics()` contains nothing that is not in `cfg.topics`; `has(cfg.presence.topic)` is false under every row including the broad-pattern and presence-disabled rows. A row generated from the config object means a future config field (a second reserved topic, a `subscribe_topics` list) is graded the moment it appears."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "allowlist-guard-unpinned",
+    "class": "anchor-wrapping-not-pinned",
+    "file": "packages/bridge-core/src/allowlist.ts",
+    "line": 85,
+    "summary": "The full-match anchoring `^(?:src)$` is a stated security property (the docstring and CLAUDE.md's security lens both name \"anchored post_topics\"), but no test distinguishes it from `^src$`. Dropping the non-capturing group survives the whole suite.",
+    "failure": "Mutation: `return new RegExp(`^${src}$`)`. Result: 38 files / 1873 tests PASS. Under that mutation `post_topics: ['ops|dev']` compiles to /^ops|dev$/, so `has('secret-dev')` is true and `has('ops-anything')` is true — a config line that reads as two narrow topics mints a post/fetch set reaching arbitrary topics. Nothing notices because neither allowlist.test.ts's SAFE table nor testing/regex-corpus.ts contains a single source with a TOP-LEVEL bare alternation: every alternation in both is already wrapped in its own group ('(alpha|beta)-.*', '(?:ops|dev|qa)-[a-z]+'), which is precisely the shape the wrapper is redundant for.",
+    "remediation": "Add sources whose meaning changes under re-association to the shared corpus and assert the negative: `new Allowlist(['ctx'], { postPatterns: ['ops|dev'] })` must have `has('secret-dev') === false`, `has('ops-x') === false`, `has('ops') === true`, `has('dev') === true`. Apply the same rows to presence.ts's compilePeerPatterns, which wraps identically.",
+    "testUpgrade": "Parameterize on the class \"source whose top level is an alternation or an anchor\": table of [src, mustMatch[], mustNotMatch[]] with rows 'ops|dev', 'a|b|c', '^ops', 'ops$', '|ops', 'ops|', '.*|x' — driven through all three entry points already enumerated in regex-screen-parity.test.ts (isRedosSafeSource is exempt; Allowlist and parseConfig+allowlistFor are not). A row asserting only \"the listed topic matches\" cannot fail; the mustNotMatch column is what pins the anchoring."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "seam-contract-doc-drift",
+    "class": "doc-cites-a-value-the-reference-backend-does-not-return",
+    "file": "packages/bridge-core/src/seam.ts",
+    "line": 118,
+    "summary": "seam.ts is the canonical contract a plugin author reads, and its fetchRecent JSDoc states the SQLite reference backend returns `{ messages: [], nextCursor: '0' }` for a never-posted topic. It does not, and has not since cursors became store-scoped.",
+    "failure": "packages/bridge-sqlite/src/index.ts:231 returns `nextCursor: last?.cursor ?? mintCursor(storeId, resumeAfter ?? 0n)` and mintCursor (line 500) is `asCursor(`${storeId}.${rowid}`)`, so the empty-topic cursor is e.g. '9f3a1c2b.0' — never '0'. A plugin author following the doc literally emits '0', which sqlite's own resume path documents (index.ts:236) as \"another backend's numeric cursor reaching this plugin\" and treats as a foreign store.",
+    "remediation": "Drop the parenthetical value or restate it structurally: \"the SQLite reference backend returns an empty page whose nextCursor encodes its store id and rowid 0\". The load-bearing part of the contract is replayability, not the literal.",
+    "testUpgrade": "Guard the CLASS \"a seam doc quoting a concrete backend value\" mechanically rather than by re-reading prose: the conformance suite already asserts replayability at packages/conformance/src/index.ts:241; extend the same case to assert `first.nextCursor` is a non-empty string AND that `String(first.nextCursor)` round-trips as `since` — then delete every literal cursor value from seam.ts's prose so there is nothing left to rot. A source-lint row (in the existing source-hygiene.test.ts style) banning a quoted cursor literal in seam.ts JSDoc would pin it durably."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "injectivity-guard-boundary",
+    "class": "off-by-one-in-disambiguated-name-recognition",
+    "file": "packages/bridge-core/src/topic-name.ts",
+    "line": 72,
+    "summary": "`isDisambiguated` returns false when `name.length === sep.length + hashLen`, which is exactly the length of a minted name whose sanitized prefix is empty. So the pass-through branch and the disambiguating branch are NOT disjoint at that boundary, and safeName — documented as an unqualified \"injective topic -> backend-name mapping\" for any caller-supplied fold — collides.",
+    "failure": "With `sanitize = s => s.replace(/[^a-z0-9-]/g,'')` (a charset fold that DELETES rather than replaces, a natural third-party shape): safeName(asTopic('  ')) === '-099600a10a' (sanitized is '', so the minted name is sep+hash, length 11), and safeName(asTopic('-099600a10a')) === '-099600a10a' (pass-through, because isDisambiguated's `<=` refuses to recognise a length-11 name). Two distinct topics land on one backend channel and cross-deliver; an attacker who can choose a topic can compute the target name. Reproduced in the worktree. No shipped fold is affected today — all five (sanitizeAlias/Token/Name/Local/Nick) replace rather than delete — so this is a latent hole in exported public API.",
+    "remediation": "Change the guard to `if (name.length < sep.length + hashLen) return false;`. Optionally also refuse a fold that maps a non-empty topic to the empty string, which is the only way to reach the boundary.",
+    "testUpgrade": "The existing closure test (topic-name.test.ts:186) is the right instrument but its `folds` table contains only total-replacement folds, so no fold can ever produce an empty sanitized form and the boundary is unreachable. Add a deleting fold (`s => s.replace(/[^a-z0-9-]/g,'')`) and a lowercasing+deleting fold to the shared `folds` table so all four generated describes (closure-injectivity, fixed-point, near-miss, COLLAPSED corpus) grade them; add SEEDS that fold to '' ('  ', '!!!', ' ') plus the minted names of those seeds. That guards the CLASS \"pass-through and disambiguated branches must be disjoint at every length\", not just this one length."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "redos-budget-composition",
+    "class": "per-pattern-budget-multiplied-by-unbounded-pattern-count",
+    "file": "packages/bridge-core/src/regex-safety.ts",
+    "line": 19,
+    "summary": "MAX_AMBIGUITY is documented as the backtracking bound and calibrated so \"the worst accepted source finishes in single-digit milliseconds\", but it is a PER-SOURCE bound. `post_topics` has no `.max()` on the array and `Allowlist.has` runs `.some()` over every compiled pattern, so the calibrated cost multiplies by an unbounded count.",
+    "failure": "Measured in the worktree: `post_topics` filled with N copies of the worst source the screen accepts at the bound — '[ab]?'.repeat(16) + 'a'.repeat(16) + 'z<i>' (96 chars, budget exactly 2^16 = MAX_AMBIGUITY, 2.7ms alone) — blocks the event loop inside ONE `allow.has('a'.repeat(64))` call for 260ms at N=100, 2.6s at N=1000 and 19.0s at N=5000. Every parley_post / parley_reply / parley_fetch_recent call pays it, and config.test.ts:493 states this repo's own threat model that a config file \"is not always operator-authored end to end — generated, templated, or committed by someone else\". engine/presence.ts already caps the analogous untrusted list at MAX_RECORD_TOPICS = 64; the operator-side list is uncapped, so the two paths disagree about whether the budget composes.",
+    "remediation": "Put a `.max()` on `post_topics` in ConfigSchema (a count that keeps count x MAX_AMBIGUITY inside the same single-digit-millisecond envelope the constant is calibrated to — 64 mirrors MAX_RECORD_TOPICS) and amend the MAX_AMBIGUITY docstring to say the bound is per source and that callers must also bound HOW MANY sources they match against one input.",
+    "testUpgrade": "Guard the CLASS \"aggregate cost across a screened collection\" rather than one pattern shape: a parameterized budget test that, for each entry point compiling unauthored patterns (Allowlist post patterns, presence peer patterns), fills the collection to its documented maximum with the worst source the screen accepts AT the bound (derive it from MAX_AMBIGUITY, e.g. '[ab]?'.repeat(log2(MAX_AMBIGUITY))) and asserts one match call against a MAX_MATCH_INPUT-length adversarial input stays under a stated wall-clock budget. Derive the pattern from the constants so raising MAX_AMBIGUITY or the count cap re-grades automatically."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "config-silent-no-op",
+    "class": "flag-accepted-where-nothing-reads-it",
+    "file": "packages/bridge-core/src/config.ts",
+    "line": 141,
+    "summary": "`live_push.mention_filter: true` combined with `live_push.enabled: false` loads cleanly and does nothing. This is the same class the module deliberately fails on elsewhere — `permissions.skip_permissions: true` is rejected because \"nothing in core or any plugin reads it\", and unknown keys are rejected because they would \"leave the operator with a bridge that quietly does nothing\".",
+    "failure": "parseConfig({identity:{handle:'h'}, topics:['t'], live_push:{enabled:false, mention_filter:true}}) succeeds. mentionFilter is read at exactly one place, transport/push-loop.ts:61, reached only from stdio-bridge.ts:115 inside `if (cfg.live_push.enabled)`. An operator who set mention_filter to stop being flooded gets no filtering AND no error. The inverse asymmetry compounds it: the superRefine at line 241 DOES reject a non-mentionable handle whenever mention_filter is true even with enabled:false, so the same dead flag is enforced strictly in one direction and ignored in the other.",
+    "remediation": "Add a superRefine issue on path ['live_push','mention_filter'] when `mention_filter && !enabled` — 'live_push.mention_filter only applies to the live push path; set live_push.enabled: true or remove mention_filter' — and gate the existing mentionable-handle check on `enabled` too, so the two rules agree about when the flag is live.",
+    "testUpgrade": "Guard the CLASS \"a knob that is only read under another knob\" with a table of [dependent flag, its enabling flag] pairs (live_push.mention_filter -> live_push.enabled; presence.heartbeat_ms/ttl_ms/topic -> presence.enabled) asserting that setting the dependent while the enabler is false is either a load error or provably has an effect. A row per pair means the next conditional knob is graded when it lands, instead of one fixed case for mention_filter."
+  },
+  {
+    "target": "core-seam",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "seam-contract-doc-drift",
+    "class": "security-comment-overstates-the-guarantee",
+    "file": "packages/bridge-core/src/allowlist.ts",
+    "line": 66,
+    "summary": "The Allowlist class docstring asserts \"A reply always targets the inbound topic, which is subscribed (thus in the explicit list) and therefore already allowed.\" `parley_reply` takes a caller-supplied `topic` argument and is gated by the POST/FETCH set, which includes post_topics pattern matches — so a reply can target a topic that was never subscribed.",
+    "failure": "transport/tools.ts registers 'parley_reply' with its own `topic` input schema and routes it through the shared doPost -> `deps.allow.assert(topicStr)` (tools.ts:152), i.e. the pattern-widened set. With `post_topics: ['ctx-.*']` and `topics: ['ctx-a']`, parley_reply({topic:'ctx-elsewhere', ...}) is accepted. Since the sentence sits two lines under \"Inbound is untrusted\", a reader concludes that a prompt-injected instruction to reply elsewhere is structurally impossible; in fact it is bounded only by the post set. No privilege escape (assert still runs) — the claim is what is false, and it is false in the module that defines the boundary.",
+    "remediation": "Restate it as the mechanism actually in force: a reply is gated by the same post/fetch set as parley_post, so it can reach any explicit topic or post_topics match and nothing else. Per CLAUDE.md the reasoning belongs in the commit message, not in expanded prose here.",
+    "testUpgrade": "Guard the CLASS \"every write entry point is gated by allow.assert and by nothing weaker\" so the doc cannot drift again: a parameterized test over the registered write tools (parley_post, parley_reply, and any future one, enumerated from the server's registered tool names rather than a hand list) asserting each rejects a topic outside the post set with TopicNotAllowedError and each ACCEPTS a post_topics-pattern topic that is not in `topics` — the second half is what makes the docstring's claim measurable instead of prose."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "roster-liveness",
+    "class": "instance-eviction-by-arrival-order-not-freshness",
+    "file": "packages/bridge-core/src/engine/presence.ts",
+    "line": 251,
+    "summary": "`retainFreshest` evicts by Map insertion (message arrival) order, not by beat freshness, so a live long-lived instance is dropped by short-lived siblings of the same handle that beat after it — and the handle then reports `online: false`.",
+    "failure": "Reproduced with a probe test (deleted). Page for handle `claude-a`, ascending cursor: [heartbeat at=now-60s inst-long ctx-long], then 8 short sessions each posting hello+goodbye (`short-0`..`short-7`, at=now-50s..now-40s). `computeRoster(msgs, now, {ttlMs: 1_800_000, sinceMs: 600_000})[0]` → `{online: false, topics: ['ctx-short']}`. Expected `online: true` and `topics` containing `ctx-long`: the long-lived session beat 60 s ago, well inside a 30-min TTL. `parley_list_users` therefore hides a reachable hand-off partner entirely under `online_only: true`, and drops its topics from the roster otherwise. `instance_id` defaults to the handle and agents are explicitly ephemeral sessions, so this needs no attacker — a handle whose sessions churn faster than its heartbeat reproduces it.",
+    "remediation": "Make eviction pick the record with the smallest `at` among the tracked instances (decode already rejects any `at` beyond `nowMs + MAX_CLOCK_SKEW_MS`, so `at` is bounded enough to order on), or preferentially evict `goodbye`/TTL-stale instances before any live one. Then correct the JSDoc, which currently promises exactly the protection the code does not deliver: \"the evicted instance is the stalest one rather than a long-lived peer a flood of fresh instanceIds pushed out\".",
+    "testUpgrade": "Parameterize over the POSITION of the surviving instance's last beat within the page — first / middle / last — crossed with the sibling kind (`heartbeat`, `goodbye`) and sibling count (`MAX_HANDLE_INSTANCES`, ×2, ×4). Assert in every cell that a handle with at least one non-`goodbye` beat inside `ttlMs` comes back `online: true` and carries that instance's topics. The existing `retains the instances still beating and evicts the stalest` case pins only the `last` column and so cannot fail on this class."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "lru-refresh-line-is-vacuously-covered",
+    "file": "packages/bridge-core/src/engine/presence.test.ts",
+    "line": 374,
+    "summary": "Deleting `insts.delete(rec.instanceId)` from `retainFreshest` — the entire LRU-refresh mechanism — leaves the whole 1885-test suite green.",
+    "failure": "Mutation applied to packages/bridge-core/src/engine/presence.ts (`insts.delete(rec.instanceId); insts.set(...)` → `insts.set(...)`), then `npx vitest run packages/bridge-core`: `Tests 1885 passed (1885)`. The guarding test `retains the instances still beating and evicts the stalest` still passes because `inst-loud` beats AGAIN after the flood, so it is re-inserted at the tail either way — the assertion is satisfied by the final beat, not by the refresh. The one line the test names in its title is unreachable by any assertion.",
+    "remediation": "Add the column the test is missing (survivor beats BEFORE the flood, as in the finding above) so the refresh line has a case that dies without it — and fix the underlying eviction policy at the same time.",
+    "testUpgrade": "Table `computeRoster` instance-retention over (survivor beat position ∈ {before, interleaved, after} × sibling count ∈ {N, 2N, 4N} × sibling kind ∈ {heartbeat, goodbye}) and assert both `online` and topic membership per cell. A generator that shuffles beat arrival order relative to `at` would also catch any future retention policy that silently keys on the wrong one of the two."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "operability-and-release",
+    "theme": "teardown-completeness",
+    "class": "teardown-latch-set-before-work-completes",
+    "file": "packages/bridge-core/src/transport/stdio-bridge.ts",
+    "line": 96,
+    "summary": "`teardown` sets `toreDown = true` before doing any work, so a rejecting `plugin.disconnect()` skips `server.close()` forever and every retry of `shutdown()` is a silent no-op.",
+    "failure": "Reproduced with a probe (deleted): a `BackendPlugin` whose `disconnect()` rejects with `disconnect boom`. `await bridge.shutdown()` rejects, `server.close()` is never invoked (spy count 0), and a second `await bridge.shutdown()` returns immediately without closing. On the shipped `createStdioBridge` root the `StdioServerTransport` keeps stdin resumed, so the process never exits — an operator's SIGINT handler that awaits `shutdown()` hangs instead of exiting. Network backends whose close handshake can reject (Matrix/XMPP/NATS) are exactly the ones that hit this. The `attach` rollback path has the same shape: `teardown().catch(() => {})` swallows it and leaves the server connected.",
+    "remediation": "Run each teardown step independently (e.g. settle `presence.stop()`, `plugin.disconnect()` and `server.close()` and aggregate failures) rather than short-circuiting on the first rejection, and only latch `toreDown` once every step has been attempted — or leave the latch clearable so a failed teardown is retryable.",
+    "testUpgrade": "Widen `every startup failure point rolls back identically` into a teardown-failure table: for each teardown step ∈ {presence.stop, plugin.disconnect, server.close} × each entry point ∈ {shutdown(), rollback inside a failed attach}, inject a rejection into that step and assert (a) every OTHER step still ran exactly once, and (b) the process has no live handles afterwards. Today there is no row where `disconnect` itself fails."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "asymmetric-validation",
+    "class": "write-side-missing-the-guard-the-read-side-has",
+    "file": "packages/bridge-core/src/engine/read-state.ts",
+    "line": 65,
+    "summary": "`ReadStateStore.load` explicitly rejects non-string cursor values (\"a non-string cursor would wedge catch-up\"), but `set`/`flush` accept anything and persist it — a missing `nextCursor` silently DELETES the topic's stored read position instead of failing fast.",
+    "failure": "Reproduced with a probe (deleted). Persist `{ctx: '42'}`, then run `catchUpTopic` against a plugin returning `{messages: []}` with no `nextCursor` (a JS plugin, or a TS plugin returning a value typed away). `set(T, undefined)` → `merged['ctx'] = undefined` → `JSON.stringify` omits the key → on-disk file loses `ctx` entirely. A fresh `ReadStateStore(path).get(T)` returns `undefined` instead of `'42'`, so the next start cold-restarts the topic: it re-drains the recent window and re-warms `seen` from a position the instance had already passed. Silent, permanent, and invisible until a restart. Same path for a numeric cursor: it survives in memory (`get` hands a number back as a `since`) and is discarded by `load` on the next boot.",
+    "remediation": "Validate in `set` with the same predicate `load` uses — throw a `TypeError` naming the topic and the offending value when `cursor` is not a non-empty string — so a nonconformant plugin fails loudly on the first page instead of quietly resetting read-state. The `this.state[topic]!` non-null assertion in `flush` is what hides it today.",
+    "testUpgrade": "Add a `nextCursor` shape dimension to `packages/bridge-core/src/testing/nonconformant.ts` (missing, `null`, numeric, empty string) and run the existing catch-up/read-state driver table across it, asserting in every cell that the previously persisted cursor is either unchanged or replaced by a valid string — never deleted. A round-trip property test over `set(t, v)` for arbitrary `v` would also catch the next value type that slips through."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "failed-write-retry-claim-untested",
+    "file": "packages/bridge-core/src/engine/read-state.ts",
+    "line": 88,
+    "summary": "The comment on `this.pending.clear()` states \"keep a failed write's topics pending, so that the next flush retries them\", but moving the clear ABOVE the write (destroying exactly that behaviour) leaves the suite green.",
+    "failure": "Mutation: hoist `this.pending.clear()` to before `writeFileSync`/`renameSync` in `flush`. `npx vitest run packages/bridge-core` → `Tests 1885 passed (1885)`. The `a failed atomic write leaves no debris` table asserts only that `set()` throws and no `.tmp` file survives; nothing observes that the failed topic is re-attempted. With the mutation, a topic whose flush failed is never written again — a later successful flush for a different topic silently publishes stale disk state for the first.",
+    "remediation": "Keep the current ordering and add the missing observation: make the write fail once, then succeed, and assert the first topic's cursor appears on disk.",
+    "testUpgrade": "Extend the existing `a failed atomic write leaves no debris` table with a `then recovers` column: for each failure mode, make the write fail for the first N attempts and succeed on N+1, then assert the on-disk file contains EVERY topic set during the failing window. Parameterize over N ∈ {1, 2} and over whether the retry `set` targets the same topic or a different one."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "long-poll-deadline-clamp-untested",
+    "file": "packages/bridge-core/src/engine/blocking-fetch.ts",
+    "line": 135,
+    "summary": "The nap's deadline clamp `sleep(Math.min(pollIntervalMs, remaining))` can be replaced by `sleep(pollIntervalMs)` with the whole suite still green — nothing pins that the long poll respects its own `blockMs` budget when the poll cadence is coarser than the remaining budget.",
+    "failure": "Mutation: `await sleep(Math.min(opts.pollIntervalMs, Math.max(0, deadline - now())))` → `await sleep(opts.pollIntervalMs)`. `npx vitest run packages/bridge-core` → `Tests 1885 passed (1885)`. Every existing case uses `blockMs` an exact multiple of `pollIntervalMs` (1000/250, 1000/400), where the two expressions coincide. With the mutation and the shipped default `block_poll_interval_ms: 250`, a `parley_fetch_recent` with `block_ms: 10` on an empty topic returns after ~250 ms and issues one extra backend query — the `block_ms` contract (\"hold up to this long\") is exceeded and the caller's budget is not a bound.",
+    "remediation": "Keep the clamp; add a case whose budget is NOT a multiple of the cadence.",
+    "testUpgrade": "Parameterize the deadline behaviour over (blockMs, pollIntervalMs) pairs including pollIntervalMs > blockMs (e.g. 10/250), non-multiples (e.g. 900/250, 1/1000) and the multiple case, asserting BOTH the virtual-clock time at resolution is <= blockMs and the exact `fetchRecent` call count. The existing `an un-aborted budget queries once per poll interval and once at the deadline` case only covers the multiple column."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "shipped-default-constants-never-asserted",
+    "file": "packages/bridge-core/src/engine/seen-set.ts",
+    "line": 23,
+    "summary": "`SeenSet`'s shipped defaults (`maxPerTopic = 4096`, `maxTopics = 256`) are documented in prose but asserted nowhere — every test injects its own values, so the production dedup window can be changed silently.",
+    "failure": "Mutation: `private readonly maxTopics = 256` → `= 2`. `npx vitest run packages/bridge-core` → `Tests 1885 passed (1885)`. `buildBridge` constructs `new SeenSet()` with no arguments, so in production this would collapse the LRU to two topics: a three-topic bridge would evict a hot topic's dedup bucket on every cross-topic message and re-emit already-delivered `<channel>` events after each catch-up/live overlap. Nothing in the suite observes the default-constructed instance's capacity.",
+    "remediation": "Assert the defaults where the prose states them — construct a default `SeenSet`, write `maxPerTopic + 1` ids to one topic and touch `maxTopics + 1` topics, and pin the eviction boundary against the exported constants (which should be exported rather than inline literals).",
+    "testUpgrade": "Fold the seen-set defaults into `packages/bridge-core/src/stated-bounds.test.ts`, which already grades documented inclusive bounds three cells each (at / one inside / one outside) from the constant rather than a literal. The same row is missing for `MAX_FETCH_LIMIT` and `PRESENCE_FETCH_LIMIT` in transport/tools.ts — add all of them so a future constant inherits the grading."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "host-header-normalisation-untested",
+    "file": "packages/bridge-core/src/transport/http.ts",
+    "line": 62,
+    "summary": "`hostnameOf`'s `.toLowerCase()` — the case-normalisation the DNS-rebinding gate depends on — can be deleted with the suite still green.",
+    "failure": "Mutation: `return hostname.toLowerCase();` → `return hostname;`. `npx vitest run packages/bridge-core` → `Tests 1885 passed (1885)`. With the mutation a request carrying `Host: LocalHost:8080` (legal and common from browsers and proxies) gets a 403 from a loopback-default deployment, and an operator's `allowedHosts: ['Parley.Example']` never matches an incoming lowercase `Host`. The host-gate tests only ever send already-lowercase values.",
+    "remediation": "Keep the normalisation and add mixed-case rows on both sides of the comparison (configured value and incoming header).",
+    "testUpgrade": "Parameterize the host/origin gate over a table of header spellings — mixed case, bracketed IPv6 with and without port, explicit port, missing header, `Origin: null`, trailing dot, and a suffix-attack host such as `127.0.0.1.evil.com` — crossed with configured-allowlist spellings, asserting allow/deny per cell. One table replaces the ad-hoc cases and covers the next normalisation rule too."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "doc-attachment",
+    "class": "orphaned-jsdoc-block",
+    "file": "packages/bridge-core/src/engine/presence.ts",
+    "line": 213,
+    "summary": "`computeRoster`'s entire contract JSDoc (lines 213-235) is immediately followed by a second JSDoc block for `emitterOf`, so it attaches to nothing; `computeRoster` itself (line 277) ships with no doc comment at all.",
+    "failure": "Read the file: the block beginning `Reconstruct the reachability roster from the presence topic's messages (DESIGN §7)` ends at line 235, line 236 opens a new `/**` documenting `emitterOf`, and `function emitterOf` is declared at 242. `export function computeRoster` at 277 has no preceding comment. Hovering `computeRoster` in an editor, or generating API docs, yields no documentation for the function whose contract that block describes — including the per-instance liveness rule and the `MAX_HANDLE_INSTANCES` bound. Worse, the orphaned block is precisely where the false claim in the finding above lives, so a reader who does find it is misled about behaviour that a reader of `computeRoster` never sees.",
+    "remediation": "Move the block down to sit directly above `export function computeRoster`, and trim it to the risk it warns a future developer off (per CLAUDE.md), pushing the rationale into the commit message.",
+    "testUpgrade": "Extend `packages/bridge-core/src/source-hygiene.test.ts` with a check that no exported function in the package is preceded by a doc-less declaration when a JSDoc block exists earlier in the file with no declaration between it and the next JSDoc — i.e. flag any JSDoc block whose next non-blank line is another `/**`. That is a mechanical rule covering every orphaned block, not just this one."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "tool-description-vs-behaviour",
+    "class": "param-description-contradicts-tool-behaviour",
+    "file": "packages/bridge-core/src/transport/tools.ts",
+    "line": 322,
+    "summary": "`parley_list_users`'s `topic` parameter says \"Omit for all configured topics; the default scope is the configured topics\", but the unscoped path is bidirectional reachability over the POST/FETCH set, which includes pattern-allowed topics that are not configured.",
+    "failure": "Traced through `filterReachable` (engine/presence.ts:391-401) with `topics: ['ctx']`, `post_topics: ['ops-.*']`. A peer advertising only `topics: ['ops-1']` is included unscoped, because `opts.canPostTo('ops-1')` (`allow.has`) matches the pattern — yet `ops-1` is not a configured topic. The tool's own main description states the correct rule (\"anyone you can post to, or who can post to a topic you subscribe to\"); the field description contradicts it, and both ship to the model in the tool list. An agent that trusts the field description will not expect pattern-reachable peers in the default roster.",
+    "remediation": "Restate the field as \"Omit for everyone you share a channel with in either direction (see above); pass a topic to scope to peers on that topic.\" Same class applies to `describeAllowed`, which advertises `any topic fully matching regex …` without noting the presence topic is reserved and will still be refused.",
+    "testUpgrade": "Add a description-vs-behaviour table: for each tool, extract the registered description text and assert the behavioural claims it makes are exercised by a paired assertion — concretely, a case with `post_topics` set that asserts a peer reachable ONLY via a pattern appears in the unscoped roster, and a case asserting the reserved presence topic is refused by `parley_post`/`parley_fetch_recent` despite matching an advertised `.*` pattern."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "untrusted-input-caps",
+    "class": "truncation-merges-distinct-identities",
+    "file": "packages/bridge-core/src/engine/presence.ts",
+    "line": 209,
+    "summary": "`decodePresence` DROPS over-long topic strings with the stated reason that truncating \"would fabricate a different topic name\", yet truncates over-long `handle` and `instanceId` with `slice()` — fabricating a different identity and silently merging distinct peers/instances into one roster key.",
+    "failure": "Traced: `r.handle.slice(0, MAX_HANDLE_LEN)` (line 209) and `r.instanceId.slice(0, MAX_INSTANCE_ID_LEN)` (line 204). Two peers whose handles share a 128-character prefix and differ only after it collapse into a single `RosterEntry`, unioning their topics and `postTopics` and reporting one as online when only the other is. The same slice means two distinct instances of one handle sharing a 128-char `instanceId` prefix occupy one slot, so one's `goodbye` reaps the other. The file states the correct policy 17 lines earlier for topics and then does the opposite for the two fields that are actually used as MAP KEYS, where a collision is more consequential than for a list element.",
+    "remediation": "Drop the record (or drop just the offending field, falling back to `senderHandle` / the anonymous-instance sentinel) when `handle`/`instanceId` exceeds its cap, matching the policy the file already states for topics.",
+    "testUpgrade": "Parameterize a decode policy table over every capped string field (`topics[]`, `postTopics[]`, `handle`, `instanceId`) × {at the cap, one over, far over}, asserting the SAME policy in every cell — and add a roster-level case proving two records differing only past the cap yield two distinct entries rather than one merged one."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "rate-limit-keying",
+    "class": "permissive-trust-proxy-nullifies-every-limiter",
+    "file": "packages/bridge-core/src/auth/remote.ts",
+    "line": 91,
+    "summary": "`trustProxy: true` is accepted by the public option and turns `req.ip` into an attacker-controlled header value, so every rate limiter on the built-in front door — including the 10/15min brute-force gate on the owner passphrase — becomes unlimited. The JSDoc warns only about the *default* (`false`) being too strict and never that `true`, the value Express operators reach for first, is the one that removes the protection entirely.",
+    "failure": "Boot `createOAuthRemoteApp({ issuerUrl, verifyOwner, trustProxy: true })` behind the documented reverse-proxy topology (proxy appends the real client IP, so the chain is `<spoofed>, <realIP>`). 25 consecutive POSTs to `/parley/consent` with a rotating leading `X-Forwarded-For` all return 403 (wrong passphrase) — zero 429s. The identical probe under the documented `trustProxy: 'loopback'` returns 429 from request 11 onward. Measured statuses: true -> [403 x25]; 'loopback' -> [403 x10, 429 x15]. Consequence: unbounded online guessing of the single owner secret that authorizes the whole bridge, plus unbounded /token, /register, /revoke and /authorize.",
+    "remediation": "Reject a permissive value at the factory instead of forwarding it: in `createOAuthRemoteApp`, throw when `oauth.trustProxy === true` (and when it is the string `'*'`/`0.0.0.0/0`-style catch-alls), naming the safe alternatives ('loopback', a hop count, or a concrete CIDR) the way `assertOptionsMatchMode` already fails fast on stray options. Keep `false` as the default. express-rate-limit already logs ERR_ERL_PERMISSIVE_TRUST_PROXY here, which is evidence the value is known-dangerous and evidence that a log line is not a control.",
+    "testUpgrade": "The class is 'a `trust proxy` value under which two different X-Forwarded-For chains do NOT share a bucket even though they come from the same real client'. Widen the existing `TOPOLOGIES` table in remote.test.ts (currently only `false` and `'loopback'`) into a table of `{ trustProxy, accepted: boolean, spoofable: boolean }` rows covering `true`, `'*'`, `2` (hop count), `'loopback'`, `false`, `'203.0.113.0/24'`; for accepted rows drive `LIMITED_ROUTES` with a *two-element* XFF chain `'<rotating>, <fixed real ip>'` (the current rows send a single value, which cannot distinguish `true` from `'loopback'` at all) and assert the limiter still reaches 429; for refused rows assert the factory throws naming the option. That row shape also catches any future proxy option added to `OAuthRemoteOptions`."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "guard-rationale-does-not-match-code",
+    "class": "stated-reason-contradicted-by-the-guard's-own-accept-list",
+    "file": "packages/bridge-core/src/auth/invariants.ts",
+    "line": 9,
+    "summary": "The comment at line 9 and the operator-facing error text at line 53 both assert that the built-in OAuth front door 'refuses a non-https issuer whatever its host'. That is false. The MCP SDK's `checkIssuerUrl` (node_modules/@modelcontextprotocol/sdk/dist/esm/server/auth/router.js:15) exempts exactly `localhost` and `127.0.0.1` — the same two hosts this module's own LOOPBACK_HOSTS allows. The real reason `[::1]` must stay out is that the SDK's exemption list omits it, not that the SDK is host-blind.",
+    "failure": "`createOAuthRemoteApp({ issuerUrl: new URL('http://localhost:PORT'), verifyOwner })` boots and serves (verified by direct execution, and by the passing BASE_URL_SHAPES row `http://localhost:PORT/ -> boots`), which the documented rule says is impossible. An operator who reads the shipped error message 'the built-in OAuth front door refuses a non-https issuer whatever its host' concludes their `http://127.0.0.1` dev setup is also unsupported and either adds TLS they do not need or deletes the loopback exemption; a maintainer who believes it will not realise that adding `[::1]` to LOOPBACK_HOSTS breaks only the builtin door.",
+    "remediation": "State the actual rule in both places: the SDK's issuer exemption covers only `localhost` and `127.0.0.1`, so a base URL this guard accepts must be drawn from the same set for it to boot on both front doors. Derive LOOPBACK_HOSTS from that fact in one place rather than restating a mechanism.",
+    "testUpgrade": "The class is 'a comment/error message that names a mechanism in a dependency'. Add a table in invariants.test.ts pairing every host in LOOPBACK_HOSTS plus `[::1]` with the SDK's own `checkIssuerUrl` — i.e. `it.each(HOSTS)` asserting that `assertPublicBaseUrl` accepting `http://<host>` implies `mcpAuthRouter({issuerUrl: new URL('http://<host>')})` constructs without throwing, and that a rejected host is rejected by our message before the SDK's. That fails the moment the SDK changes its exemption set or someone widens ours, and it makes the rationale executable instead of prose. Existing BASE_URL_SHAPES rows assert the outcome but nothing asserts the stated cause."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "one-composed-front-door-is-unexercised",
+    "class": "security-control-deletable-on-the-second-factory-with-suite-green",
+    "file": "packages/bridge-core/src/auth/oidc-remote.ts",
+    "line": 120,
+    "summary": "`hardenErrorSurface(remote.app)` in the delegated-OIDC front door is covered by nothing. The 96-cell error-surface matrix boots only `createOAuthRemoteApp`; `createOidcRemoteApp` never appears in error-surface.test.ts. The call is a security control whose removal is invisible to the gate that decides whether a change lands.",
+    "failure": "Mutation: replace `hardenErrorSurface(remote.app);` with `void hardenErrorSurface;` in oidc-remote.ts. `npx vitest run packages/bridge-core` -> `Test Files 39 passed (39)`, 0 failures. With the call removed and NODE_ENV unset (the state the shipped run command in examples/self-host-remote/README.md leaves it in), the app's `env` is 'development' and any framework error reaching Express's default handler renders `err.stack` — absolute install paths and frame list — into the response body. Today that path needs a valid bearer (because `protect` runs before `express.json()` on /mcp), but any route a future `configureApp` mounts ahead of `protect`, or any unauthenticated route added to the metadata router, reopens it unguarded.",
+    "remediation": "Parameterize the error-surface suite over both factories rather than adding a second bespoke file, so a third front door inherits the coverage.",
+    "testUpgrade": "The class is 'a hardening step applied per-factory, verified for only one factory'. Lift the FACTORIES table already used by teardown.test.ts (which does parameterize over both remote-app factories) into a shared fixture and drive error-surface.test.ts's BOOT_ENVS x ROUTES x TRIGGERS matrix from it, with each factory contributing its own route list. Add one route per factory that is mounted *before* `protect` and throws, so the assertion has a negative control in both modes. This also catches the next control that gets applied in `remote.ts` but forgotten in `oidc-remote.ts`."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-with-no-negative-control",
+    "class": "half-of-a-two-part-control-cannot-fail-any-test",
+    "file": "packages/bridge-core/src/auth/error-surface.ts",
+    "line": 16,
+    "summary": "The docblock says 'Keep BOTH halves of this', but only one half is measured. Deleting `app.use(terminalErrorHandler)` leaves the entire suite green, because with `env` pinned to 'production' Express's own finalhandler already emits a stackless status phrase, already sets `err.status`, and already calls console.error — satisfying every assertion in the 'really does reach the terminal handler' negative control (status 413, no 'PayloadTooLargeError', logged). The `statusOf` 400–599 clamp is likewise unmeasured.",
+    "failure": "Mutation A: delete `app.use(terminalErrorHandler);` -> `Test Files 39 passed (39)`. Mutation B: weaken `statusOf`'s range check from `typeof claimed !== 'number' || !Number.isInteger(claimed) || claimed < 400 || claimed > 599` to `typeof claimed !== 'number'` -> `Test Files 39 passed (39)`; an error carrying `status: 200` or `status: 1.5` is then reflected as the response status. Control: deleting `app.set('env','production')` DOES fail 2 tests, so the suite discriminates one half and not the other. Either the handler is redundant (and is dead weight on the request path) or it is load-bearing and ships unverified.",
+    "remediation": "Decide which. If it stays, pin what only it does: `content-type: text/plain`, the exact `<status> <phrase>` body, the `[parley]` log prefix, and the clamp of an out-of-range `err.status`. If it does not, delete it and let the env pin carry the docblock's claim alone.",
+    "testUpgrade": "The class is 'a defence whose stated contribution is already delivered by something else in the chain'. Add a table over injected error shapes — `{status:200}`, `{status:999}`, `{status:1.5}`, `{statusCode:413}`, `{}`, a string throw, an error thrown after `res.writeHead` (headersSent path) — mounted via a route registered before the terminal handler, asserting response status, `content-type`, and exact body for each row. Then re-run the mutation: each row must fail with the handler removed. Generalise it as 'for every element of hardenErrorSurface, removing it alone turns at least one row red' so a third half added later inherits the requirement."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "public-base-url-validation",
+    "class": "scheme-never-constrained-to-http-or-https",
+    "file": "packages/bridge-core/src/auth/invariants.ts",
+    "line": 50,
+    "summary": "`assertPublicBaseUrl` checks 'https, or a loopback host' but never checks that the scheme is http/https at all. Any scheme on `localhost`/`127.0.0.1` passes, and for a non-special scheme `URL.origin` is the string 'null', so `canonicalResourceId`'s `resource.origin !== base.origin` cross-origin guard degenerates to `'null' !== 'null'` and cannot fire either. The guard's own docblock says it exists so a server cannot 'boot healthy and then 401 every token'.",
+    "failure": "`createOAuthRemoteApp(plugin, cfg, { issuerUrl: new URL('htp://localhost:8080'), verifyOwner })` — a one-character operator typo — boots and reports `resource = htp://localhost:8080/mcp`. Verified by direct execution; `foo://127.0.0.1:8080` and `ws://localhost:8080` boot identically. Every token is then minted with an audience no client can dereference, the advertised RFC 9728 resource identifier names a scheme nothing speaks, and nothing at boot says so. The SDK's own `checkIssuerUrl` does not catch it either (same 'https OR loopback host' shape).",
+    "remediation": "Add an explicit scheme check to `assertPublicBaseUrl`: `url.protocol` must be `https:`, or `http:` on a loopback host; anything else is refused by name. Same for `assertTrustRootUrl`, which has the identical shape and would accept `htp://localhost/jwks` as a JWKS trust root.",
+    "testUpgrade": "The class is 'a URL component the guard does not constrain'. Extend BASE_URL_SHAPES in invariants.test.ts with a scheme axis — `htp://localhost:PORT`, `foo://127.0.0.1:PORT`, `ws://localhost:PORT`, `file://localhost/`, `https://localhost:PORT` — each with an explicit boots/refuses outcome, and mirror the same rows onto `assertTrustRootUrl` in the trust-root ROWS table. Better still, drive it from a generator over `{scheme} x {host} x {path,query,fragment,userinfo}` and assert the invariant 'accepted implies `new URL(mcpPath, base).protocol` is http: or https: and `base.origin !== \"null\"`', which catches components nobody enumerated."
+  },
+  {
+    "target": "core-auth",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "protocol-conformance",
+    "theme": "token-endpoint-parameter-binding",
+    "class": "stricter-than-spec-rejection-of-a-conformant-client",
+    "file": "packages/bridge-core/src/auth/oauth-provider.ts",
+    "line": 240,
+    "summary": "`exchangeAuthorizationCode` compares `redirectUri !== rec.redirectUri` unconditionally. When a client with exactly one registered redirect URI omits `redirect_uri` from BOTH the authorization request and the token request — explicitly legal under RFC 6749 §4.1.3 / OAuth 2.1 §4.1.3, which make it REQUIRED at /token only *if* it was present at /authorize — the SDK defaults `rec.redirectUri` to `client.redirect_uris[0]` at /authorize and then passes `undefined` at /token, so the exchange always fails.",
+    "failure": "DCR a client with a single `redirect_uris` entry; GET /authorize with `client_id`, `response_type=code`, `code_challenge`, `code_challenge_method=S256` and no `redirect_uri`; approve consent; POST /token with `grant_type=authorization_code`, `code`, `code_verifier` and no `redirect_uri` -> HTTP 400 `invalid_grant` 'authorization grant is invalid or expired'. The owner has already given consent and burned the code, so the only diagnostic is a generic invalid_grant and the flow is unrecoverable without re-consenting. Traced through authorize.js:92 (`redirect_uri = client.redirect_uris[0]`) and token.js (`redirect_uri` optional).",
+    "remediation": "Record on the CodeRecord whether the client actually supplied `redirect_uri` at /authorize (the provider can see the difference only if the SDK forwards it, so either carry a flag or compare `redirectUri ?? rec.redirectUri`), and require the exact match only when it was supplied. Alternatively, refuse the /authorize request outright when `redirect_uri` is absent, so the client learns at the first hop instead of after the owner has consented — but do not leave the strictness silently at the last hop.",
+    "testUpgrade": "The class is 'a request shape the spec permits that this AS refuses, discovered only after consent is spent'. Turn the existing single case 'rejects a token exchange that omits redirect_uri' into a table over `{ suppliedAtAuthorize, suppliedAtToken, matches }` — all four combinations plus a mismatching value — with the expected outcome for each drawn from the RFC, and assert the failing rows fail *before* the pending consent is consumed where the spec allows an early refusal. Same table shape should cover `resource` (present/absent at each hop), which has the same two-hop optionality."
+  },
+  {
+    "target": "sqlite",
+    "dirs": [
+      "bridge-sqlite"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "cursor-identity-across-restart",
+    "class": "store-id-persistence-ungraded",
+    "file": "packages/bridge-sqlite/src/index.ts",
+    "line": 516,
+    "summary": "Nothing grades that `parley_meta.store_id` is read BACK rather than re-minted, so the entire justification of the `<storeId>.<rowid>` cursor design — that a cursor stays honourable across a bridge restart against the same file — is uncovered. test/cursor-replay.test.ts grades only the REPLAY arm across a reconnect (reset / backup-restore); every case asserting the HONOURED arm runs on one live connection where the in-memory storeId is trivially stable.",
+    "failure": "Mutation: in `readOrMintStoreId`, replace `return row.value;` with `return randomBytes(8).toString('hex');` (INSERT OR IGNORE and the row===undefined guard intact). `npx vitest run packages/bridge-sqlite` -> 341/341 PASS. Probe of the resulting shipped behaviour: connect(db_path=P); post m0,m1,m2; tail = fetchRecent({topic}).nextCursor; disconnect(); new SqlitePlugin().connect(db_path=P); fetchRecent({topic, since: tail}) returns ['m0','m1','m2'] instead of []. In production that is: every bridge restart treats core's persisted read-state as foreign and replays the whole topic window, and core's SeenSet is in-memory, so a Code session re-emits the replayed window as <channel> events on every start.",
+    "remediation": "No src change needed — the code is correct today; add the missing guard. Introduce a restart-generation case in test/cursor-replay.test.ts that reconnects to the SAME file and asserts the pre-disconnect cursor is still exclusive and that the store id is byte-identical across the reconnect.",
+    "testUpgrade": "Guard the CLASS 'a cursor survives a generation boundary that did NOT change the store' with a table over (transition) x (cursor position): transitions = [same-file reconnect, reconnect after more posts, reconnect after a retention prune, reconnect after a clean close/WAL checkpoint]; positions = [0, first row, mid, tail, tail-after-more-rows]. Each row asserts (a) drained contents equal exactly the rows after the cursor and (b) storeIdOf(p) is identical before and after. Run it alongside the existing UNHONOURABLE_CURSORS table so both arms — replay for a foreign store, exclusivity for the same store — are pinned across a reconnect, not only within one connection. The existing 'a store restored from an older backup' case is too narrow: it expects a replay either way, so it passes under the mutation."
+  },
+  {
+    "target": "sqlite",
+    "dirs": [
+      "bridge-sqlite"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "background-loop-failure-isolation",
+    "class": "handler-throw-guard-ungraded",
+    "file": "packages/bridge-sqlite/src/index.ts",
+    "line": 287,
+    "summary": "The poll loop wraps `handler(rowToMessage(row, storeId))` in a try/catch so a throwing consumer cannot be mistaken for a database failure. No test in the package ever registers a handler that throws, so the guard counts as coverage while being ungraded.",
+    "failure": "Mutation: delete the try/catch, leaving a bare `handler(rowToMessage(row, storeId));`. `npx vitest run packages/bridge-sqlite` -> 342/342 PASS. With the guard gone, one throwing handler invocation (core's push loop emitting into a closed stdio transport, e.g. EPIPE) falls into the loop's DB-error catch, is classified `unavailable`, prints a misleading `parley-sqlite: poll error on topic \"ctx\"`, and after 10 such ticks drives the topic to state 'degraded' with a backoff toward 30 s — a consumer bug reported to the operator as a store outage, throttling live push.",
+    "remediation": "No src change needed. Add a case to test/background-jobs.test.ts subscribing a handler that throws on the first N messages, asserting later messages still arrive, no `poll error` line is written, and subscriptionHealth(T)[0] stays state 'live' with consecutiveFailures 0.",
+    "testUpgrade": "Add a second dimension to the existing ERROR_CASES decision table — WHO threw. Parameterize source = ['select statement', 'handler'] x the existing SQLITE_*/unclassified rows, asserting that only the 'select statement' source may move `state` off 'live' or emit a diagnostic. That also catches the inverse regression (a widened guard that swallows real DB errors)."
+  },
+  {
+    "target": "sqlite",
+    "dirs": [
+      "bridge-sqlite"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "stated-blast-radius-vs-actual",
+    "class": "understated-failure-cost",
+    "file": "packages/bridge-sqlite/README.md",
+    "line": 38,
+    "summary": "The README justifies throwing on an unparseable cursor by claiming it costs one page: 'absorbing it would wedge the topic's catch-up forever instead of costing one page.' Rejecting it actually costs the whole bridge: resumeAfter throws, catchUpAll rethrows out of buildBridge, and cli.ts's main().catch exits 1 — permanently, on every subsequent start, until an operator deletes read-state.",
+    "failure": "Reproduced with the shipped dist/cli.js: config with state_path pointing at {\"ctx\":\"s123_456\"} (a Matrix-shaped cursor left behind by repointing an instance from parley-matrix to parley-sqlite under the default instance_id) -> stderr 'parley-sqlite: fatal: Error: catch-up failed on topic \"ctx\" ... malformed cursor', EXIT=1, identical on retry. The doc also hides an inconsistency: a foreign NUMERIC cursor ('123456789', a NATS/Telegram id) self-heals by replaying, while a foreign non-numeric one is a hard startup failure.",
+    "remediation": "Restate the cost honestly in README.md and in the resumeAfter JSDoc: an unparseable cursor stops the bridge at catch-up-on-start until read-state is cleared (core's error already names the file and the fix). Keeping the fail-fast behaviour is defensible; describing it as 'one page' is not.",
+    "testUpgrade": "Guard the CLASS 'a documented failure cost matches the observed blast radius' with a table in src/cli.test.ts over (bad persisted state) x (expected blast radius): [malformed cursor -> non-zero exit + message naming state_path], [foreign numeric cursor -> bridge up + topic replayed], [foreign storeId cursor -> bridge up + replayed], [own cursor above high water -> bridge up + replayed]. Each row asserts the process verdict, so a change to either the behaviour or the prose that desynchronizes them turns red."
+  },
+  {
+    "target": "sqlite",
+    "dirs": [
+      "bridge-sqlite"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "stated-blast-radius-vs-actual",
+    "class": "test-attribution-drift",
+    "file": "packages/bridge-sqlite/README.md",
+    "line": 217,
+    "summary": "README: 'test/multi-process.test.ts covers the pragmas themselves: each one is asserted through an observable consequence (`PRAGMA` read-back, the -wal sidecar appearing on disk, a contended write retrying ...)'. That file's PRAGMAS block reads no pragma back — it only asserts the README mentions each pragma name and consequence. The read-back lives in test/driver-parity.test.ts, whose own comment says so.",
+    "failure": "multi-process.test.ts lines 52-82: the per-pragma `it` bodies are `expect(README).toContain(p.name)` / `expect(README).toMatch(p.consequence)`. A reader following the README to verify the pragma claim lands on a doc-string check and concludes pragma VALUES are graded there when they are not; if driver-parity.test.ts were deleted, the README would still point at a file grading nothing about pragma values.",
+    "remediation": "Point the sentence at test/driver-parity.test.ts for the read-back, and describe multi-process.test.ts as covering the -wal sidecar, the contended write, the DDL-drift comparison and the README-documentation check.",
+    "testUpgrade": "Add a README-claim table mapping each named test file to a regex its content must match (multi-process.test.ts -> /-wal|busy_timeout|byte-identical DDL/, driver-parity.test.ts -> /PRAGMA \\$\\{p\\.name\\}/), so a claim naming the wrong file fails instead of rotting. This is the same ratchet as the finding above, applied to file attribution rather than blast radius."
+  },
+  {
+    "target": "sqlite",
+    "dirs": [
+      "bridge-sqlite"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "observability-lies-about-liveness",
+    "class": "health-map-keyed-collision",
+    "file": "packages/bridge-sqlite/src/index.ts",
+    "line": 272,
+    "summary": "subscribe() keys this.health by topic and overwrites unconditionally, but starts an independent poll loop on every call. Two subscriptions to one topic run two loops while subscriptionHealth() reports one entry — contradicting the invariant test/lifecycle.test.ts names ('subscriptionHealth never reports a loop that cannot deliver'). The plugin also silently double-delivers rather than failing fast on a call it cannot represent, unlike connect(), which refuses to run twice.",
+    "failure": "Probe: connect(poll_interval_ms=10); subscribe('ctx', a); subscribe('ctx', b); post('ctx','x') -> observed handlerA=['x'] handlerB=['x'] health=[{\"topic\":\"ctx\",\"state\":\"live\",\"consecutiveFailures\":0}] — one health record for two live loops. If the first loop later takes 10 consecutive fatal errors it sets state 'stopped' on an object no longer in the map, so a supervisor polling subscriptionHealth() reads 'live' for a handler that has permanently stopped receiving. Core never subscribes twice today, so this is embedder-facing rather than a shipped outage.",
+    "remediation": "Either reject a duplicate subscribe(topic) with a named error (fail-fast, matching connect()'s posture), or key health per subscription and have subscriptionHealth(topic) return one record per loop.",
+    "testUpgrade": "Guard the CLASS 'every started loop is represented in subscriptionHealth' with a parameterized case over subscription counts [1, 2, 3] on the same topic and on distinct topics: assert subscriptionHealth().length equals the number of loops that can deliver, and that after breaking the Nth loop's select the report shows a non-'live' entry. The same table catches the inverse (a loop torn down but still reported)."
+  },
+  {
+    "target": "redis",
+    "dirs": [
+      "bridge-redis"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "config-knob-effect-untested",
+    "class": "retention-trim-never-observed",
+    "file": "packages/bridge-redis/src/index.ts",
+    "line": 475,
+    "summary": "`retention_days` can be made a complete no-op and all 304 bridge-redis tests stay green. Every retention case grades only the negative direction (\"history is KEPT\"); nothing anywhere asserts that a single entry is ever trimmed, so the knob's one observable effect is uncovered while the README and DESIGN §11 both promise it.",
+    "failure": "Mutation: replace the `this.retentionDays !== undefined ?` guard on the `XADD ... TRIM {MINID ~}` option with `false` (i.e. never send a trim). `PARLEY_REDIS_URL=redis://127.0.0.1:6399 npx vitest run --root . packages/bridge-redis` → `Test Files 9 passed (9) / Tests 304 passed (304)`. A shipped bridge configured `retention_days: 30` would then retain every message forever — unbounded Redis memory growth on the exact backends whose store Parley owns — with no test, no error and no log line. The nearest cases (live-failure-modes.test.ts:90 `%s keeps every posted message`, :164 `every accepted %s round-trips post → fetchRecent`) pass a retention window and assert nothing was deleted, which the mutant satisfies perfectly.",
+    "remediation": "Add a positive-direction retention case. Verified feasible against a real server: seed ~200 entries at explicit ids 30 days in the past via an independent writer (`xAdd(key, `${old+i}-0`, …)`), connect the plugin with `retention_days: 1`, issue one `post`, then assert `XLEN` collapsed to the fresh entry (measured: 200 old → 1 remaining, 1000 old → 1 remaining, 5 old → 6 remaining because `~` trims whole nodes).",
+    "testUpgrade": "Guard the CLASS \"a config knob whose only effect is on backend state is graded solely by its negative direction\": add a table over the knob's *effect*, parameterized by (retention_days, seeded age, seeded volume) — e.g. rows [{days:1, ageDays:30, n:200, expect:'trimmed'}, {days:30, ageDays:1, n:200, expect:'kept'}, {days:1, ageDays:30, n:5, expect:'kept — approximate trim, node-granular'}] — asserting XLEN/fetchRecent contents in both directions from one generator. The third row also pins the `~` approximation the README claims, which no test currently exercises. Apply the same both-directions rule to every knob in CONFIG_KEYS whose effect is externally observable."
+  },
+  {
+    "target": "redis",
+    "dirs": [
+      "bridge-redis"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "docs-vs-code",
+    "class": "undocumented-cursor-heal-contradicts-exclusive-since",
+    "file": "packages/bridge-redis/README.md",
+    "line": 13,
+    "summary": "The README, the shipped npm `description`, and the RedisPlugin class JSDoc all state that `fetchRecent` is exclusive on `since` (`XRANGE <key> (since +`). It is not: a cursor sorting past the stream's last generated id silently re-queries the whole recent window with XREVRANGE and returns messages STRICTLY BEFORE `since`, with a regressed `nextCursor`. The sibling backends that do the same thing document it (bridge-sqlite README:31-32, bridge-nats README:33); this one does not.",
+    "failure": "`fetchRecent({topic, since: '<Date.now()+86400000>-0'})` on a topic holding messages a,b → returns `{messages:[a,b], nextCursor: <cursor of b>}`, i.e. two messages older than the cursor the caller asked to read strictly after, and a cursor lower than the one supplied. Pinned by live-failure-modes.test.ts:515 and core-catchup.test.ts:86 (`resolves.toBe(2)`), so the behaviour is deliberate — only the docs are wrong. An operator reading the README's mapping table cannot predict a whole-window replay into a live session, and `package.json`'s \"XRANGE for exclusive-since catch-up\" ships that claim to npm.",
+    "remediation": "Add a short README paragraph (mirroring bridge-sqlite's) stating that a cursor above the stream's high-water mark — a re-created dataset, a repointed `url`, a changed `key_prefix`, an evicted key — is treated as unset, so catch-up self-heals by replaying the most recent `limit` entries and returning a lower `nextCursor`. Soften the `fetchRecent` row in the mapping table and the class JSDoc accordingly.",
+    "testUpgrade": "Guard the CLASS \"a behaviour tested in code but absent from the package's own prose\": extend readme.test.ts with a table mapping each named plugin behaviour to a required README phrase — rows for the past-the-tail heal, the labelled-refusal path, the live-delivery-STOPPED line, the block_ms floor — driven from a single exported list so a behaviour added later must add its row. Widen it to grade `package.json.description` with the same phrases, since that string ships to npm independently."
+  },
+  {
+    "target": "redis",
+    "dirs": [
+      "bridge-redis"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "silent-failure",
+    "class": "long-poll-swallows-permanent-refusal",
+    "file": "packages/bridge-redis/src/index.ts",
+    "line": 591,
+    "summary": "`blockingRead`'s bare `catch { return []; }` swallows permanent, operator-fixable server refusals on the long-poll path, while the `subscribe` loop classifies the identical refusals via `serverRefusal()` and reports them to stderr. The same NOPERM is loud on one path and invisible on the other.",
+    "failure": "Reproduced against a live redis:7-alpine with `ACL SETUSER poller on >pw ~* &* +@read +@write +@connection +@keyspace -xread`. `subscribe` → stderr: `parley-redis: live delivery STOPPED for topic 'acl2' … NOPERM … 'xread'`. `fetchRecent({topic, since: <tail>, blockMs: 1500})` → resolves `{messages:[], nextCursor:'1785392750481-0'}` in 8ms, no error, no stderr. Core's fetchRecentBlocking then naps 250ms and retries, so every `parley_fetch_recent` with the default 60s budget opens and burns ~240 doomed Redis connections while reporting a normal empty long-poll. The same silence covers any reader-open failure (maxclients, a proxy accepting TCP then stalling — exactly the state live-failure-modes.test.ts:995 creates and never grades the returned page of).",
+    "remediation": "In `blockingRead`, run the caught error through `serverRefusal()`; on a permanent refusal (or a repeated reader-open failure) surface it — either by rethrowing so `labelled()` names the plugin/topic/key, or at minimum by emitting the same one-line stderr diagnostic `subscribe` already uses. Keep the `[]` fallback only for teardown and transient socket faults.",
+    "testUpgrade": "Guard the CLASS \"the same backend fault is diagnosed on one delivery path and swallowed on another\": parameterize the existing permanent/transient reason table (subscribe-hardening.test.ts:233) over PATH ∈ {subscribe, blocking fetchRecent} as well as REASON, asserting that a permanent reason produces a labelled error or a stderr line on both paths and that a transient one produces neither. Add a live row using an ACL user without `xread` so the class is also covered end-to-end rather than only against the mock."
+  },
+  {
+    "target": "redis",
+    "dirs": [
+      "bridge-redis"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "protocol-conformance",
+    "theme": "message-normalization",
+    "class": "non-iso-timestamp-passthrough",
+    "file": "packages/bridge-redis/src/index.ts",
+    "line": 766,
+    "summary": "`entryTimestamp` accepts any string `Date.parse` does not reject and forwards it verbatim, so a foreign writer's `ts` can put a non-ISO-8601 value into `Message.timestamp`, which DESIGN §5 declares is ISO 8601. The function's own JSDoc says a foreign entry must \"normalize into a Message that satisfies the DESIGN §5 contract\"; it only handles the unparseable case.",
+    "failure": "`XADD parley:t * sender a content x ts 'Mon Jan 01 2020'` (also `'2020'`, `'12/25/2021'`, `'Tue, 05 Nov 2024 10:00:00 GMT'`) → `fetchRecent` returns `timestamp: \"Mon Jan 01 2020\"` / `\"2020\"` / `\"12/25/2021\"` verbatim (reproduced on a live server). That string reaches core, the `<channel>` event and `parley_list_users` as if it were ISO 8601. Worse, non-ISO `Date.parse` input is implementation-defined, so which of these is accepted can differ between Node versions. The guarding row (live-failure-modes.test.ts:295) only uses a proper ISO string, and every other assertion is `!Number.isNaN(Date.parse(ts))` — which the defect satisfies.",
+    "remediation": "Re-serialize instead of passing through: `const at = Date.parse(ts); return Number.isNaN(at) ? fromId() : new Date(at).toISOString();`.",
+    "testUpgrade": "Guard the CLASS \"a field with a declared FORMAT is asserted only for parseability\": widen the foreign-entry table with a `ts` axis of parseable-but-non-ISO spellings (RFC 2822, `MM/DD/YYYY`, bare year, `YYYY-MM-DD` without time, an offset form) and assert `m.timestamp === new Date(m.timestamp).toISOString()` for every row rather than `!isNaN(Date.parse(...))`. The same shape assertion belongs in the conformance suite's expectWellFormedMessage so it grades all eleven backends."
+  },
+  {
+    "target": "redis",
+    "dirs": [
+      "bridge-redis"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "lifecycle-gating",
+    "class": "long-poll-generation-gate-unguarded",
+    "file": "packages/bridge-redis/src/index.ts",
+    "line": 584,
+    "summary": "Both `gen !== this.generation` guards in `blockingRead` can be deleted with the whole suite green, even though the structurally identical guard in `startReadLoop`/`tearDown` is genuinely guarded (removing the `connecting` exclusion reddens a leak case). Lifecycle-supersession is graded on the subscribe path only; the long-poll path's version is unmeasured coverage.",
+    "failure": "Mutation: delete `if (gen !== this.generation) return [];` after `connectReader` and weaken `if (gen !== this.generation || res === null) return []` to `if (res === null) return []`. Full run → `Tests 304 passed (304)`. With those gates gone, a `fetchRecent(blockMs)` whose reader was still inside `connectReader` when `disconnect()` ran (tearDown deliberately skips `connecting` readers) proceeds to issue `XREAD BLOCK` on a superseded connection: the socket lives for the whole granted budget past `disconnect()`, and the call can resolve with messages after the plugin was torn down — which the conformance clause \"disconnect is idempotent and stops the plugin serving\" forbids. The existing lifecycle rows only poll `proxy.live() === 0` for 5s with short block budgets, so they cannot see it.",
+    "remediation": "Keep the gates and grade them: after `disconnect()` wins the race during a reader handshake, the in-flight blocking `fetchRecent` must resolve empty, hold no socket, and deliver nothing written afterwards.",
+    "testUpgrade": "Guard the CLASS \"a supersession gate exists on every lifecycle path but is asserted on only one\": add a table over PATH ∈ {subscribe, blocking fetchRecent} × RACE ∈ {disconnect during reader handshake, connect during reader handshake, disconnect while parked in the blocking read}, using a proxy that delays the handshake so the `connecting` window is deterministic, and assert in every cell (a) sockets return to zero within a bound well under the block budget and (b) no message written after the lifecycle call is delivered or returned."
+  },
+  {
+    "target": "postgres",
+    "dirs": [
+      "bridge-postgres"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "race-closing-requery-untested",
+    "file": "packages/bridge-postgres/src/index.ts",
+    "line": 647,
+    "summary": "The `this.drain(sub)` that closes the tail-read -> LISTEN window in startSubscription can be deleted with all 528 tests still green, although removing it permanently loses live-path messages.",
+    "failure": "Delete line 647 (`this.drain(sub);`) and run `PARLEY_PG_URL=... npx vitest run packages/bridge-postgres`: 528/528 still pass. Its absence is a real defect — with a 400ms sleep inserted between the `SELECT COALESCE(MAX(seq),0)` tail read and `acquireListen`, a probe where plugin A subscribes and independent client B posts 100ms into that window observes `live === []` (expected `['in-window']`) after 1.5s; the row's NOTIFY fired before the LISTEN existed, `lastSeen` sits below its seq, and nothing re-triggers a drain until the NEXT post to that topic. With line 647 restored and the same widened window the probe passes.",
+    "remediation": "Keep the drain; add a case that grades it. Expose the tail-read -> LISTEN gap to a test (an injectable hook, or the existing `vi.mock('pg')` Pool delaying the `MAX(seq)` read) so a row that becomes visible inside the window can be made to land with no notification, and assert it is delivered.",
+    "testUpgrade": "Parameterize a `subscribe` arming-window table over WHERE inside registration a row becomes visible — after the tail read but before LISTEN, during LISTEN, and after registration — crossed with 0/1/N pre-existing subscriptions on the channel, with the doorbell explicitly never rung for the pre-LISTEN cells. This is the same class the waiters suite already guards for blocking fetch ('a row landing in the LISTEN snapshot window still wakes the waiter'); the subscribe path has the identical arm-then-requery shape and no equivalent table. `test/subscribe-race.test.ts` and the conformance clause 'subscribe delivers exactly the post-subscribe tail' are both too narrow: they post only after `await subscribe(...)` has resolved, so the window is always already closed."
+  },
+  {
+    "target": "postgres",
+    "dirs": [
+      "bridge-postgres"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-without-negative-control",
+    "class": "crash-guard-untested-on-one-connection-surface",
+    "file": "packages/bridge-postgres/src/index.ts",
+    "line": 306,
+    "summary": "`pool.on('error', () => undefined)` — the guard that keeps an idle-client error from killing the bridge process — can be deleted with all 528 tests still green; the listener Client's identical guard IS covered.",
+    "failure": "Replace line 306 with a no-op and run the suite: 528/528 pass. Probe with the mutation applied: connect with `?application_name=probe_x`, `post()` once so a client returns to the pool idle, then `SELECT pg_terminate_backend(pid) ... WHERE application_name='probe_x'` (a server restart or an admin kill in production) raises `uncaughtException: terminating connection due to administrator command`, which takes down a real stdio bridge. Restoring the handler makes the probe pass. `test/background-tasks.test.ts` grades exactly this property for the listener `Client` and nothing grades it for the `Pool`; none of the seven `vi.mock('pg')` Pool fakes in the suite can emit an `error` event at all.",
+    "remediation": "Keep the handler; make the pool fake able to emit `error` (give the mocked Pool the same emitter shape MockClient already has) and add a case asserting no `uncaughtException` reaches the process, plus a real-server case using the harness's `terminateBackends`.",
+    "testUpgrade": "Extend `test/background-tasks.test.ts`'s 'background chores never escape as an unhandled rejection' into a table over EVERY connection surface the plugin owns — pooled query client, pooled idle client, dedicated listener Client — crossed with failure mode (socket error, server-side terminate, mid-query kill) and lifecycle phase (during connect bootstrap, idle, mid-drain, mid-blocking-fetch, during disconnect). One row per surface makes the omission of a future surface visible instead of silently uncovered."
+  },
+  {
+    "target": "postgres",
+    "dirs": [
+      "bridge-postgres"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-hygiene",
+    "theme": "fake-duplication",
+    "class": "per-file-restated-driver-mock",
+    "file": "packages/bridge-postgres/test/suite-hygiene.test.ts",
+    "line": 35,
+    "summary": "Seven test files each restate a 35-71 line `vi.mock('pg')` MockClient/Pool fake (~350 lines), while the hygiene rule that exists because 'copies drift' only enforces sharing of the real-server helpers.",
+    "failure": "`grep -c 'class MockClient' *.test.ts` returns 1 for background-tasks, lifecycle, listener-blackout, read-ordering, subscribe-race, teardown-delivery and waiters. The drift is already load-bearing: the seven Pool fakes differ in whether `connect()`'s client answers anything, and none of them models `pool.on('error')` — which is exactly why finding 2's guard is uncovered. A reviewer cannot tell which file's fake is the honest one, and changing one changes what a whole file asserts with no assertion edited.",
+    "remediation": "Move the MockClient/Pool factory into `test/fake-pg.ts` beside `servePool`, parameterized by the per-file knobs already in use (listen mode/delay, query failure injection, row source), and extend `suite-hygiene.test.ts`'s enforcement to it.",
+    "testUpgrade": "Generalize the suite-hygiene rule from a hard-coded helper list to a structural one: assert that no `*.test.ts` in the package declares a class or factory that implements the pg driver surface (`connect`/`query`/`end`/`on`) — a regex over `class \\w*(Client|Pool)` plus a `vi.mock('pg')` body length cap. That catches the next fake someone inlines under a different name, which a name list never will."
+  },
+  {
+    "target": "postgres",
+    "dirs": [
+      "bridge-postgres"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "guard-that-cannot-fire",
+    "class": "rule-entry-with-hardcoded-exemption",
+    "file": "packages/bridge-postgres/test/suite-hygiene.test.ts",
+    "line": 17,
+    "summary": "`SHARED_HELPERS` lists `isPostgresUp`, which `pg-harness.ts` does not export, and the export self-check skips that entry explicitly — a rule entry that grades nothing.",
+    "failure": "`test/suite-hygiene.test.ts:52` reads `if (name === 'isPostgresUp') continue;`, so the 'the harness exports every helper the rule points files at' case can never fail for it. `grep isPostgresUp test/pg-harness.ts` returns nothing. The entry looks like coverage of a helper that does not exist, and the exemption pattern invites the next stale name to be added the same way.",
+    "remediation": "Delete the `isPostgresUp` entry and the `continue`, or rename the harness export to it. Do not carry list entries that need a per-name exemption to pass.",
+    "testUpgrade": "Make the list self-verifying instead of exempt-able: derive `SHARED_HELPERS` from the harness's own exported names (parse `export (async )?function|const` out of `pg-harness.ts`) and assert the derived set is non-empty, so an entry can never be both 'enforced against test files' and 'not actually a harness export'."
+  },
+  {
+    "target": "postgres",
+    "dirs": [
+      "bridge-postgres"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "universal-claim-with-a-counterexample",
+    "class": "jsdoc-claims-every-path",
+    "file": "packages/bridge-postgres/src/schema.ts",
+    "line": 47,
+    "summary": "`badConfig`'s JSDoc claims every rejection this package raises goes through it, so the `parley-postgres: … backend_config.<key>` contract 'holds on every path an operator's value can take'. The unknown-key path does not.",
+    "failure": "`validateBackendConfig` at `packages/bridge-postgres/src/index.ts:83` throws `parley-postgres: unknown backend_config key 'x' — expected one of url, table_name, pool_size, retention_days` directly via `new Error`, not via `badConfig`, and therefore does not carry the documented `invalid backend_config.<key>` shape. `test/config-validation.test.ts:73` pins that second, different shape — so the code is intentional and the comment is the wrong half.",
+    "remediation": "Narrow the JSDoc to what is true ('every rejection of a VALUE'), or route the unknown-key rejection through a sibling formatter in schema.ts so there is one documented family of two shapes. Per CLAUDE.md, prefer deleting the comment and letting the two formatters name themselves.",
+    "testUpgrade": "Add a table over every rejection `validateBackendConfig`/`assertTableName` can raise (unknown key, each knob x each bad value class, each bad table_name class) asserting each message matches one of an explicitly enumerated set of message shapes — so adding a rejection path that invents a third shape, or a doc claim that outruns the code, fails here rather than being described in prose."
+  },
+  {
+    "target": "matrix",
+    "dirs": [
+      "bridge-matrix"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "live-path-message-loss",
+    "class": "backfill-boundary-read-after-position",
+    "file": "packages/bridge-matrix/src/index.ts",
+    "line": 709,
+    "summary": "subscribe() seeds the `limited`-burst backfill boundary (`lastDelivered`) from `timelineTip()`, an HTTP round-trip AFTER the positioning `/sync` fixed `nextBatch`. Any event that lands in that window is post-subscription (it is newer than nextBatch, so it MUST be delivered) but is treated as already-delivered, so the backward `backfill` stops at it and silently discards it and everything between it and nextBatch.",
+    "failure": "FakeSynapse, per-topic room, syncCap=3. Post 'seed'; call subscribe(T). Using onRequest, land window-0..window-2 while the timelineTip `/messages?dir=b&limit=1` request is in flight (positioning /sync has already returned). Then land burst-0..burst-9 so the first incremental /sync is `limited`. Handler receives ['burst-0'..'burst-9'] — window-0..2 are NEVER delivered, and limitedEmitted === 1 proves the backfill path ran. Expected all 13 in order. On a real Synapse the same shape is a >100-event burst plus any traffic in the one round-trip between the positioning sync and the tip read; those events never become `<channel>` events for the running session.",
+    "remediation": "Do not use a separately-read tip as the delivery boundary. Either (a) derive the boundary from the positioning sync itself — e.g. take the tip BEFORE the positioning `/sync` so it can only be at or behind nextBatch (over-including is safe: the `skip` set and the ascending re-delivery order handle overlap, and per-topic rooms cannot leak foreign history), or (b) stop paging backfill at the positioning `next_batch` token rather than at an event id, so the boundary is exactly the subscription position. Keep the shared_room pre-history guard by intersecting with, not replacing, that position.",
+    "testUpgrade": "CLASS = 'a live-path recovery boundary established at a different instant than the subscription position'. Parameterize the existing `subscribe recovers a burst larger than the per-sync cap via prev_batch` table (catchup-sync.fake.test.ts) with a new axis WHEN-EVENTS-LAND: {before subscribe, inside the positioning /sync, inside the timelineTip read, after subscribe returns} x {syncCap 1,2,3} x {prevBatchOverlap 0,1,2} x {shared_room true,false}, asserting the handler sees EXACTLY the post-position events, once, ascending. Add a fake hook that lands events before a named request's body is computed (FakeSynapse.onRequest already does this) and record which hook fired, so a row that armed nothing fails instead of grading a different window. The current table only lands events after `await p.subscribe(...)`, so no row can reach this cell."
+  },
+  {
+    "target": "matrix",
+    "dirs": [
+      "bridge-matrix"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "unvalidated-backend-config",
+    "class": "compile-time-only-enum-on-a-privilege-granting-knob",
+    "file": "packages/bridge-matrix/src/index.ts",
+    "line": 240,
+    "summary": "`RoomPreset` is a TypeScript union only. `backend_config` is `z.record(z.unknown())` in core (config.ts:180), so `connect()` assigns `cfg.room_preset` with no runtime check and `resolveOrCreateRoom` forwards it verbatim to POST /createRoom. `trusted_private_chat` — the preset the JSDoc and README say is deliberately excluded because it hands every invitee power level 100 (letting any of them flip `m.room.join_rules` to `public`) — is fully accepted from YAML, with no warning from `configRisks` and no load error.",
+    "failure": "parley.config.yaml with `backend_config: { room_preset: trusted_private_chat }`. Reproduced: POST /createRoom body is `{\"room_alias_name\":\"parley_t\",\"preset\":\"trusted_private_chat\",\"visibility\":\"private\"}` and console.warn emitted zero lines. A junk value is forwarded too: `room_preset: public_chat_lol` produced `{\"preset\":\"public_chat_lol\",...}` on the wire (a homeserver 400 at first post, not at load). README line 87 states \"Matrix's third preset, `trusted_private_chat`, is deliberately **not accepted**\" — it is.",
+    "remediation": "Validate in `connect()` before the login: `if (cfg.room_preset !== undefined && !ROOM_PRESETS.includes(cfg.room_preset)) throw` naming the accepted members and, for `trusted_private_chat` specifically, why it is refused. This matches the repo's existing fail-fast posture for an unsupported privilege knob (`skip_permissions: true` is a load error, never a lenient no-op). Every other `backend_config` string that reaches the wire or the loop arithmetic should be validated in the same pass.",
+    "testUpgrade": "CLASS = 'a backend_config value whose only guard is the TypeScript type'. Add a table over EVERY typed field of MatrixBackendConfig x {a value outside its union/type, a value of the wrong JS type, a value out of range}, driving `new MatrixPlugin().connect(cfg as unknown as BackendConfig)` and asserting it REJECTS (or, where lenience is intended, warns) — never that the value reaches `fake.createRoomBodies` / the request URLs. Include an explicit row asserting `trusted_private_chat` is refused, and a negative-control row per ROOM_PRESETS member asserting it is accepted. The existing provisioning table only iterates ROOM_PRESETS, so no row can supply a value outside the union; shipped-artifacts.test.ts only checks the README documents each union member."
+  },
+  {
+    "target": "matrix",
+    "dirs": [
+      "bridge-matrix"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "unvalidated-backend-config",
+    "class": "degenerate-timing-knob-becomes-a-busy-loop",
+    "file": "packages/bridge-matrix/src/index.ts",
+    "line": 512,
+    "summary": "`sync_timeout_ms` is documented as \"Unbounded\" and is never validated. `blockingFetch` computes `slice = Math.min(remaining, this.syncTimeoutMs)`; with `sync_timeout_ms: 0` (or negative) the slice is 0, so the waiter timer fires immediately and the park/re-query loop spins for the whole budget, re-running the canonical `/context` + `/messages` catch-up each pass. `pollBoundedSync` has an explicit anti-hot-spin pace guard for exactly this shape; the blocking park and the subscribe loop have none.",
+    "failure": "backend_config `{ sync_timeout_ms: 0 }`; post a seed, take the tail cursor, then `fetchRecent({ topic, since: tail, blockMs: 500 })`. Reproduced: 218 `/messages` requests issued during that single 500ms call (222 with `sync_timeout_ms: -1`). At the production default `catchup.block_max_ms: 60000` one idle `parley_fetch_recent` becomes roughly 26,000 homeserver requests — self-inflicted rate-limit exhaustion from a single config typo, with no warning at load.",
+    "remediation": "Validate `sync_timeout_ms` in `connect()` (positive integer; reject 0/negative/NaN, naming the default), and independently floor the park slice — e.g. `Math.min(remaining, Math.max(this.syncTimeoutMs, MIN_SLICE_MS))` — so no config value can turn the wait into a re-query storm. Consider giving the subscribe loop the same pace guard `pollBoundedSync` already carries, so a non-blocking or degenerate `/sync` endpoint cannot hot-spin it either.",
+    "testUpgrade": "CLASS = 'a timing knob whose degenerate values collapse a wait into a request storm'. Add a parameterized case over sync_timeout_ms in {0, -1, NaN, 1, 50, 25000} x {blocking fetchRecent with blockMs=500, subscribe loop for 500ms} asserting a REQUEST-RATE ceiling from `fake.messagesRequests.length` / `fake.syncAttempts.length` (e.g. <= blockMs / MIN_SLICE_MS + k) — not just that the call returns. Note the existing sync-deadline.fake.test.ts sweeps sync_timeout_ms only over {1000, 25000, 30000, 60000} and asserts deadlines, never a rate, so no degenerate value is reachable there."
+  },
+  {
+    "target": "matrix",
+    "dirs": [
+      "bridge-matrix"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "teardown-invariants",
+    "class": "staleness-gate-before-an-await-it-is-meant-to-cover",
+    "file": "packages/bridge-matrix/src/index.ts",
+    "line": 926,
+    "summary": "`existingRoom` gates on `isStale(generation)` BEFORE `await this.joinRoom(...)` and then repopulates `this.rooms` after it. The JSDoc claims the gate stops a teardown landing mid-resolve from joining with a cleared token and repopulating `rooms` for the next generation, but a `disconnect()` landing during the awaited join is not covered: the join completes post-teardown and `this.rooms.set(key, ...)` re-adds an entry `disconnect()` just cleared. Compounding it, the cached fast path at line 920 returns the cached room with no staleness check at all.",
+    "failure": "Trace: fetchRecent(topic) with no cached room -> lookupAlias resolves -> isStale false -> `await joinRoom(...)` -> disconnect() runs (stopped=true, controllers aborted, rooms.clear(), token=undefined) -> joinRoom resolves -> `this.rooms.set(key, Promise.resolve(roomId))`. `rooms.size === 1` after a completed disconnect, violating the invariant reconnect-lifecycle.fake.test.ts asserts for REGISTRIES. Harm is bounded (the next `connect()` clears `rooms`, and the token is gone so requests would 401), but the stated guard does not hold and the cached-entry fast path would serve it.",
+    "remediation": "Re-check `isStale(generation)` after the awaited `joinRoom` and return `undefined` without caching when stale; equally, gate the cached fast path on generation so a post-teardown cache hit cannot be served. Same treatment for `ensureRoom`'s memoized promise.",
+    "testUpgrade": "CLASS = 'a staleness gate placed before the await it is supposed to cover'. Extend the reconnect-lifecycle REGISTRIES table with a WHERE-THE-DISCONNECT-LANDS axis driven off FakeSynapse.onRequest / holdMessages — {during /directory lookup, during /join, during the positioning /sync, during /messages} x {fetchRecent, post, subscribe} — asserting all four registries are empty after the sequence AND that no request is issued after teardown. The current lifecycles only disconnect at coarse points (after subscribe, racing an in-flight subscribe), so no row can land inside the join."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "occupant-identity-reconciliation",
+    "class": "global-nick-revert-strands-already-joined-rooms",
+    "file": "packages/bridge-xmpp/src/index.ts",
+    "line": 1041,
+    "summary": "`revertToProvisionalNick()` mutates the connection-wide `this.nick` but neither records the old nick in `roomNicks` for rooms already entered under it, nor forgets/re-joins them (the way `switchNick` does). Every subsequent `post` to those rooms fails the `resourceOf(from) === this.occupantNick(room)` provenance check in `onGroupchat`, so its reflection is dropped and the post stalls to POST_TIMEOUT_MS — permanently, because nothing ever re-reconciles the nick.",
+    "failure": "Live against Prosody (throwaway container, examples/dev-compose image/flags): a second account pins nick `alice` in room B. Plugin connects with no `backend_config.nick`; `post(A,'alice','first')` -> ok (`joined[A]` under nick `alice`); `post(B,'alice','second')` -> join answered `conflict`, plugin reverts `this.nick` to `parley-<rand>` and joins B -> ok; `post(A,'alice','third')` -> `ERR post reflection timeout in qa-1-klj8ul@muc.parley.local` after 15905 ms, and every later post to A does the same. This is exactly the stall the `roomNicks` JSDoc says the per-room map exists to prevent — the map is only ever written on a service rewrite (status 210), never on the plugin's own revert.",
+    "remediation": "Make every mutation of `this.nick` reconcile existing occupancy. Either (a) in `revertToProvisionalNick`, before assigning, `for (const room of this.joined.keys()) this.roomNicks.set(room, oldNick)` so those rooms keep recognising their own reflections, or (b) route the revert through `switchNick`-style handling: `forgetAllRooms()` + re-drive `ensureJoinedRoom` for each, so every room is actually re-entered under the new nick. Option (b) also keeps `parley_list_users` attribution consistent across rooms.",
+    "testUpgrade": "Guard the CLASS \"a connection-wide occupant-nick change leaves a previously joined room addressed under the stale nick\". Parameterize `join-recovery.test.ts` over a *room count* axis (>=2 rooms) crossed with each nick-changing event (`conflict` revert, `switchNick` on first-post identity adoption, service rewrite status 210, reconnect re-join) and assert, for EVERY room joined before the event, that a subsequent `post` resolves within a bound well under POST_TIMEOUT_MS. The existing table is single-room only, so no row can observe cross-room divergence."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "fixture-cannot-express-the-state-under-test",
+    "class": "fake-models-one-connection-wide-occupant-nick",
+    "file": "packages/bridge-xmpp/test/fake-xmpp.ts",
+    "line": 168,
+    "summary": "`FakeXmpp` holds a single `nick` field for the whole connection: `answerJoin` overwrites it on every join and `onPost` reflects from `${room}/${this.nick}` for all rooms. The fixture therefore cannot represent one connection occupying room A as `alice` and room B as `parley-xxx` — which is precisely the state `XmppPlugin.roomNicks` exists to model and precisely the state the confirmed nick-revert defect creates. Every fake-driven test agrees with the plugin by construction.",
+    "failure": "The same scenario as the confirmed defect, written against `FakeXmpp` (post A as alice; conflictNicks.add('alice'); post B; post A again), PASSES — `third post -> arch-3 after 0 ms` — because the fake reflects room A's message from the connection's *current* nick. The identical scenario against real Prosody fails with a 15.9 s reflection timeout. A fixture that agrees with the bug is counted as coverage for the branch it hides.",
+    "remediation": "Give `FakeXmpp` per-room occupancy state: `occupantNick: Map<room, nick>` written by `answerJoin` from the presence's own resource, read by `onPost` and `endOccupancy` when composing `from`. Then `nick` becomes a per-room query rather than a connection-wide field, and `attach()` seeds the map for the room it pre-joins.",
+    "testUpgrade": "Guard the CLASS \"a stand-in whose state is coarser than the production state it models\". Add a fixture-fidelity case that joins two rooms under two different nicks and asserts the fake reflects each room from its own nick; then reuse it as the substrate for a parameterized per-room-nick table (reflection provenance, occupancy-loss attribution, 210 rewrite in one room only). The existing `join-attribution.test.ts` drives one room and so cannot fail on this."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "host-classification",
+    "class": "unanchored-loopback-prefix-match",
+    "file": "packages/bridge-xmpp/src/index.ts",
+    "line": 178,
+    "summary": "`isPlaintextRemote` classifies any host matching `/^127\\./` as loopback. That regex is unanchored at the end, so a *hostname* that merely begins with `127.` is treated as loopback and the cleartext-SASL-PLAIN warning — the only guard on this path — is suppressed.",
+    "failure": "`isPlaintextRemote('xmpp://127.evil.com:5222')` returns `false` (verified by executing the exported function). Result: `connect({ service: 'xmpp://127.evil.com:5222', password: 's3cret' })` emits no `SECURITY: ... plaintext scheme to a non-loopback host` warning, and `@xmpp/client` then offers SASL PLAIN over an opportunistically-upgraded stream to a remote attacker-controlled host. `ws://127.attacker.net` behaves the same.",
+    "remediation": "Match the IPv4 loopback block as an address, not as a string prefix: require the host to parse as four dot-separated decimal octets with the first equal to 127 (e.g. `/^127(\\.\\d{1,3}){3}$/`, plus the existing `localhost` / `::1` cases). Anything that is not a literal IP or the exact string `localhost` is remote.",
+    "testUpgrade": "Guard the CLASS \"a loopback/private-range check that matches a prefix of a hostname rather than an address\". Extend the `LOOPBACK`/`REMOTE` table in `creds-warning.test.ts` with an adversarial-lookalike row set that must all classify REMOTE: `127.evil.com`, `127.0.0.1.evil.com`, `localhost.evil.com`, `::1.evil.com`, `0177.0.0.1`, `2130706433` — and keep the genuine `127.0.0.44`/`[::1]` rows as the negative control. A generator that appends `.evil.example` to every LOOPBACK entry and asserts the transport warning fires covers inputs nobody enumerated."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "silent-no-op",
+    "class": "seam-argument-ignored-after-first-call",
+    "file": "packages/bridge-xmpp/src/index.ts",
+    "line": 1016,
+    "summary": "`adoptIdentityNick` memoizes on the FIRST identity it ever sees (`this.nickAdoption ??= this.switchNick(nickFor(identity))`). Every later `post` with a different `identity` is attributed to the first handle, with no error and no diagnostic — the seam's per-call `identity` parameter silently stops meaning anything after call one.",
+    "failure": "`post(t, asHandle('alice'), 'x')` then `post(t, asHandle('bob'), 'y')`: `nickFor('bob')` is never evaluated, the join presence is never re-driven, and the archived sender of both messages is `alice`. `fetchRecent` therefore returns `senderHandle: 'alice'` for a message the caller posted as `bob`, and `parley_list_users` never learns `bob` exists.",
+    "remediation": "Fail fast rather than silently rebind: if `nickFor(identity)` differs from the adopted nick, either drive a nick change for it (as `switchNick` already can) or reject the post with an error naming both handles and pointing at `backend_config.nick` / one-bridge-per-handle. A no-op that changes the message's attribution is the worst of the three options.",
+    "testUpgrade": "Guard the CLASS \"a seam argument that is honoured on the first call and silently discarded thereafter\". Add a parameterized case per seam method that takes a caller-supplied identity/topic-scoped argument, driving two calls with DIFFERENT argument values and asserting the second is either honoured or refused — never accepted-and-ignored. For XMPP the row is `post(t,'alice')` then `post(t,'bob')`, asserting the second message reads back with `senderHandle === 'bob'` or the call rejects."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "maintainability",
+    "theme": "stale-contract-on-a-helper",
+    "class": "documented-return-value-no-caller-uses",
+    "file": "packages/bridge-xmpp/src/index.ts",
+    "line": 1041,
+    "summary": "`revertToProvisionalNick(): boolean` is documented as \"Returns whether the nick actually changed\", but its only caller (`doJoin`) discards the value and re-derives the answer from `this.nick !== usedNick`. The two conditions are not equivalent (they differ exactly in the concurrent-revert case), so the JSDoc describes a contract nothing consumes and a reader must diff the two predicates to learn which one is authoritative.",
+    "failure": "Reading `doJoin`, the `conflict` branch is `this.revertToProvisionalNick(); if (this.nick !== usedNick) { ... }` — the returned boolean is dropped on the floor while the JSDoc asserts it is the signal. A maintainer who \"simplifies\" to `if (this.revertToProvisionalNick())` silently removes the concurrent-revert retry the class comment says is deliberate.",
+    "remediation": "Make the function `void` and delete the sentence, or have it return the fact the caller actually needs (`nickChangedSince(usedNick)`) and use it. One predicate, one place.",
+    "testUpgrade": "Guard the CLASS \"a helper whose documented return contract has no consumer\" mechanically rather than by review: extend the existing `source-hygiene` style check in `packages/bridge-core/src/source-hygiene.test.ts` to flag private methods with a non-`void` return type whose every call site is an expression statement."
+  },
+  {
+    "target": "nats",
+    "dirs": [
+      "bridge-nats"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "window-arithmetic",
+    "class": "stream-wide-state-read-as-per-topic-state",
+    "file": "packages/bridge-nats/src/index.ts",
+    "line": 257,
+    "summary": "readRecent sizes the since-less window from the STREAM-wide `last_seq`, only falling back to the per-subject `last_by_subj` tail when `num_deleted > 0`. When the topic's stream captures more subjects than the topic's own — a configuration `ensureStream`/`captures()` explicitly accepts — the window is anchored on a foreign publisher's sequence, the widening budget (32 x limit) is exhausted, and the page comes back empty with a cursor far above the topic's real history.",
+    "failure": "Live NATS 2.10: stream `PW_deploys` created out-of-band with subjects ['pw.>']; plugin configured subject_prefix 'pw.' / stream_prefix 'PW_'; post 'a','b','c' to topic `deploys` (seqs 1-3); then 5000 messages published by anyone to `pw.junk`. `plugin.fetchRecent({topic: deploys})` -> `{messages: [], nextCursor: '1803'}` after 1.2s of wasted pulls. Replaying that cursor as `since` returns `[]` forever: 'a','b','c' are durably stored and permanently unreachable. num_deleted is 0 throughout, so the per-subject `tailSequence()` anchor that would have fixed it never runs.",
+    "remediation": "Drop the `num_deleted > 0` gate and anchor the window on `streams.getMessage(stream, {last_by_subj: subject})` unconditionally (one extra round trip per since-less read), and/or keep widening while `read.length === 0` until `startSeq <= firstSeq` instead of stopping at WIDEN_ATTEMPTS. Additionally consider refusing, at ensureStream, a pre-existing stream whose subject list is not exactly this topic's subject — every sequence field the plugin reads is then per-topic by construction.",
+    "testUpgrade": "Widen the fake-JetStream generator behind window.test.ts so a shape can carry FOREIGN sequences: records the pull's filter_subject does not match, but which still count toward `state.messages`/`first_seq`/`last_seq` and leave `num_deleted` at 0. Cross that axis (foreign-tail depth 0, 1, limit, 32*limit, 100*limit) with the existing shapes x positions table, asserting the exact `owed()` page — the class is 'any stream-level counter used where a per-subject one is required', so the same rows also catch a future `first_seq`/`messages` misuse. window.test.ts today cannot see this: every shape's records are all on the topic's own subject, so stream-wide and per-subject state coincide in every row."
+  },
+  {
+    "target": "nats",
+    "dirs": [
+      "bridge-nats"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "reprovisioned-store-id-collisions",
+    "class": "guard-whose-only-covered-arm-is-the-easy-one",
+    "file": "packages/bridge-nats/src/index.ts",
+    "line": 208,
+    "summary": "`confirmSequence`'s payload-equality check — the half that catches a re-provisioned stream which ALREADY HOLDS a different message at the acked sequence — is vacuous coverage. Deleting the line leaves the whole suite green. Only the 'sequence holds nothing' arm (`isMessageMissing`) is graded, and that is the arm a real re-provision least often presents.",
+    "failure": "Mutation: delete `if (dec.decode(stored.data) !== payload) throw ackIncarnationUnknown(stream, seq);`. `npx vitest run packages/bridge-nats/test/msg-id.test.ts packages/bridge-nats/test/cursor.test.ts` -> 29 passed, 0 failed. The uncovered real behaviour: stream re-provisioned around a publish, new incarnation already at seq 3 with its own message; `post` returns `<newIncarnation>-3` for a message that landed in the OLD incarnation, which is exactly the id the new incarnation's seq-3 message will mint — core's SeenSet then drops a genuinely new message. Both ackAmbiguities rows in msg-id.test.ts wipe `records`, so getMessage always 404s and the equality branch is never reached.",
+    "remediation": "No source change needed for the guard itself; add the missing arm to the test table so the guard cannot be deleted silently.",
+    "testUpgrade": "Parameterize msg-id.test.ts's `ackAmbiguities` over WHAT the surviving incarnation holds at the acked sequence, not just over how the swap is observed: {no message}, {a different message at the same seq}, {a different message at a lower seq and nothing at the acked seq}, {the same content posted by someone else}. Add a fake knob `replaceRecordsWith` so the swapped incarnation can be pre-populated. The class is 'a two-armed guard whose test table only ever exercises one arm' — same row generator should be reused for isStreamMissing/isMessageMissing classification."
+  },
+  {
+    "target": "nats",
+    "dirs": [
+      "bridge-nats"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "reprovisioned-store-id-collisions",
+    "class": "live-path-rebuild-guard-never-exercised",
+    "file": "packages/bridge-nats/src/index.ts",
+    "line": 498,
+    "summary": "The subscribe rebuild's incarnation reset (`if (info.created !== created) { created = info.created; lastSeq = 0; }`) is unexercised. Deleting it keeps the whole fake-backed suite green, and the neighbouring `if (lastSeq > info.state.last_seq)` clamp masks it in every case the tests do construct — but not in the case that matters.",
+    "failure": "Mutation: delete the `info.created !== created` block. `npx vitest run packages/bridge-nats/test/msg-id.test.ts packages/bridge-nats/test/subscribe-loop.test.ts packages/bridge-nats/test/recovery.test.ts` -> 36 passed, 0 failed. Traced consequence the mutation exposes: live subscription at lastSeq=5; stream deleted and re-created out-of-band; 10 messages land in the new incarnation before the rebuild, so `info.state.last_seq` is 10 and the downward clamp does not fire; the rebuilt consumer starts at opt_start_seq 6 and the new incarnation's messages 1-5 are never delivered on the live path. No test in the package ever re-provisions a stream underneath a live subscribe.",
+    "remediation": "Keep the guard; add coverage. Give the fake a way to re-provision between iterator generations (reset records + bump streamCreated at a named `consume()` generation) so the rebuild path can be driven.",
+    "testUpgrade": "Add a parameterized table to subscribe-loop.test.ts crossing {new incarnation's last_seq BELOW the old lastSeq, EQUAL, ABOVE} x {rebuild cause: silent EOF, ConsumerDeleted status, delivery-sequence hole}, asserting every message of the NEW incarnation reaches the handler exactly once. That guards the class 'the live loop's resume position is computed from a value that is only meaningful within one store incarnation', which also covers the downward clamp and any future resume-position source."
+  },
+  {
+    "target": "nats",
+    "dirs": [
+      "bridge-nats"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "reprovisioned-store-id-collisions",
+    "class": "absolute-claim-over-a-best-effort-code-path",
+    "file": "packages/bridge-nats/README.md",
+    "line": 38,
+    "summary": "README states `post` reads the incarnation stamp back after its ack so that a stream re-provisioned between two posts \"CANNOT re-mint the previous incarnation's ids\". `observeIncarnation` swallows every failure by design (its own JSDoc says \"the cached incarnation is the best available\"), and on that path `post` does exactly what the README says cannot happen.",
+    "failure": "Trace: stream re-provisioned after the publish ack; `observeIncarnation`'s `streams.info` fails (link blip, auth, timeout) and is swallowed at index.ts:221. `this.incarnations.get(stream)` still holds the OLD token, so `published === incarnations.get(stream)` and `confirmSequence` is skipped entirely. `post` returns `<oldIncarnation>-<seq>` for a message that landed in the new incarnation — and since sequences restart at 1, the old incarnation very likely already handed out that exact id for a different message, so core's SeenSet drops the new one. The README promises this is impossible.",
+    "remediation": "Either make the failure honest in code — on an `observeIncarnation` failure, mark the stream's incarnation UNKNOWN (or force `confirmSequence`) rather than reusing the last-known token — or soften the README to state the residual window: an incarnation read that fails leaves the id labelled with the last observed incarnation.",
+    "testUpgrade": "Add a fake knob `infoFailures: n` and a row to msg-id.test.ts's observation table: 'the post-ack incarnation read itself fails'. Assert the same SeenSet property the other rows assert (no id minted after the swap collides with one minted before). The class is 'a doc claim resting on a code path that swallows its own failure' — a docs.test.ts style check listing README's absolute modal claims ('cannot', 'never', 'always') and requiring a named test per claim generalizes it."
+  },
+  {
+    "target": "nats",
+    "dirs": [
+      "bridge-nats"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "protocol-conformance",
+    "theme": "stated-bounds",
+    "class": "retry-restarts-a-caller-supplied-deadline",
+    "file": "packages/bridge-nats/src/index.ts",
+    "line": 249,
+    "summary": "`fetchRecent`'s long-poll deadline (`Date.now() + blockMs`) is computed INSIDE `readRecent`, which `withStream` may run a second time. A stream that vanishes mid-poll therefore serves the caller up to 2 x `blockMs`, breaking the bound core states for `catchup.block_max_ms` (\"sized under client tool timeouts so a blocked call never trips them\").",
+    "failure": "Trace: `fetchRecent({topic, since, blockMs: 60000})` -> `withStream` -> `readRecent` sets deadline T+60s -> `blockingFetch` -> `jsm.consumers.add` (outside blockingFetch's try, index.ts:384) rejects with 'stream not found' after e.g. 55s because the stream was removed out-of-band -> `isStreamMissing` -> `withStream` re-ensures and re-invokes `readRecent`, which computes a FRESH T'+60s deadline. The MCP `fetch_recent` call blocks ~115s against a stated 60s ceiling; core's `fetchRecentBlocking` awaits the plugin call in full and cannot cut it short without an AbortSignal.",
+    "remediation": "Compute the deadline in `fetchRecent` (before `withStream`) and pass it down, so a retry inherits the caller's original budget rather than minting a new one; return the empty page with the fallback cursor if the retry starts past the deadline.",
+    "testUpgrade": "Parameterize a bounded-budget table over every path that can retry or re-enter a caller-supplied wait: {stream missing during consumers.add, during consumers.get, during the iterate} x blockMs in {150, 300, 1000, 5000}, asserting total elapsed < blockMs + slack for each. long-poll.test.ts today pins the upper bound only on the happy path, so any retry wrapper reintroduces the overshoot invisibly; the class is 'a deadline recomputed inside a retried closure'."
+  },
+  {
+    "target": "zulip",
+    "dirs": [
+      "bridge-zulip"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "live-path-watermark",
+    "class": "empty-read-mistaken-for-empty-history",
+    "file": "packages/bridge-zulip/src/index.ts",
+    "line": 554,
+    "summary": "subscribe() seeds its delivery watermark from a limit-1 since-less read; that read can come back EMPTY while history exists, because the backward pagination walk terminates on an unusable edge record. lastDeliveredId then falls to 0 and the armed gap-fill replays the ENTIRE topic history through the live handler.",
+    "failure": "Topic has messages h0,h1,h2. A record with `id: 0` (or `id: -1`) is then appended by anything other than the plugin (`fake.injectRaw({topic, fields:{id:0}})` models the shape the package itself declares reachable — a proxy/older server/hostile realm member). `subscribe(topic, h)` → h receives ['h0','h1','h2'] within 500ms. Reproduced: `tail probe` returns [] because zulipToMessage drops id<=0 and pageAnchor('newest'→'0') then finds nothing older; needsGapFillFrom = 0; gapFill(cursor '0') re-reads and delivers all history as live push. Violates the frozen conformance clause 'subscribe delivers exactly the post-subscribe tail' — the defect the suite says 'has already bitten a shipped backend'.",
+    "remediation": "Do not derive the watermark from the usable-message projection. Have the tail probe report the highest RAW `id` the server showed (the same raw-vs-usable distinction fetchMessages already applies to termination and to the next anchor), and only treat 0 as the watermark when the server showed no record at all. Equivalently: make fetchMessages expose `sawRawRecords`/`maxRawId` and have subscribe seed from that.",
+    "testUpgrade": "Parameterize the existing `subscribe delivers exactly the post-subscribe tail` clause over a table of pre-subscribe history states crossed with an unusable NEWEST record: id ∈ {0, -1, 1.5, 1e18, NaN, 'nope', missing} × history length ∈ {0, 1, 3, GAP_FILL_PAGE+1}. Assert the handler receives ONLY post-subscribe messages in every cell. The existing 'replays what is behind a full page of unusable records in the dead window' case only walks the FORWARD gap-fill direction and cannot reach the backward tail probe; the untrusted-payload `limit` table only grades fetchRecent, never the subscribe watermark."
+  },
+  {
+    "target": "zulip",
+    "dirs": [
+      "bridge-zulip"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "budget-containment",
+    "class": "retry-backoff-ignores-caller-deadline",
+    "file": "packages/bridge-zulip/src/index.ts",
+    "line": 477,
+    "summary": "A single 429 on the blocking-fetch wait path (register or the /events long-poll) makes fetchRecent overrun its blockMs by the server's whole Retry-After hint. fetchWithRetry's 429 backoff (net-util sleepUnlessStopped) races only isStopped(), never `init.signal`, so the plugin's deadlineAbort fires into a void.",
+    "failure": "`plugin.fetchRecent({topic, since: tail, blockMs: 300})` with `fake.rateLimit('GET /api/v1/events', {times:1, headerSeconds:8})` returns after 8018ms (measured); same shape on 'POST /api/v1/register' returns after 8012ms. Because pollForWake raises deadlineMs to blockMs + DEFAULT_DEADLINE_MS, any hint up to ~30s is honoured in full — so a routine Zulip rate limit turns a 300ms-budget fetch_recent into a ~30s one and blows the MCP client tool timeout DESIGN §11 sizes catchup.block_max_ms under.",
+    "remediation": "Make net-util's 429 backoff race `init.signal` (abort → throw, same as an in-flight abort), so a caller-supplied deadline signal bounds the whole call and not just the bytes in flight. Belt-and-braces in the plugin: race `wake.waited` and the post-wait fetchMessages against an interruptibleDelay to `deadline` in blockingFetch, so no single HTTP call can spend more than the caller's budget.",
+    "testUpgrade": "Add a 429 row family to the existing `zulip blocking fetchRecent never overruns its blockMs` table: cross the SLOW_STATES dimension with `rateLimit(route, {times:1, headerSeconds: 8})` for EVERY route the wait path touches ('POST /api/v1/register', 'GET /api/v1/events', 'GET /api/v1/messages'), at blockMs ∈ {200, 600, 2000}, asserting elapsed <= blockMs + slack. The current table only models hangs, 500s and holdResponse — none of which reach the retry loop's own sleep — and rate-limit.test.ts only ever 429s 'POST /api/v1/messages', which has no caller budget to overrun."
+  },
+  {
+    "target": "zulip",
+    "dirs": [
+      "bridge-zulip"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "backoff-pacing",
+    "class": "non-escalating-retry-under-degradation",
+    "file": "packages/bridge-zulip/src/index.ts",
+    "line": 114,
+    "summary": "When no healthy subscribe loop exists, every pass of blockingFetch mints and drops a dedicated event queue at a FLAT 400ms pace (BLOCKED_FETCH_RETRY_MS) with no escalation — unlike the push loop, which backs off to 5s. One blocked fetch against a degraded server issues hundreds of register/poll/delete round trips.",
+    "failure": "`fetchRecent({topic, since: tail, blockMs: 6000})` with /events answering 400 BAD_EVENT_QUEUE_ID: measured 15 POST /api/v1/register + 15 DELETE /api/v1/events + 15 GET /api/v1/events in 6s. At core's default catchup.block_max_ms of 60000 that is ~150 registrations and ~450 requests from a SINGLE parley_fetch_recent — past Zulip's default 200 req/min per-user API rate limit, so the call rate-limits the bot by itself and then lands in the 429 stall above.",
+    "remediation": "Escalate the blocked-fetch pause the way the push loop does (LOOP_BACKOFF_MIN_MS→LOOP_BACKOFF_MAX_MS on consecutive failed wake attempts), and/or reuse one dedicated queue across passes of the same blockingFetch instead of re-registering per pass when the previous registration is still valid.",
+    "testUpgrade": "Widen `does not spin when the server rejects every event queue it is handed` from one 1200ms/<10 point into a table over blockMs ∈ {1200, 6000, 20000} × degradation mode ∈ {BAD_EVENT_QUEUE_ID, 500 on /events, 200-with-no-events, /events black hole}, asserting requests-per-second on every loop route stays under a named budget (e.g. registers <= 2 + blockMs/2000). Pinning a raw count at one short duration certifies a pace that is fine for 1.2s and 25x over budget for 60s."
+  },
+  {
+    "target": "zulip",
+    "dirs": [
+      "bridge-zulip"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "negative-control-missing",
+    "class": "defensive-clause-no-test-can-fail",
+    "file": "packages/bridge-zulip/src/index.ts",
+    "line": 1029,
+    "summary": "pageAnchor's anti-spin guard — the clause its own comment says to 'keep, so that a server answering with an unmoving id cannot spin the read on one page forever' — is graded by nothing. Deleting it leaves the entire zulip suite green.",
+    "failure": "Mutation: removed `const current = Number(from); if (Number.isFinite(current) && (backwards ? id >= current : id <= current)) return undefined;` from pageAnchor. `npx vitest run packages/bridge-zulip` → 18 files passed, 358 passed / 1 skipped. The fake never returns a page whose edge record fails to move the anchor (it always excludes the anchor and filters strictly by id), so no fixture can discriminate the guard's presence. A defensive clause counted as coverage that cannot fail is worse than none — and the same shape is what the head commit ('give every clause a negative control') was closing elsewhere.",
+    "remediation": "Give the fake a lever that models an anchor-violating server (`stallAnchor(route)`: answer a full page whose edge record repeats the requested anchor id, or whose records are all unusable with a non-advancing edge), and assert fetchMessages terminates rather than spinning.",
+    "testUpgrade": "Parameterize a 'pagination always terminates' case over server-misbehaviour rows: {edge record repeats the anchor, edge record moves backwards, whole page unusable with a non-advancing edge, edge id absent} × direction {since-less backward walk, since-based forward walk} × limit {1, MAX_MESSAGES_PER_FETCH+1}. Each row asserts the call resolves inside a bound AND that fake.requestCount('GET /api/v1/messages') stays under a small ceiling — so the guard's deletion reddens the suite. Generalize the row generator so any future defensive early-return in the read path is required to name the fixture that makes it fire."
+  },
+  {
+    "target": "zulip",
+    "dirs": [
+      "bridge-zulip"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "secret-disclosure",
+    "class": "credential-in-config-url-echoed",
+    "file": "packages/bridge-zulip/src/index.ts",
+    "line": 232,
+    "summary": "requireHttpUrl accepts a site_url carrying URL userinfo, and the plaintext-credential SECURITY warning then prints the whole site_url verbatim — so a password embedded in site_url is written to stderr. The package's secret-hygiene discipline keys on the config key NAME ('key|secret|token|password|credential'), so `site_url` is classified non-secret and this shape escapes it entirely.",
+    "failure": "`connect({ site_url: 'http://bot:sup3rs3cret@zulip.example.com', email:'b@x', api_key:'realkey' })` → console.warn emits `[parley-zulip] SECURITY: site_url http://bot:sup3rs3cret@zulip.example.com is plaintext http:// ...`. cli.ts sends stderr to the operator's logs, and core surfaces connect diagnostics into model context. net-util's own credentialParts() redacts exactly this shape from thrown messages; this console.warn path bypasses it.",
+    "remediation": "Either reject a site_url carrying username/password at connect() naming the key (it is redundant with the Basic header the plugin builds itself, and is the fail-fast answer), or strip userinfo when normalizing baseUrl in requireHttpUrl and warn on the stripped origin only.",
+    "testUpgrade": "Extend the secret-hygiene table from key-NAME classification to VALUE classification: for every declared backend_config key, feed a value carrying a sentinel secret in each place a secret can hide (URL userinfo `http://u:SENTINEL@host`, a query value `?token=SENTINEL`, a path segment `/bot:SENTINEL/`), and assert the sentinel appears in no console.warn/console.error/thrown message/stack from connect() — accepted or rejected. The current SECRET_KEY regex over key names cannot see a credential smuggled into a non-secret-named key."
+  },
+  {
+    "target": "discord",
+    "dirs": [
+      "bridge-discord"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "stated-budget-overrun",
+    "class": "per-attempt-deadline-reused-across-a-paging-loop",
+    "file": "packages/bridge-discord/src/index.ts",
+    "line": 427,
+    "summary": "`fetchRecent`'s `blockMs` budget is enforced per REST PAGE, not per CALL. `fetchWithin` computes `budget = deadline - Date.now()` once and hands that same DURATION to `fetchSince`, which passes it unchanged as `deadlineMs` to every page in its `while (messages.length < limit)` loop. net-util's `deadlineMs` is a per-call wall-clock duration (bridge-net-util/src/index.ts:400, `budget = deadlineMs - (now() - started)` with `started` local to that call), so each page restarts the clock. A call with `limit > 100` may therefore run up to `ceil(limit/100) x blockMs`. The `since === undefined` branch is worse: it passes no `deadlineMs` at all, so every page falls back to net-util's 30 s default regardless of `blockMs`. This is the exact class test/blocking-budget.test.ts declares in its header ('a call that overruns its own declared budget on a leg nobody bounded'), but every cell there uses the default limit of 100, i.e. exactly one page, so the paging loop is invisible to it.",
+    "failure": "Reproduced against test/fake-discord.ts: channel provisioned, three 200-responses of 100 messages each injected with `delayMs: 900`, then `plugin.fetchRecent({ topic, since: asCursor('1'), limit: 300, blockMs: 1500 })` -> settles at 2745 ms against a 1500 ms budget. The same call with `since` omitted -> 2734 ms. Reachable from production: `parley_fetch_recent` accepts a model-supplied `limit` clamped to MAX_FETCH_LIMIT = 1000 (bridge-core/src/transport/tools.ts:42) and `block_ms` clamped to `catchup.block_max_ms` (60 s default), and `fetchRecentBlocking` spreads `...args` so `limit` reaches the plugin unchanged - so one tool call can occupy 10 x 60 s = 600 s while core sized the wait at 60 s for the client's tool timeout. MAX_FETCH_LIMIT's own stated purpose (bounding a DoS knob) is defeated by the same path.",
+    "remediation": "Make the deadline ABSOLUTE rather than a duration inside the paging loop: thread `deadline` (epoch ms) down to `fetchSince`/`getMessages` and recompute `deadlineMs = deadline - Date.now()` per page, breaking out of the loop (returning the pages gathered so far with their real `nextCursor`) once it is <= 0. Give the `since === undefined` branch the same treatment so a no-`since` blocking call is bounded at all; where no `blockMs` was given, bound the whole multi-page walk by one shared budget instead of N x net-util's 30 s default.",
+    "testUpgrade": "Widen test/blocking-budget.test.ts's CELLS table with a `limit` axis crossed against the existing STALLS: `LIMITS = [1, PAGE_LIMIT, PAGE_LIMIT + 1, 3 * PAGE_LIMIT, 1000]`, each row seeding or injecting enough full pages to force `ceil(limit/100)` round trips with a per-page delay strictly BELOW the budget, and asserting the same `<= BLOCK_MS + SLACK_MS` invariant. Add a `since: undefined` row so the no-`since` branch joins the table. This guards the class 'a bound expressed as a per-attempt duration inside a loop that repeats the attempt' rather than the one 300-message instance; the existing cells are all single-page and can never see it."
+  },
+  {
+    "target": "discord",
+    "dirs": [
+      "bridge-discord"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "coverage-that-cannot-fail",
+    "class": "table-satisfied-by-the-wrapper-not-the-unit-under-test",
+    "file": "packages/bridge-discord/test/long-poll.test.ts",
+    "line": 146,
+    "summary": "11 of the 18 cases in long-poll.test.ts cannot fail on the plugin's native long-poll at all: both large tables drive core's `fetchRecentBlocking` (generic 250 ms poll wrapper), so core's fallback satisfies every assertion whether or not the plugin ever arms a waiter. The first table's comment concedes this; the SECOND table ('when the live transport dies mid-wait', 6 cells) explicitly claims the opposite - 'nothing else can wake that waiter: the message is durable over a healthy REST API while the call sleeps its whole budget' - and that claim is false, because it too runs through `fetchRecentBlocking` with `pollIntervalMs: 250`. A false rationale is worse than a missing one: it reads as coverage of waiter-death-mid-wait that nobody actually has.",
+    "failure": "Mutation: `const socketLive = this.gatewayLive();` -> `const socketLive = false;` at src/index.ts:396, which disables the native long-poll entirely (no waiter is ever armed; `fetchRecent` degenerates to an immediate REST page). `npx vitest run packages/bridge-discord/test/long-poll.test.ts` -> 13 passed, 5 failed. All 5 transport-state cells and all 6 'dies mid-wait' cells stayed GREEN; only the 'a wakeup arriving' phases and the two disconnect cells caught it. Those 11 green cells each also step up to BLOCK_MS = 60 s of fake-timer time in 10-100 ms increments, so they cost wall-clock too.",
+    "remediation": "Drive the mid-wait table through `plugin.fetchRecent(...)` directly (as the 'a wakeup arriving' describe already does), so the plugin's own waiter is the only thing that can return the message. If the wrapper is kept deliberately, rewrite the header comment to state what the cells actually assert (that the plugin composes with core's fallback without hanging or erroring in each transport state) and merge the two tables into one parameterized transport-state x loss-time table, since they then assert the same property.",
+    "testUpgrade": "Add a caller axis to the file so every future long-poll cell declares which layer it can discriminate: `CALLERS = [['plugin (native)', (p, args) => p.fetchRecent({...args, blockMs})], ['core wrapper', (p, args) => fetchRecentBlocking(p, args, {blockMs, pollIntervalMs: 250})]]` crossed with the existing transport/loss rows, plus a negative control that runs the native rows with the waiter suppressed and asserts they FAIL. This guards the class 'a plugin-level table whose assertions are satisfied by a core-level fallback', which recurs on every backend that has both a native and a wrapped blocking path."
+  },
+  {
+    "target": "discord",
+    "dirs": [
+      "bridge-discord"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "protocol-conformance",
+    "theme": "absent-topic-classification",
+    "class": "seam-classification-that-flips-on-the-caller-budget",
+    "file": "packages/bridge-discord/src/index.ts",
+    "line": 429,
+    "summary": "Whether an absent Discord channel is reported as `NoSuchTopicError` or as a plain empty page depends on how much of `blockMs` is left when the REST 404 lands. `fetchWithin` returns `{ messages: [], nextCursor: since }` when `budget <= 0`, and its catch swallows ANY error - `NoSuchTopicError` included - once `Date.now() >= deadline`. With a small `block_ms` the gateway-connect leg (`withDeadline(this.ensureGateway(), blockMs)`) or a slow query eats the budget, so the absent-topic signal is silently replaced by an ordinary empty window and core never sets `topicAbsent: true`. Both answers are individually legal per the seam, but the same input flipping between them on a timing race reproduces exactly the 'idle bridge with no error' failure the rest of this package works hard to avoid.",
+    "failure": "Reproduced against test/fake-discord.ts with a channel id that was never created: `plugin.fetchRecent({ topic: asTopic('7999999'), since: asCursor('1'), blockMs })` gives `blockMs: 1 -> {messages:[],nextCursor:\"1\"}`, `blockMs: 5 -> {messages:[],nextCursor:\"1\"}`, `blockMs: 20 -> NoSuchTopicError`. `block_ms` is clamped from above by `catchup.block_max_ms` but never floored, so a model may pass `block_ms: 1`. Operator consequence: a mistyped channel id in parley.config.yaml reports an empty window forever instead of 'topic not present yet'.",
+    "remediation": "Classify absence before the budget can erase it: let `NoSuchTopicError` escape `fetchWithin`'s post-deadline catch unconditionally (it is a classification, not a transport failure), and issue the first exclusive-`since` query before spending budget on `ensureGateway`, or reserve a minimum slice of `blockMs` for it. A zero or negative budget should still make the one query it owes rather than answering from nothing.",
+    "testUpgrade": "Parameterize the existing 'a topic with no backend representation' READS table in test/rest-contract.test.ts over a BUDGETS axis - `[0, 1, 5, 50, BLOCK_MS]` - crossed with an injected query latency above and below that budget, asserting the SAME classification (`NoSuchTopicError`) in every cell. The current table pins only `BLOCK_MS = 2000`, the one column that cannot see the flip. The class is 'a seam classification decided after a budget check', so the widened table should cover every seam-level error the blocking path can swallow, not just absence."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "degraded-long-poll",
+    "class": "live-source-established-but-not-serving",
+    "file": "packages/bridge-slack/src/index.ts",
+    "line": 370,
+    "summary": "Once the Socket Mode handshake succeeds, blockForMessage breaks out of the degradation ladder and performs zero further conversations.history reads for the rest of the budget, so a stream that establishes but never delivers withholds already-durable history for the whole block_ms.",
+    "failure": "connect({app_token}) on a workspace whose Event Subscriptions lack `message.channels` (or whose app_token is shared with another process, so events land on the other connection). fetchRecent({topic, since:'0', blockMs:4000}); a message becomes durable in conversations.history at t=400ms. Observed: returns at t=4036ms with only 3 history reads. Same shape with an established socket dropped 300ms into the park and dials failing: durable at t=700ms, returned at t=4008ms. At the default catchup.block_max_ms of 60s this is a full minute of silent delay per message, which is exactly the harm the README's ladder paragraph claims to have removed.",
+    "remediation": "Do not treat a successful handshake as proof the stream serves. Keep the rung loop running when `live` is true — arm the waiter for min(remaining, rungMs) unconditionally and re-query each rung (a slower live-mode cadence, e.g. MAX_DIAL_BACKOFF_MS, keeps the healthy-socket cost at ~block_ms/5000 reads) — and additionally drain the channel's waiters whenever the shared socket closes or `wsReady` is reset, so a mid-park drop falls back to the ladder instead of parking to the deadline.",
+    "testUpgrade": "Widen the DEGRADATIONS table in test/blocking-fetch.test.ts, whose every row today makes the handshake FAIL before the call starts, with a 'handshake succeeds, stream does not serve' axis: (a) fake greets but never pushes an events_api envelope, (b) socket established then dropped mid-park with apps.connections.open failing, (c) socket established, dropped, and recovered mid-budget. Cross each with the existing LANDING_FRACTIONS and grade against the same dueBy() ladder plus the existing per-method ceilings, so the class is pinned by delivery latency rather than by which way the handshake failed."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "fixture-cannot-observe-the-claim",
+    "class": "request-parameter-never-graded-by-the-fake",
+    "file": "packages/bridge-slack/test/fake-slack.ts",
+    "line": 444,
+    "summary": "FakeSlack.history ignores body.limit entirely, so the page size the plugin actually asks Slack for is unpinned; the README cost model is 'verified' against the HISTORY_PAGE_LIMIT constant rather than against anything on the wire.",
+    "failure": "Mutating runFetch's request body from `{ channel, limit: HISTORY_PAGE_LIMIT }` to `{ channel }` leaves the whole package suite green: 430/430 passed. Against real Slack that mutation halves the page to the API default of 100, doubling the request count of the documented `backlog^2 / (2 * limit * page)` model — while documented-scopes.test.ts still passes because it only checks the README string `page = 200` against the constant, a number no request now carries.",
+    "remediation": "Make the fake serve `min(body.limit ?? 100, pageSize)` objects per page (real Slack semantics: it serves at most what you asked and may serve fewer), and record the requested limit so a test can assert it reached the wire.",
+    "testUpgrade": "Add a parameterized 'the wire carries what the source asks for' case over the request-shaping constants: for each of pageSize in {15, 50, 1000} assert the observed page length equals min(HISTORY_PAGE_LIMIT, pageSize) and that the recorded `limit` form field equals HISTORY_PAGE_LIMIT — so dropping, renaming or retyping any history request parameter changes an observable page count instead of nothing. Generalise the same shape to `oldest`/`cursor`, which today are only pinned by one bespoke http-contract case."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "cursor-arithmetic",
+    "class": "exhaustive-walk-discards-its-own-position",
+    "file": "packages/bridge-slack/src/index.ts",
+    "line": 449,
+    "summary": "emptyCursor throws away newestSeenTs on the no-`since` path even when the walk ran to exhaustion, returning the '0' sentinel; the `since` path already returns newestSeenTs from the identical information.",
+    "failure": "Channel seeded with 300 `channel_join` records and no surfacable message. fetchRecent({topic, limit:100}) walks all 6 pages, returns messages:[] and nextCursor '0'. Core persists '0' via readState.set, so the next catch-up re-walks the entire channel (6 pages again) before it can advance. Worse, on a channel whose full history exceeds MAX_HISTORY_PAGES with fewer than `limit` surfaced messages (400k entries at a full page, ~30k on the reduced 15-object tier the README documents), the no-`since` call throws `exceeded 2000 pages` and, having no stored cursor to resume from, throws on every subsequent catch-up with no in-band recovery — the README's 'reset that topic's cursor' remedy presumes a cursor exists.",
+    "remediation": "In emptyCursor, return newestSeenTs whenever the walk ran to exhaustion (`pageCursor === undefined` on exit), for the no-`since` path as well as the `since` path; keep `args.since ?? asCursor('0')` only for a walk that stopped early. The safety argument in the existing JSDoc — every entry above the floor was seen and none was surfacable — applies identically.",
+    "testUpgrade": "In test/catchup-window.test.ts drop the `if (sinceMode !== 'none')` guard so the final-cursor assertion runs for every since mode, and add an 'all-unsurfaced' layout row asserting (a) the first no-`since` page's nextCursor is the newest raw entry's ts and (b) the second drain iteration costs O(1) pages — a request-count assertion, so a cursor that merely 'looks' advanced but re-walks still fails."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "design-principles",
+    "theme": "fail-fast",
+    "class": "guard-installed-in-one-of-two-callers",
+    "file": "packages/bridge-slack/src/index.ts",
+    "line": 466,
+    "summary": "subscribe calls ensureSocket directly, bypassing the clear missing-app_token guard that ensurePollSocket owns, so a reactive-only deployment gets an opaque vendor error and one futile dial per topic against Slack's tightest-limit endpoint.",
+    "failure": "connect({api_url, bot_token}) with no app_token, then subscribe(asTopic('C0NOAPP'), handler) rejects with `SlackApiError: Slack apps.connections.open -> not_authed` and fake.hits('apps.connections.open') === 1. With five configured topics that is five token-less dials at startup and five occurrences of an error message that names neither app_token nor Socket Mode, while ensurePollSocket already has the exact sentence an operator needs ('Slack Socket Mode needs an app_token; this deployment has no live push').",
+    "remediation": "Hoist the `this.appToken === undefined` rejection into ensureSocket (or check it at the top of subscribe) so both entry points fail with the same named error and neither dials.",
+    "testUpgrade": "Parameterize a table over the entry points that need the shared socket (`subscribe`, blocking `fetchRecent`) crossed with (`app_token absent`, `app_token present`): the absent rows must reject/degrade with a message matching /app_token/ AND leave fake.hits('apps.connections.open') === 0. Today only the blocking-fetch/absent cell is covered, by one assertion inside the DEGRADATIONS table."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "docblock-claims-a-guard-the-code-lacks",
+    "class": "test-docblock-overclaims-coverage",
+    "file": "packages/bridge-slack/test/absent-topic.test.ts",
+    "line": 19,
+    "summary": "The docblock says subscribe's reachability probe catches 'a missing `message.channels` event subscription'; the probe is a conversations.history read, which succeeds in exactly that configuration.",
+    "failure": "Provision the app with the bot invited to a channel and `channels:history` granted but no `message.channels` event subscription. subscribe() resolves: apps.connections.open succeeds, hello arrives, and the limit:1 history probe returns ok:true. No message event is ever pushed, so the topic delivers nothing forever — precisely the outcome the docblock says cannot happen, and the configuration that makes finding #1 cost 60s per message.",
+    "remediation": "Correct the docblock to the two absences the probe genuinely detects (a typo'd channel_map target and a channel the bot was never invited to), matching the accurate comment already on subscribe in src/index.ts, and cross-reference the live-source-not-serving behaviour instead of implying it is guarded.",
+    "testUpgrade": "Extend the absent-topic CODES table with a `deliverability` axis alongside `absentFor`, carrying an explicit row for 'history readable but no events subscribed' whose stated expectation is 'subscribe resolves and delivers nothing' — so the gap is a declared, reviewable decision rather than a prose claim no case grades."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "truth-in-docs",
+    "theme": "complexity-claim-about-own-code",
+    "class": "big-o-claim-contradicted-by-a-capped-backoff",
+    "file": "packages/bridge-slack/README.md",
+    "line": 93,
+    "summary": "The rate-limit paragraph claims an unavailable Socket Mode costs 'O(log block_ms) reads and dials per blocked call', but the ladder caps at MAX_DIAL_BACKOFF_MS, making the rung count linear in block_ms once past the cap.",
+    "failure": "Applying the plugin's own rungStarts recurrence: block_ms=60000 gives 16 rungs (coincidentally near log2), but catchup.block_max_ms is operator-configurable — block_ms=600000 gives 124 rungs against log2(600000) ~= 20. An operator who raises block_max_ms to ten minutes on the strength of an O(log) claim gets ~124 conversations.history reads and ~124 apps.connections.open dials per blocked fetch_recent on one channel, which on the README's own reduced tier (one request per minute) is two orders of magnitude over budget.",
+    "remediation": "State the bound the code actually implements: roughly 4 + block_ms/MAX_DIAL_BACKOFF_MS reads and dials per blocked call (about 16 at the default 60s), and note that it grows linearly if block_max_ms is raised.",
+    "testUpgrade": "Extend the documented-scopes rate-limit paragraph checks — which already pin DIAL_BACKOFF_MS and MAX_DIAL_BACKOFF_MS by value — with a case that computes rungStarts(blockMs).length for a table of blockMs values {4000, 60000, 600000} and asserts the README states a bound consistent with it, so any future re-shaping of the ladder must move the prose."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-hygiene",
+    "theme": "restated-fixtures",
+    "class": "per-file-harness-duplication",
+    "file": "packages/bridge-slack/test/vendor-markup.test.ts",
+    "line": 48,
+    "summary": "Six near-identical 'start a fake, connect a plugin, tear both down' helpers are restated across the suite instead of shared, so a fixture change has to be made six times and a divergence between them is invisible.",
+    "failure": "`withPlugin` appears in vendor-markup.test.ts:48 and mention-markup.test.ts:210 differing only in mention_map and handshake_timeout_ms; `harness()` in envelope-robustness.test.ts:108; `makePlugin` + `capture` + `settleWithin` in connection-lifecycle.test.ts:39; `deliver` in blocking-fetch.test.ts:42; `makeContext` in conformance.test.ts:11; plus `listen`/`stop`/`readBody` in http-contract.test.ts. When the constructor gained handshake_timeout_ms only two of the six adopted it, so the classification and markup suites silently run on the 10s default while the lifecycle suite runs on 400ms — a divergence no test can report.",
+    "remediation": "Extract one `test/harness.ts` exporting a parameterized `withSlack({ mentionMap?, channelMap?, appToken?, handshakeTimeoutMs?, pageSize?, greet? })` plus the shared `capture`/`settleWithin`/`deliver` helpers, and have every file build from it. This is a merge, not a new test.",
+    "testUpgrade": "None required — the remedy is deletion and merging. Once shared, the harness's own defaults become a single reviewable statement, which is what lets a future reviewer see at a glance which axis a given file actually varies."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "silent-message-loss",
+    "class": "write-succeeds-without-durable-record",
+    "file": "packages/bridge-telegram/src/index.ts",
+    "line": 292,
+    "summary": "`post` resolves with a `backendMsgId` even when `ingest`/`store.append` recorded nothing, so an accepted message is invisible to `fetchRecent` forever and the only signal is one stderr line a minute.",
+    "failure": "Reproduced (test/aprobe.test.ts probe F, since deleted): with `ObservedStore.isOpen()` false and `append()` returning undefined — what `compactIfDue`'s `finally { this.fd = openSync(...) }` leaves behind when the reopen fails with EMFILE/EACCES/ENOENT — three `post()` calls all resolve ('-1009111222:1..3'), all three texts reach the fake upstream, `fetchRecent` then returns `[]` with nextCursor '0' (a REGRESSED cursor), and stderr carries exactly ONE 'dropped a message' line for the three losses because `report` throttles the class to 60s. The same store state silently discards every inbound getUpdates message after the update has already been acknowledged to Telegram, and nothing ever retries the open, so the bridge is a permanent black hole that reports healthy. The plugin already treats this exact outcome as unacceptable on the teardown path (index.ts:285-291 throws an error naming the id and the store path) — the store-refusal cause is simply unguarded.",
+    "remediation": "Make `ingest` report refusal to its caller (return the record or a reason) and have `post` throw the same 'accepted upstream, missing locally' error naming `<chat>:<mid>` and `storePath` when nothing was stored. Separately, treat `!store.isOpen()` as a connection fault: attempt a reopen, and fail seam calls rather than accepting writes into a store that cannot hold them.",
+    "testUpgrade": "Parameterize a table over CAUSE-of-refusal x seam-call: {no append descriptor, chat cap refuses, append throws} x {post, inbound getUpdates ingest}, asserting for every cell that either (a) the record is retrievable via fetchRecent, or (b) the call rejects with a message naming the id and the store path — never 'resolved and missing'. The existing TEARDOWN_CELLS table in protocol.test.ts covers only the disconnect cause and should be widened to this axis; protocol.test.ts's 'names $name as the reason a record was dropped' asserts the stderr text only and passes while post lies."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "concurrency-and-failure",
+    "theme": "partial-failure-mid-write",
+    "class": "post-write-step-failure-suppresses-delivery",
+    "file": "packages/bridge-telegram/src/store.ts",
+    "line": 242,
+    "summary": "`append()` runs `compactIfDue()` AFTER the record is durably written and indexed, so a compaction failure throws out of a successful write — the caller skips `wakeWaiters` and every live subscriber, and the loop misreports the message as dropped.",
+    "failure": "Reproduced (probe A): with `observed_retention_per_chat: 1` and one forced ENOSPC inside `compactIfDue`, an injected message 'two' ends up STORED (fetchRecent returns ['two']) but is NEVER delivered to the live subscriber (live === ['one']), while stderr says `dropped update 2: ENOSPC`. The same throw skips `wakeWaiters`, so a `fetchRecent({since, blockMs: 60000})` parked on that chat hangs for the full budget despite the message it is waiting for being in the store. store-compaction.test.ts already pins that the record survives ('m51' on disk and in entries) — it just never looks at the plugin-level consequence.",
+    "remediation": "Compaction is an amortization concern, not a durability one: catch inside `compactIfDue` (or after it in `append`) and report, so `append` returns the stored record whenever the record was written. Never let a post-write step convert a success into an exception.",
+    "testUpgrade": "A parameterized case over FAILING-STEP within append {appendFileSync, index, applyRetention, compactIfDue} asserting the invariant 'a record visible to fetchRecent was also pushed to every live subscriber and woke every parked waiter, or the record is absent everywhere' — i.e. store-visibility and delivery never disagree. inbound.test.ts's 'keeps consuming updates when store append throws' only fails the write itself, which is the one step where the two agree."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "unsafe-file-handling",
+    "class": "predictable-temp-path-followed-through-symlink",
+    "file": "packages/bridge-telegram/src/store.ts",
+    "line": 412,
+    "summary": "Compaction opens the predictable path `<store_path>.tmp` with 'w' (no O_EXCL, symlinks followed) and then renames it over the store, so anyone who can create a file in the store's directory redirects the full plaintext of every observed message.",
+    "failure": "Reproduced (probe E): pre-planting `store.jsonl.tmp` as a symlink to `victim.txt` and driving 8 appends under `maxPerChat: 2` overwrites victim.txt with `#evicted [\"-1:1\",\"-1:2\"]` plus the message records ('secret-3' …). `restrictMode(tmp)` also chmods the link target. Reachable whenever `store_path` is placed in a shared directory (e.g. /tmp) or the state dir pre-exists with loose modes — `mkdirSync(..., {mode: 0o700})` only applies to directories the store itself creates. store.test.ts's permissions table deliberately exercises a leftover `.tmp` and asserts it is REUSED, so the current suite endorses the behaviour.",
+    "remediation": "Create the temp file with `O_EXCL|O_NOFOLLOW` (`openSync(tmp, 'wx')` plus a retry on a unique suffix), or use a randomized name in the store's own directory; refuse to compact through an existing non-regular file.",
+    "testUpgrade": "A parameterized security case over PRE-EXISTING-TMP kind {regular world-readable file, symlink to a file outside the store dir, symlink to a directory, FIFO} asserting the compaction either fails loudly or writes only to a fresh regular file inside the store directory — and that no path outside `store_path` is modified. This also guards the analogous hazard on the store file itself."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "vacuous-coverage",
+    "class": "uncovered-transient-failure-recovery",
+    "file": "packages/bridge-telegram/src/index.ts",
+    "line": 453,
+    "summary": "All three 'don't poison the memo on transient failure' recovery paths (chatIdByTopic, canonicalById, getMe) are vacuously covered — deleting them leaves the whole package suite green, while the behaviour they prevent is a permanently unusable topic.",
+    "failure": "Mutation: replacing the three `.delete(...)` lines (index.ts:453, :500, :651) with no-ops keeps `npx vitest run packages/bridge-telegram` at 327 passed / 3 skipped. The difference is user-visible: with `failMethod('getChat', {status: 500, times: 1})`, the unmutated plugin answers the FIRST `fetchRecent({topic: '@mychannel'})` with an error and the SECOND with 'ok'; the mutant rejects every later call for the life of the connection, so one transient 500 makes the topic permanently unresolvable (posts, subscribes and catch-up all fail, and core's presence loop swallows the rejection).",
+    "remediation": "Keep the code; add coverage. Also consider bounding what is memoized negatively at all, so the rule is structural rather than three hand-copied catch blocks.",
+    "testUpgrade": "A parameterized table over MEMO {getMe, getChat/@name resolution, topic→chat resolution} x FAILURE {500 once, transport error once, 429-then-ok} x CALL {post, fetchRecent, subscribe, resolveIdentity}, asserting the first call rejects and the next identical call succeeds against the same instance. docs.test.ts's 'is offline-safe' case is the near-miss: it makes getChat fail permanently and only ever calls once."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "unvalidated-upstream-response",
+    "class": "missing-api-envelope-check",
+    "file": "packages/bridge-telegram/src/index.ts",
+    "line": 700,
+    "summary": "`call()` returns `res.json()` with no check of Telegram's `ok`/`result` envelope, so a 2xx `{\"ok\":false}` passes `connect`'s advertised fail-fast preflight and resurfaces later as a contextless TypeError.",
+    "failure": "Reproduced (probe B): stubbing `/getMe` to answer HTTP 200 `{\"ok\":false,\"error_code\":400,\"description\":\"nope\"}` makes `connect()` RESOLVE — README line 21 claims connect 'Verifies the token with getMe (fails fast … rather than coming up as a silent black hole)' — and `resolveIdentity` then rejects with `Cannot read properties of undefined (reading 'username')`, naming neither the call nor the upstream. The same shape on `/sendMessage` throws `Cannot read properties of undefined (reading 'chat')` after Telegram has accepted the message, and on `/getChat` reports the topic as unresolvable with the same opaque text. Reachable via a middlebox/captive portal or a local Bot API server (`api_url` is a documented knob).",
+    "remediation": "Add one envelope check in `call()`: reject with `<label> → ok:false: <description>` when `ok !== true`, and when the expected `result` is absent — the same place Slack's `ok:false` is interpreted per net-util's own note that response shapes belong in the caller.",
+    "testUpgrade": "A parameterized table over MALFORMED-2xx {ok:false with description, ok:true with no result, result of the wrong type, empty body} x ENDPOINT {getMe, getChat, sendMessage, getUpdates}, asserting connect rejects (preflight endpoints) or the seam call rejects with an error naming the endpoint and the upstream description — never a TypeError."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "untrusted-text-into-model-context",
+    "class": "unsanitized-body-on-the-2xx-path",
+    "file": "packages/bridge-telegram/src/index.ts",
+    "line": 700,
+    "summary": "net-util bounds, flattens and redacts every untrusted body before it can become an Error, but the plugin's success path calls `res.json()` directly, so a hostile 2xx body reaches the MCP error result raw.",
+    "failure": "Reproduced (probe C): a 200 response whose body is `HOSTILE-PAYLOAD-…` makes `post` reject with `Unexpected token 'H', \"HOSTILE-PA\"... is not valid JSON` — upstream bytes verbatim. Node embeds the snippet unescaped: `JSON.parse(\"\\n\\nHELLO\")` yields `Unexpected token 'H', \"\\n\\nHELLO\" is not valid JSON` and a leading U+202E is carried through as-is, which is exactly the forged line structure and bidi override `sanitizeBody`'s NEUTRALIZED class exists to strip before a thrown message becomes an `isError` tool result.",
+    "remediation": "Parse the buffered text yourself and wrap the failure: `sanitizeBody(text)` (via net-util) in a `<label> → body: …` error, instead of letting a raw `JSON.parse` SyntaxError escape.",
+    "testUpgrade": "A parameterized case over HOSTILE-2xx-BODY {leading newlines, U+202E, U+0085/U+009B, a lone surrogate, 10MB of text} asserting the rejection message contains no raw control/format character and is bounded — run against every plugin that hands a body to `res.json()`, since this is a cross-backend class net-util already owns for the non-2xx path."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "maintainability",
+    "theme": "dead-code",
+    "class": "unreachable-branch-with-a-justifying-comment",
+    "file": "packages/bridge-telegram/src/store.ts",
+    "line": 459,
+    "summary": "Two `ObservedStore` branches are unreachable — the out-of-order binary-search insert and the seq-less legacy record path — and the comment defending the first describes a situation that cannot occur.",
+    "failure": "Mutation: replacing the binary-search body (store.ts:459) and the `: this.nextSeq` fallback in `stamp()` (store.ts:436) with `throw new Error('MUTANT: …')` leaves the whole package suite green (327 passed / 3 skipped). Neither branch executes: `append` stamps strictly increasing seqs, and the on-disk file is written in global append order, so lines for one chat are already ascending — the comment's justification ('store lines interleaved across chats on reload') produces interleaving ACROSS chats, never out-of-order WITHIN one. The `stamp` fallback serves a seq-less record format this package has never published.",
+    "remediation": "Delete both branches (push-at-tail; treat a record with no valid `seq` as a garbled line and drop it, which the surrounding try/catch already does) and delete the comments with them. If either is genuinely wanted, it needs a test that reaches it.",
+    "testUpgrade": "Rather than a test per branch, add a package-level guard for the CLASS: assert store invariants over a generated append/reload sequence (random chats, random message_ids, reload at random points) and separately run the suite with these branches mutated to throw as part of the mutation budget — an unreachable branch is a finding, not coverage."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "maintainability",
+    "theme": "comment-discipline",
+    "class": "comment-contradicts-the-code-it-sits-on",
+    "file": "packages/bridge-telegram/test/conformance.test.ts",
+    "line": 21,
+    "summary": "The conformance context sets `concurrentPost: 'unsupported'` and is immediately followed by a comment reading 'NO concurrentPost, deliberately', and the file's opening comment describes chat-id shapes while sitting above `let seq = 0`.",
+    "failure": "Reading conformance.test.ts:22 ('concurrentPost: unsupported as const,') then :23-26 ('// NO concurrentPost, deliberately: …') tells a maintainer the field is absent when it is present — and the two spellings are not equivalent to `assertConformanceContext`, so anyone acting on the comment changes which conformance clauses run. Likewise :4 ('Supergroup-shaped chat ids: the fake rejects anything real Telegram would 400 on.') documents `freshTopic`, which is 20 lines below, over a bare counter declaration.",
+    "remediation": "Fold the rationale into the `concurrentPost: 'unsupported'` line's own short note (or into the commit message, per CLAUDE.md) and move the chat-id sentence onto `freshTopic`.",
+    "testUpgrade": "Not a runtime class — but the existing docs.test.ts hygiene lints (title uniqueness, rig duplication) can be extended with a check that every conformance context field a backend sets is either used or named in the same expression, so a stale narration about a field cannot survive the field changing."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "security",
+    "theme": "credential-redaction",
+    "class": "colon-less-path-credential-survives-redaction",
+    "file": "packages/bridge-net-util/src/index.ts",
+    "line": 105,
+    "summary": "`credentialParts` keeps the pathname and its segments ONLY when they contain a `:`, so a token carried in an ordinary path segment (the `/api/webhooks/<id>/<token>` shape) is redacted only by the byte-exact URL split and the `scheme://` sweep. A body or transport that echoes the bare path leaks it into an MCP `isError` result.",
+    "failure": "url = `https://api.example.test/api/webhooks/12345/SECRET-CANARY-9f3a`, upstream returns 404 with body `no route for /api/webhooks/12345/SECRET-CANARY-9f3a`. Reproduced: thrown message is `L → 404: no route for /api/webhooks/12345/SECRET-CANARY-9f3a` — the canary reaches model context and stderr. The existing SPELLINGS row 'the credential path alone, no scheme or host' passes only because its fixture URL is the Telegram `bot123:<token>` shape, which happens to contain a colon.",
+    "remediation": "Drop the `includes(':')` filter: put the whole `pathname` and every path segment into `credentialParts` unconditionally, gated on a length threshold (e.g. `> 8`) rather than on punctuation, so an opaque token in any segment is covered. Then correct the README sentence, which today reads as if the path itself were always covered.",
+    "testUpgrade": "Parameterize the CREDENTIAL_LOCATIONS table by credential SHAPE as well as location: add rows for a colon-less opaque path segment (`/api/webhooks/<id>/<token>`), a base64url token segment, and a token in a path segment with a `-`/`_` — crossed with the existing SPELLINGS × VECTORS grid. Better still, generate the URL from a `{location, shape}` product and assert the canary never appears, so the next credential shape is a row rather than a rewrite."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "conformance-ratchet-granularity",
+    "class": "assertion-inside-a-clause-has-no-negative-control",
+    "file": "packages/conformance/test/negative-control.test.ts",
+    "line": 57,
+    "summary": "The negative control's one-to-one-ness is enforced per CLAUSE, not per ASSERTION. Individual assertions inside a graded case can be deleted with the entire conformance package — reference suite, suite-shape, CLAUSES registry and the child broken-variant run — staying green, while eleven backends keep being certified against the gutted suite.",
+    "failure": "Mutated packages/conformance/src/index.ts to neuter six assertions at once: the `Date.parse(m.timestamp)` validity check, `typeof/length` on `m.backendMsgId`, `typeof/length` on `m.cursor`, the SECOND `await ctx.plugin.disconnect()` (i.e. the entire 'idempotent' half of the 'disconnect is idempotent' clause), `typeof/length` on `id.backendRef`, and `expect(new Set(ids).size).toBe(3)` (post-returned ids unique). `npx vitest run packages/conformance` → 279/279 passed, 7/7 files. No BROKEN_VARIANT produces a bad timestamp, an empty cursor/backendMsgId/backendRef, a non-idempotent disconnect, or duplicate post-return ids.",
+    "remediation": "Extend the mechanical control from clauses to the assertions a clause is built on. Add BROKEN_VARIANTS for the uncontrolled shapes (garbage `timestamp`; empty `cursor`; empty `backendMsgId`; a `disconnect` that throws on the second call; an empty `backendRef`; a `post` that returns a constant id while `fetchRecent` reports distinct ones) and record which case each must break, exactly as `mustFail` already does.",
+    "testUpgrade": "Guard the CLASS by deriving the requirement from the suite source: parse `src/index.ts` for every `expect(` inside `expectWellFormedMessage` and each case, and require a mapping entry to a BROKEN_VARIANT for each — or, cheaper and durable, extend `BrokenVariant` with a `mutates` field naming the Message field / seam call it corrupts, and assert (from `CONTEXT_FIELDS` plus the `Message` keys) that every field the suite asserts on has at least one variant corrupting it. A table over `keyof Message` would have caught all four Message-field instances above at once."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "retry-after-fidelity",
+    "class": "http-date-hint-interpreted-against-the-local-clock",
+    "file": "packages/bridge-net-util/src/index.ts",
+    "line": 57,
+    "summary": "`oneRetryAfterValue` computes an HTTP-date `Retry-After` as `Date.parse(text) - Date.now()`, ignoring the response's own `Date` header. A client clock ahead of the server turns a real server-stated wait into a negative value, which `retryAfterFromHeader` filters out as 'no hint' — and the loop then retries at `DEFAULT_BACKOFF_MS`, violating the module's central 'never retry sooner than the vendor asked' invariant.",
+    "failure": "Reproduced. Server clock 60s behind the client; response carries `Date: <serverNow>` and `Retry-After: <serverNow+30s>`. `retryAfterFromHeader(res)` → `undefined`; `fetchWithRetry` then performs a single 500 ms wait and re-fires. The vendor asked for 30 000 ms; we retried 60× sooner — the exact escalation-into-a-ban path the file's own comments are written against. The mirror case (client clock behind) inflates a routine 2 s hint past `deadlineMs` and ends the call with `429: upstream asked for …ms, past this call's 30000ms deadline`.",
+    "remediation": "When the value is an HTTP-date, compute the delta against the response's `Date` header if present and parseable (`Date.parse(retryAfter) - Date.parse(res.headers.get('date'))`), falling back to `Date.now()` only when no `Date` header is offered. That is what RFC 9110 §10.2.3 assumes and it makes the hint skew-invariant.",
+    "testUpgrade": "Parameterize the existing `retryAfterFromHeader` HTTP-date rows over a clock-skew axis: `skewMs ∈ [-120_000, -1_000, 0, +1_000, +120_000]` × `[a date form hint, a delay-seconds hint]`, with the fixture setting a `Date` header at `now - skew`. Assert the computed hint is within a second of the server-intended duration for every skew, and that no performed wait in `fetchWithRetry` falls below it. The current `httpDate()` helper derives from the local clock, so no existing row can vary this axis."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "blocking",
+    "verdict": "CONFIRMED",
+    "lens": "correctness",
+    "theme": "error-envelope-completeness",
+    "class": "caller-supplied-hook-escapes-the-label-envelope",
+    "file": "packages/bridge-net-util/src/index.ts",
+    "line": 420,
+    "summary": "`await opts.retryAfterOf?.(res)` is not guarded. A caller-supplied parser that throws — the ordinary case of `res.clone().json()` on a Cloudflare/nginx HTML 429 page — propagates an arbitrary, unlabeled, unredacted error out of `fetchWithRetry`, defeating the `<label> → …` contract, the URL redaction, `sanitizeBody`, and `statusOf`.",
+    "failure": "Reproduced: 429 with body `<html>rate limited</html>` and `retryAfterOf: async (r) => { await r.clone().json(); return 1; }`. `fetchWithRetry` rejects with a bare `SyntaxError` (`Unexpected token '<' …`). The message does not start with `L → `, `statusOf(err)` is `undefined` (so a caller branching on 429 sees nothing), and nothing has passed through `redactUrls`. The error-envelope suite's own describe is titled 'nothing leaves this module outside the label + redact + sanitize envelope' — this leaves it. All four shipped parsers happen to `try/catch` internally, so the escape is latent rather than currently firing.",
+    "remediation": "Wrap the hook: `const parsed = usableHint(await Promise.resolve(opts.retryAfterOf?.(res)).catch(() => undefined));`. A parser that cannot read the body means 'no usable hint', not 'abort the call' — and fail-open here cannot retry sooner than the header floor, which is computed independently.",
+    "testUpgrade": "Add a `retryAfterOf` row-shape axis to the PARSERS table used by the HEADER_ROWS × PARSERS grid: `['a throwing parser', () => { throw new SyntaxError('…') }]`, `['a rejecting parser', () => Promise.reject(new Error('x'))]`, `['a parser returning a non-number', () => 'soon' as never]`. Assert for every row that the rejection message starts with `${label} → ` and that `statusOf(err)` is 429 — which pins the envelope for every future hook shape, not just this one."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-integrity",
+    "theme": "vacuous-assertion",
+    "class": "floor-assertion-degenerates-to-zero",
+    "file": "packages/bridge-net-util/test/fetch-with-retry.test.ts",
+    "line": 454,
+    "summary": "The HEADER_ROWS × PARSERS grid asserts `expect(w).toBeGreaterThanOrEqual(requestedMs)`, and eight of the 22 header rows ('zero', 'empty', 'unparseable', 'negative', 'absent', 'a date already past', 'a hexadecimal spelling', 'an exponent spelling') carry `requestedMs === 0`. Across six parsers that is 48 rows whose wait assertion is vacuously true, so the `DEFAULT_BACKOFF_MS` floor — the module's only self-invented backoff, and a documented public claim — is asserted nowhere.",
+    "failure": "Mutated `const wait = hinted ?? DEFAULT_BACKOFF_MS` to `const wait = hinted ?? Math.min(0, DEFAULT_BACKOFF_MS)` (token-preserving, so the source-text meta-check still passes): 320/320 tests green, with the loop now firing eight back-to-back requests at a hint-less 429 with zero delay. Separately mutating `usableHint`'s `ms > 0` to `ms >= 0` — which makes a `retryAfterOf` returning 0 count as a stated hint of 0 ms — also stayed 320/320 green, so the 'a zero parser' row grades nothing either.",
+    "remediation": "Give each row a `minWaitMs` alongside `requestedMs`: `Math.max(requestedMs, DEFAULT_BACKOFF_MS)` for every 'retry' row, and assert `w >= minWaitMs`. Add one row pinning `waits` exactly `[DEFAULT_BACKOFF_MS]` for a bare 429 with no header and no parser.",
+    "testUpgrade": "Guard the CLASS by refusing degenerate expectations in the generator itself: derive the expected wait from the row (`expected = usableHint(headerMs, parserMs) ?? DEFAULT_BACKOFF_MS`) rather than from the row's stated `requestedMs`, and assert `expect(expected).toBeGreaterThan(0)` before using it — so any future row whose expectation collapses to zero fails at construction instead of passing vacuously. The same shape applies to the `w >= 0` idiom anywhere it appears."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "operability-and-release",
+    "theme": "gate-that-never-runs",
+    "class": "typecheck-of-test-sources-is-configured-but-unwired",
+    "file": "packages/conformance/test/repo-contract.test.ts",
+    "line": 97,
+    "summary": "`tsconfig.test.json` + the `typecheck:test` script exist in both packages and are asserted to be correctly aliased, but no automation ever runs them: `.github/workflows/ci.yml` runs only `npm ci`, `npm run build` (`tsc -b`, whose per-package `include` is `src/**` only), the dev-infra script, `npm test` (vitest, which transpiles without typechecking) and `preflight:publish`. No fixture in the repo is ever seen by a compiler.",
+    "failure": "Traced: `grep typecheck .github/workflows` returns nothing; every package `tsconfig.json` has `\"include\": [\"src/**/*\"]`. A type error introduced anywhere under `packages/conformance/test/` or `packages/bridge-net-util/test/` passes CI in full. This falsifies readme.test.ts's row 'is not vacuous: some package does typecheck its test sources' — that row measures the presence of a `test/` include glob, not the execution of any gate — and it undercuts repo-contract.test.ts's own stated rationale ('the one gate that would have caught a changed public surface').",
+    "remediation": "Add a CI step that runs the test typechecks (e.g. `npm run typecheck:test --workspaces --if-present`, after `npm run build` since it needs each dependency's `dist/*.d.ts`). Note that without a prior build the conformance gate cannot even resolve `@sharptrick/parley-core`, so ordering is load-bearing.",
+    "testUpgrade": "Make the property mechanical rather than declarative: in repo-contract.test.ts, read `.github/workflows/ci.yml` and assert that some step invokes each package's `typecheck:test` script (or `tsc -p …/tsconfig.test.json`), parameterized over the set of packages that ship a `tsconfig.test.json`. That is the same trick the file already uses for `paths`, applied to the half that decides whether the config is alive."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "protocol-conformance",
+    "theme": "ungraded-seam-clause",
+    "class": "blockMs-without-since-is-never-exercised",
+    "file": "packages/conformance/src/index.ts",
+    "line": 481,
+    "summary": "Every `blockMs` call in the suite passes a `since` (lines 491, 500, 515, 542, 547, 555). `seam.ts` states 'Blocking only engages relative to a `since`; with no `since` the default recent window returns at once', and core's `fetchRecentBlocking` really does call `plugin.fetchRecent({ ...args, since: undefined, blockMs: remaining })` on its first iteration — so the since-less blocking path is on the hot path for every `parley_fetch_recent` with `block_ms` and no cursor, and no clause grades it.",
+    "failure": "A plugin that parks for the full `blockMs` on `fetchRecent({ topic, blockMs: 30000 })` with no `since` and a non-empty topic — i.e. holds a caller who asked for the recent window for 30 s and then returns it — passes conformance in full. Nothing in CLAUSES names this behaviour and no BROKEN_VARIANT produces it. (Note also that seam.ts and engine/blocking-fetch.ts state opposite rules for the since-less case; the suite grades neither.)",
+    "remediation": "Add a clause to CLAUSES and a case: post a message, then `fetchRecent({ topic, blockMs: 5000 })` with no `since` — assert it returns the window promptly (well under `blockMs`) on both `supportsBlockingFetch` arms — plus the empty-topic variant, asserting whichever rule the repo settles on. Reconcile seam.ts and blocking-fetch.ts first, since they currently disagree.",
+    "testUpgrade": "Guard the CLASS by parameterizing the blocking clause over `since ∈ {undefined, tail}` × `topicState ∈ {empty, has-messages}` rather than adding one case: the table then also covers the since-less-empty combination and any future blocking rule change has a row waiting for it. Add the matching BROKEN_VARIANT ('a fetch that parks on a since-less blockMs') so the new assertions have a control, per the ratchet this package already applies at clause granularity."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "test-hygiene",
+    "theme": "rows-that-cannot-fail",
+    "class": "table-row-whose-body-loops-over-an-empty-set",
+    "file": "packages/conformance/test/suite-shape.test.ts",
+    "line": 145,
+    "summary": "`it.each(cases().map(c => [c.title]))('makes every capability branch of %s assert')` registers one row per suite case (21), but its body only asserts inside `for (const {field, region} of guardedRegions(owner.body))`. Only four cases contain a `ctx.<capability>` guard with an `if (` header, so ~17 rows execute an empty loop and assert nothing at all while presenting as coverage in the run summary.",
+    "failure": "Rows such as 'makes every capability branch of topics are isolated assert' and '… of post accepts inReplyTo and the reply is durable, in order assert' cannot fail for any mutation of the suite; they are indistinguishable in the report from the four rows that do work. A reader auditing 84 suite-shape tests cannot tell which ones grade anything.",
+    "remediation": "Collapse to a single case that flat-maps every case's guarded regions into one list, asserts the list is non-empty (so the check itself is not vacuous), and then asserts each region contains `expect(`. That both removes the dead rows and adds the missing non-vacuity guard.",
+    "testUpgrade": "Apply the pattern as a rule rather than a fix: build the table FROM the guarded regions (`cases().flatMap(c => guardedRegions(c.body).map(r => [c.title, r.field, r.region]))`) so a row exists exactly when there is something to grade, and add one row asserting the derived table's length is greater than three — which is what catches the detector regressing to seeing nothing. The same 'row per candidate rather than per finding' shape applies to the neighbouring `reads the required field` and `still grades the clause` tables."
+  },
+  {
+    "target": "shared",
+    "dirs": [
+      "bridge-net-util",
+      "conformance"
+    ],
+    "severity": "suggestion",
+    "verdict": "CONFIRMED",
+    "lens": "maintainability",
+    "theme": "dead-code",
+    "class": "unreachable-defensive-branch-presented-as-a-guard",
+    "file": "packages/bridge-net-util/src/index.ts",
+    "line": 239,
+    "summary": "`NULL_BODY_STATUS` (204/205/304) is unreachable. Per the fetch spec a null-body status always yields `res.body === null`, which `readBounded` short-circuits at line 257 returning `text: ''`; `buffered` then already nulls the body via `text.length === 0`. Its comment ('the constructor throws if one is given') documents a hazard the code cannot reach.",
+    "failure": "Mutated `const NULL_BODY_STATUS = new Set([204, 205, 304])` to `new Set<number>([])`: 320/320 net-util tests green. The `returns an allowStatuses status (204)` row constructs `new Response(null, {status: 204})`, so the `text.length === 0` arm claims it either way — the set has never been the thing under test.",
+    "remediation": "Delete `NULL_BODY_STATUS` and its use, leaving `const body = text.length === 0 ? null : text;`. If it is kept as belt-and-braces, it needs a test that can distinguish it — and there is no way to construct one, which is the argument for deleting it.",
+    "testUpgrade": "Rather than adding a test for unreachable code, guard the CLASS with mutation coverage on the module's constant tables: parameterize a meta-test over the module's small internal constant sets (`NULL_BODY_STATUS`, `DELAY_SECONDS`, `NEUTRALIZED`, `LONE_SURROGATE`) asserting each has at least one behavioural row that fails when the constant is emptied — run as a one-off mutation audit rather than in CI, and delete whatever cannot be distinguished."
+  },
+  {
+    "target": "core-engine",
+    "dirs": [
+      "bridge-core"
+    ],
+    "severity": "suggestion",
+    "verdict": "PLAUSIBLE",
+    "lens": "concurrency-and-failure",
+    "theme": "lifecycle-idempotence",
+    "class": "start-guard-checks-a-flag-set-after-the-race-window",
+    "file": "packages/bridge-core/src/transport/http.ts",
+    "line": 236,
+    "summary": "`listen()`'s double-start guard tests `httpServer?.listening`, which is false for the entire interval between `app.listen()` and the `listening` event — so two overlapping `listen()` calls both bind, and the comment's stated protection (\"its presence loop beating past close()\") does not hold.",
+    "failure": "Traced, not reproduced. `listen(8080)` and `listen(8081)` issued without awaiting the first: both see `httpServer?.listening !== true`, both call `app.listen`, both call `announce()`. `httpServer` and `presence` are each overwritten by the second, so the first bound socket and its presence loop are orphaned — the first keeps heartbeating `hello`/`heartbeat` to the shared presence topic with no way to stop it, advertising a bridge nobody can reach, and `close()` can never close the first socket. The sequential case is safe (the first has fired `listening` before the second runs), which is why the existing test passes.",
+    "remediation": "Latch a `starting` boolean synchronously at the top of the `listen` executor and reject the second call on it (clearing it on a bind failure), rather than inferring liveness from `server.listening`.",
+    "testUpgrade": "Table the lifecycle-idempotence class across both roots: for each of {two overlapping `listen()`s, `listen()` racing `close()`, `close()` twice, `attach()` twice on the stdio bridge, `shutdown()` racing `attach()`}, assert exactly one live socket / one presence loop and that `close()`/`shutdown()` leaves zero beats after it returns. Every existing case awaits the first call, so none of them enters the race window."
+  },
+  {
+    "target": "xmpp",
+    "dirs": [
+      "bridge-xmpp"
+    ],
+    "severity": "suggestion",
+    "verdict": "PLAUSIBLE",
+    "lens": "protocol-conformance",
+    "theme": "live-vs-catchup-divergence",
+    "class": "bodiless-archive-item-surfaces-only-on-the-catch-up-path",
+    "file": "packages/bridge-xmpp/src/index.ts",
+    "line": 868,
+    "summary": "`onGroupchat` drops a live stanza with no `<body>` (`if (body === null) return;`), but `onMamResult` has no such filter — it stores `body: inner.getChildText('body') ?? ''`. Any archived stanza without a body (MUC subject change, XEP-0308 correction, XEP-0424 retraction, a chat-state or `<x/>`-only stanza) therefore becomes a `Message` with `content: ''` on catch-up that live push never emitted, contradicting the README's \"identical via live push and via catch-up\". The same items also hit `toMessage`'s `sender: ... : this.handle` fallback when `from` is the room's bare JID, which invents a sender from the SASL *username*.",
+    "failure": "Not reachable on Prosody's `mod_muc_mam` (verified live: a `<subject>` change and an `<x/>`-only groupchat message from a second account produced no MAM item). On a server whose MUC archive stores subject changes or corrections — ejabberd's `mod_mam` and any deployment with `muc_log_all_rooms`-style settings — `fetchRecent` returns `{ content: '', senderHandle: 'parley' }` entries that occupy cursor positions and are pushed into agent context as blank messages.",
+    "remediation": "Filter in `onMamResult` the same way the live path does: skip a forwarded `<message>` with no `<body>` child (distinguish absent from empty-string). Separately, drop the `this.handle` fallback in `toMessage` — a resource-less `from` is a room-level stanza, not this bridge's own handle.",
+    "testUpgrade": "Guard the CLASS \"the live path and the catch-up path apply different admission filters to the same backend event\". Add a parameterized fixture table of archive items — body-only, subject-only, body+subject, `<x/>`-only, resource-less `from` — fed BOTH through `FakeXmpp.deliver` (live) and through a MAM query, asserting the two paths yield the identical set of `backendMsgId`s. This shape recurs on every backend that has separate push and history decoders."
+  },
+  {
+    "target": "slack",
+    "dirs": [
+      "bridge-slack"
+    ],
+    "severity": "suggestion",
+    "verdict": "PLAUSIBLE",
+    "lens": "truth-in-docs",
+    "theme": "vendor-semantics-asserted-not-verified",
+    "class": "multi-connection-event-fanout-claim",
+    "file": "packages/bridge-slack/README.md",
+    "line": 173,
+    "summary": "The README states that with multiple Socket Mode connections 'every open socket receives every subscribed event and filters locally', and rests its multi-session fallback advice on it; Slack is widely understood to deliver each event to only ONE of an app's open connections.",
+    "failure": "Two Parley processes configured per the README's weaker option ('its own app, or at least its own bot user') share one app_token, so both hold a Socket Mode connection on the same app. If Slack routes each event to a single connection, each session receives a roughly random half of the live pushes — silent, per-session live-path loss that only a manual fetch_recent recovers, on the exact configuration the README blesses. The plugin's own zero-gap rotation design (open the replacement before draining the old socket on `reason: 'warning'`) only makes sense under single-connection routing, so the two claims sit uneasily together.",
+    "remediation": "Verify the current Socket Mode multi-connection routing rule against Slack's live docs. If events are not fanned out, correct the sentence and strengthen the guidance to 'a distinct Slack APP (distinct app_token) per push-capable session — a distinct bot user within one app is not sufficient'.",
+    "testUpgrade": "Encode the decided vendor semantics in FakeSlack rather than in prose: make it deliver each events_api envelope to exactly one connected socket (round-robin) and add a case with two plugin instances sharing an app token asserting the documented outcome. The row fails until doc and fixture agree, which is what stops the next reviewer meeting this claim again in a different costume."
+  },
+  {
+    "target": "telegram",
+    "dirs": [
+      "bridge-telegram"
+    ],
+    "severity": "suggestion",
+    "verdict": "PLAUSIBLE",
+    "lens": "concurrency-and-failure",
+    "theme": "unbounded-retry-cadence",
+    "class": "rate-floor-guards-only-one-answer-shape",
+    "file": "packages/bridge-telegram/src/index.ts",
+    "line": 600,
+    "summary": "The `MIN_IDLE_POLL_MS` floor under the sole ingestion loop applies only when `updates.length === 0`, so an upstream that answers immediately with a non-empty batch it never retires spins the loop with no delay at all.",
+    "failure": "An upstream (proxy cache, non-conforming local Bot API server) that ignores `offset` and re-serves the same batch leaves `offset = Math.max(offset, u.update_id + 1)` unchanged and `updates.length > 0`, so the `if (updates.length === 0)` throttle is skipped every iteration: the loop issues getUpdates as fast as the socket allows against the operator's bot token — the exact flood the comment above the floor says it prevents — while every record is silently deduped, so no message loss makes it visible. Not reproduced: the fake always honours `offset`, and its `ignoreLongPoll(true)` mode only produces the empty-answer shape the floor does cover.",
+    "remediation": "Move the floor out of the empty-answer branch: bound the whole iteration (e.g. throttle whenever the poll returned in well under `poll_timeout_s` AND `offset` did not advance), so cadence is a property of the loop rather than of the answer's shape.",
+    "testUpgrade": "Extend the fake with an 'ignores offset' mode and parameterize the existing 'stays below a handful of polls a second at poll_timeout_s %i' table over UPSTREAM-MISBEHAVIOUR {ignores timeout, ignores offset, answers with an already-consumed batch, answers with non-message updates only} — one row per way a poll can return without progress."
+  }
+]

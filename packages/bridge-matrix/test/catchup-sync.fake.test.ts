@@ -1,153 +1,28 @@
-import { asCursor, asHandle, asTopic, catchUpTopic, ReadStateStore, SeenSet } from '@sharptrick/parley-core';
+import {
+  asCursor,
+  asHandle,
+  asTopic,
+  catchUpTopic,
+  type Cursor,
+  fetchRecentBlocking,
+  isBlockingFetchUnsupportedError,
+  ReadStateStore,
+  SeenSet,
+} from '@sharptrick/parley-core';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MatrixPlugin } from '../src/index.js';
+import type { MatrixPlugin } from '../src/index.js';
+import { connectFake, FakeSynapse } from './fake-synapse.js';
 
 /**
- * Work item 17 — Matrix catch-up & sync correctness (BUG-03 / BUG-09 / BUG-10).
+ * Matrix catch-up & sync correctness.
  *
- * These drive the ACTUAL plugin code (fetchRecent / subscribe / backfill) against an in-memory
- * fake Synapse (a `global.fetch` stub that models a single room's timeline + Matrix pagination
- * tokens). No live homeserver: the conformance suite (`conformance.test.ts`) covers the live
- * drive and is `describe.skip`'d when no Synapse answers. This file is the code-level proof that
- * each fix genuinely changes the runtime behavior, not merely that the suite is green.
- *
- * Pagination-token model: a token `p<n>` is a boundary index into the timeline array.
- *   dir=f from p<n> → timeline[n], timeline[n+1], … ascending; end = p<n+count>
- *   dir=b from p<n> → timeline[n-1], timeline[n-2], … newest-first; end = p<n-count>
- *   /context/<id> → { start:p<i>, end:p<i> } (end re-includes the since event — the mid-stream case)
+ * These drive the ACTUAL plugin code (fetchRecent / subscribe) against the in-memory
+ * fake Synapse in `./fake-synapse.ts`. No live homeserver: the conformance suite
+ * (`conformance.test.ts`) covers the live drive and is `describe.skip`'d when no Synapse answers.
  */
-
-const TOPIC_KEY = 'app.parley.topic';
-const ROOM_ID = '!room:fake';
-
-interface Ev {
-  type: string;
-  event_id: string;
-  sender: string;
-  origin_server_ts: number;
-  content: Record<string, unknown>;
-}
-
-const jsonRes = (obj: unknown, status = 200): Response =>
-  new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
-
-class FakeSynapse {
-  timeline: Ev[] = [];
-  private counter = 0;
-  /** How many events an incremental /sync will return before it truncates with `limited:true`. */
-  syncCap = 100;
-  /** Number of `limited:true` incremental syncs emitted — proves the backfill path was exercised. */
-  limitedEmitted = 0;
-
-  private ev(type: string, content: Record<string, unknown>): Ev {
-    const e: Ev = {
-      type,
-      event_id: `$e${this.counter}:fake`,
-      sender: '@parley:fake',
-      origin_server_ts: 1_700_000_000_000 + this.counter,
-      content,
-    };
-    this.counter++;
-    this.timeline.push(e);
-    return e;
-  }
-
-  /** Inject a message from a "foreign" client (simulates a post that landed between polls). */
-  addMessage(topic: string, body: string): Ev {
-    return this.ev('m.room.message', { msgtype: 'm.text', body, [TOPIC_KEY]: topic });
-  }
-
-  /** Inject a non-`m.room.message` event (reaction / membership churn). */
-  addRaw(type: string): Ev {
-    return this.ev(type, {});
-  }
-
-  readonly fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    // Yield to the macrotask queue on every request so the subscribe() poll loop (no delay on its
-    // success path) can never starve vitest's timer-based vi.waitFor.
-    await new Promise((r) => setTimeout(r, 1));
-    const url = new URL(typeof input === 'string' ? input : (input as Request).url ?? String(input));
-    const method = (init?.method ?? 'GET').toUpperCase();
-    const path = url.pathname;
-
-    if (path.endsWith('/v3/login')) return jsonRes({ access_token: 'tok', user_id: '@parley:fake' });
-    if (path.includes('/v3/directory/room/')) return jsonRes({ room_id: ROOM_ID });
-    if (path.endsWith('/join')) return jsonRes({ room_id: ROOM_ID });
-
-    if (method === 'PUT' && /\/rooms\/[^/]+\/send\/m\.room\.message\//.test(path)) {
-      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-      const e = this.ev('m.room.message', {
-        msgtype: 'm.text',
-        body: body.body,
-        [TOPIC_KEY]: body[TOPIC_KEY],
-      });
-      return jsonRes({ event_id: e.event_id });
-    }
-
-    const ctx = path.match(/\/rooms\/[^/]+\/context\/([^/]+)$/);
-    if (ctx) {
-      const evId = decodeURIComponent(ctx[1]);
-      const idx = this.timeline.findIndex((e) => e.event_id === evId);
-      if (idx < 0) return jsonRes({ errcode: 'M_NOT_FOUND', error: 'event not found' }, 404);
-      return jsonRes({ start: `p${idx}`, end: `p${idx}`, event: this.timeline[idx] });
-    }
-
-    if (/\/rooms\/[^/]+\/messages$/.test(path)) {
-      const dir = url.searchParams.get('dir');
-      const limit = Number(url.searchParams.get('limit') ?? '10');
-      const from = url.searchParams.get('from');
-      if (dir === 'f') {
-        const b = from ? tokenPos(from) : 0;
-        const chunk = this.timeline.slice(b, b + limit);
-        return jsonRes({ chunk, start: `p${b}`, end: `p${b + chunk.length}` });
-      }
-      // dir=b (default for recentWindow — no `from` → newest-first from the tail).
-      const b = from ? tokenPos(from) : this.timeline.length;
-      const start = Math.max(0, b - limit);
-      const chunk = this.timeline.slice(start, b).reverse();
-      return jsonRes({ chunk, start: `p${b}`, end: `p${start}` });
-    }
-
-    if (path.endsWith('/v3/sync')) {
-      const since = url.searchParams.get('since');
-      const filter = JSON.parse(url.searchParams.get('filter') ?? '{}') as {
-        room?: { timeline?: { limit?: number } };
-      };
-      const filterLimit = filter.room?.timeline?.limit ?? 0;
-      const len = this.timeline.length;
-      if (since === null) {
-        // Initial positioning sync (timeline limit 0) — skip history, just hand back a resume token.
-        return jsonRes({ next_batch: `p${len}`, rooms: { join: { [ROOM_ID]: { timeline: { events: [], limited: false } } } } });
-      }
-      const k = tokenPos(since);
-      const cap = Math.min(filterLimit, this.syncCap);
-      const newCount = len - k;
-      if (newCount <= 0) {
-        return jsonRes({ next_batch: `p${k}`, rooms: { join: { [ROOM_ID]: { timeline: { events: [], limited: false } } } } });
-      }
-      if (newCount <= cap) {
-        const events = this.timeline.slice(k, len);
-        return jsonRes({ next_batch: `p${len}`, rooms: { join: { [ROOM_ID]: { timeline: { events, limited: false } } } } });
-      }
-      // Burst larger than the effective per-sync cap: return only the newest `cap`, mark `limited`,
-      // and expose a `prev_batch` that paginates BACKWARD over the omitted (older) events.
-      this.limitedEmitted++;
-      const startIdx = len - cap;
-      const events = this.timeline.slice(startIdx, len);
-      return jsonRes({
-        next_batch: `p${len}`,
-        rooms: { join: { [ROOM_ID]: { timeline: { events, limited: true, prev_batch: `p${startIdx}` } } } },
-      });
-    }
-
-    return jsonRes({ errcode: 'M_UNRECOGNIZED', error: `unhandled ${method} ${path}` }, 404);
-  };
-}
-
-const tokenPos = (t: string): number => Number(t.slice(1));
 
 let fake: FakeSynapse;
 const install = (): FakeSynapse => {
@@ -156,18 +31,7 @@ const install = (): FakeSynapse => {
   return fake;
 };
 
-const connect = async (shared: boolean): Promise<MatrixPlugin> => {
-  const p = new MatrixPlugin();
-  await p.connect({
-    homeserver_url: 'http://synapse.fake',
-    server_name: 'fake',
-    user: 'parley',
-    password: 'a-real-test-secret',
-    sync_timeout_ms: 50,
-    ...(shared ? { shared_room: 'parley_conformance' } : {}),
-  });
-  return p;
-};
+const connect = (shared: boolean): Promise<MatrixPlugin> => connectFake({ shared });
 
 const rsPath = () => join(mkdtempSync(join(tmpdir(), 'parley-mx-')), 'read-state.json');
 
@@ -176,7 +40,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('BUG-03 — fetchRecent since-path drains a foreign block and always advances the cursor', () => {
+describe('fetchRecent since-path drains a foreign block and always advances the cursor', () => {
   it('shared_room: a later on-topic message after a full page of foreign-topic events is returned', async () => {
     install();
     const p = await connect(true);
@@ -214,7 +78,7 @@ describe('BUG-03 — fetchRecent since-path drains a foreign block and always ad
     await p.disconnect();
   });
 
-  it('catchUpTopic over the same shared room counts the trailing A message and advances read-state past X', async () => {
+  it('catchUpTopic over the same shared room counts the trailing A message and reports a cursor past X', async () => {
     install();
     const p = await connect(true);
     const A = asTopic('cu-A');
@@ -232,123 +96,322 @@ describe('BUG-03 — fetchRecent since-path drains a foreign block and always ad
     const total = await catchUpTopic({ plugin: p, topic: A, limit: 5, readState, seen });
 
     expect(total).toBe(1); // drains the trailing a1 rather than breaking early at 0
-    expect(String(readState.get(A))).toBe(String(idA1)); // read-state crossed the foreign block
+    // The driver leaves the stored position for `parley_fetch_recent` to advance, so what carries
+    // the crossing is the cursor the resumed page REPORTS — the value that tool persists.
+    expect(readState.get(A)).toBe(asCursor(String(idA0)));
+    const resumed = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit: 5 });
+    expect(String(resumed.nextCursor)).toBe(String(idA1)); // the cursor crossed the foreign block
     await p.disconnect();
   });
 });
 
-describe('BUG-09 — subscribe recovers a burst larger than the per-sync cap via prev_batch', () => {
-  it('delivers ALL N events ascending with no gap and no duplicate when the server truncates', async () => {
-    const f = install();
-    f.syncCap = 2; // server truncates any incremental sync to 2 events → forces limited:true
-    const p = await connect(false); // per-topic room, fresh (no prior history)
-    const T = asTopic('burst');
+/**
+ * CLASS: a cursor must cross a block of traffic it cannot return, and must not move for traffic it
+ * simply has not reached. `/messages` bounds a page BEFORE filtering, so a page-sized block of another topic's events
+ * would wedge a cursor pinned at `since` forever; but advancing on a SHORT (end-of-timeline) page
+ * means any traffic on any other topic in a shared room silently moves this topic's cursor, breaking
+ * the seam's "since at the tail returns empty and a STABLE cursor" contract for every reader of that
+ * room.
+ *
+ * The depth is SWEPT across the page boundary rather than sampled, because the decision is made at
+ * `count === limit` and the `since` event itself can occupy a page slot — hand-picked depths straddle
+ * the cell where a short page is misjudged as full. Two NECESSARY conditions bound the sweep from
+ * both sides, neither derived from how the paging is implemented, so a re-implementation cannot
+ * mirror them into a pass:
+ *   fewer than `limit` events exist after the cursor  → no full page can exist  → MUST stay stable
+ *   at least `2 * limit` do (a full page even if the cursor event steals a slot) → MUST advance
+ * Between those the plugin may do either, and only replayability is graded.
+ */
+const LIMITS = [1, 2, 5];
+const sweep = (limit: number): number[] => Array.from({ length: 2 * limit + 1 }, (_, i) => i);
+const cursorMustMove = (count: number, limit: number): boolean | undefined =>
+  count < limit ? false : count >= 2 * limit ? true : undefined;
 
-    const got: string[] = [];
-    await p.subscribe(T, (m) => got.push(m.content));
+describe('a foreign block moves this topic cursor only when it fills a page', () => {
+  for (const limit of LIMITS) {
+    for (const count of sweep(limit)) {
+      const must = cursorMustMove(count, limit);
+      it(`limit ${limit} / ${count} foreign event(s) after the cursor: moves it = ${must ?? 'either'}`, async () => {
+        install();
+        const p = await connect(true);
+        const A = asTopic('topic-A');
+        const B = asTopic('topic-B');
+        const writer = asHandle('w');
 
-    // While the loop is between polls, a burst of 5 lands (5 > syncCap 2 → the server drops 3).
-    for (let i = 0; i < 5; i++) f.addMessage(String(T), `m${i}`);
+        const idA0 = await p.post(A, writer, 'a0');
+        for (let i = 0; i < count; i++) await p.post(B, writer, `b${i}`);
 
-    await vi.waitFor(() => expect(got.length).toBe(5), { timeout: 4000, interval: 10 });
+        const at = await p.fetchRecent({ topic: A, since: asCursor(String(idA0)), limit });
+        expect(at.messages).toEqual([]);
+        const moved = String(at.nextCursor) !== String(idA0);
+        if (must !== undefined) expect(moved).toBe(must);
 
-    expect(got).toEqual(['m0', 'm1', 'm2', 'm3', 'm4']); // ascending, complete, in order
-    expect(new Set(got).size).toBe(5); // no duplicate delivery
-    expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation/backfill path actually ran
+        // Whatever it reported, the cursor is replayable: the next on-topic message is returned from
+        // it exactly once, and the read is idempotent until then.
+        const again = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
+        expect(again.messages).toEqual([]);
+        const idA1 = await p.post(A, writer, 'a1');
+        const next = await p.fetchRecent({ topic: A, since: at.nextCursor, limit });
+
+        expect(next.messages.map((m) => m.content)).toEqual(['a1']);
+        expect(String(next.nextCursor)).toBe(String(idA1));
+        await p.disconnect();
+      });
+    }
+  }
+
+  /**
+   * The bound on forward pagination (MAX_FORWARD_PAGES * limit) is only survivable because each
+   * drain advances the cursor. Driven as the repeated catch-up core runs for this backend — each
+   * page's `nextCursor` fed back as the next `since`, the exact loop a wedged cursor makes infinite.
+   * This plugin has no read primitive to park a budget on, so the row also pins the other half of
+   * that: `fetchRecentBlocking` over it REFUSES rather than crossing the block slowly.
+   */
+  it('a foreign block deeper than one drain is crossed by repeated catch-up, not wedged', async () => {
+    install();
+    const p = await connect(true);
+    const A = asTopic('deep-A');
+    const B = asTopic('deep-B');
+    const writer = asHandle('w');
+
+    const idA0 = await p.post(A, writer, 'a0');
+    for (let i = 0; i < 300; i++) await p.post(B, writer, `b${i}`);
+    const idA1 = await p.post(A, writer, 'a1');
+
+    let since = asCursor(String(idA0));
+    const drained: string[] = [];
+    for (let call = 0; call < 4 && drained.length === 0; call++) {
+      const page = await p.fetchRecent({ topic: A, since, limit: 5 });
+      drained.push(...page.messages.map((m) => m.content));
+      since = page.nextCursor;
+    }
+
+    expect(drained).toEqual(['a1']);
+    expect(String(since)).toBe(String(idA1));
+
+    // The refusal reaches an embedder through core's wrapper too, off the FIRST call: crossing the
+    // block by polling behind the caller's back is exactly the wait this backend cannot honour.
+    const refusal = await fetchRecentBlocking(
+      p,
+      { topic: A, since: asCursor(String(idA0)), limit: 5 },
+      { blockMs: 2000, pollIntervalMs: 10 },
+    ).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(isBlockingFetchUnsupportedError(refusal)).toBe(true);
     await p.disconnect();
-  });
+  }, 30_000);
 });
 
-describe('issue #20 — fetchRecent honors blockMs natively via a bounded /sync long-poll', () => {
-  it('wakes promptly when a message lands mid-wait, returning it via the canonical catch-up', async () => {
-    install();
-    const p = await connect(false); // per-topic room; no subscribe loop → dedicated bounded /sync
-    const T = asTopic('block-wake');
-    const writer = asHandle('w');
+/**
+ * CLASS: a live-path boundary established at a DIFFERENT INSTANT than the subscription position.
+ * A homeserver truncates any `/sync` timeline to the filter cap and flags it `limited`, so a burst
+ * wider than the cap arrives with its older events missing. Push is a SUBSET of the post-subscribe
+ * tail (DESIGN §6), so those events are a gap catch-up closes — but the events the sync DOES carry
+ * must still be exactly post-position, once, ascending: a loop that positioned itself late drops
+ * what landed in between, and one that positioned early replays PRE-subscription history as live
+ * events. `WHEN_EVENTS_LAND` puts a burst on each side of that instant, and every row is seeded with
+ * pre-subscription history so both directions are graded at once.
+ *
+ * Both halves are graded per cell: a non-empty subsequence of the post-position events on the live
+ * path, and the WHOLE of them from a cursor taken before the subscribe.
+ */
+const SYNC_CAPS = [1, 2, 3];
+const BURST = 5;
+/** On-topic history that exists BEFORE subscribe — never live, in either room mode. */
+const PRE_HISTORY = ['h0', 'h1', 'h2', 'h3'];
+const WINDOW = ['w0', 'w1', 'w2'];
 
-    await p.post(T, writer, 'old');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+/**
+ * Where the first tranche of live events lands. `arm` returns the proof it fired, so a row that
+ * armed nothing fails instead of quietly grading the other cell.
+ */
+const WHEN_EVENTS_LAND: Record<
+  string,
+  { landed: string[]; arm: (f: FakeSynapse, land: (c: string) => void) => () => boolean }
+> = {
+  'after subscribe() returns': { landed: [], arm: () => () => true },
+  'between the subscription position and subscribe() returning': {
+    landed: WINDOW,
+    arm: (f, land) => {
+      let fired = false;
+      f.afterPositioningSync = (ordinal) => {
+        if (ordinal !== 1 || fired) return;
+        fired = true;
+        for (const c of WINDOW) land(c);
+      };
+      return () => fired;
+    },
+  },
+};
 
-    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 2000 });
-    // A message lands ~60ms into the wait (after the first bounded /sync has parked).
-    setTimeout(() => void p.post(T, writer, 'fresh'), 60);
+/** Ascending, once, and drawn only from `expected` — the subset the relaxed contract permits. */
+const expectSubsequence = (got: string[], expected: string[]): void => {
+  expect(got).toEqual(expected.filter((c) => got.includes(c)));
+  expect(got.length, 'the live path delivered nothing at all').toBeGreaterThan(0);
+};
 
-    const woke = await pending;
-    expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
-    expect(String(woke.nextCursor)).not.toBe(String(tail)); // cursor advanced past the floor
-    await p.disconnect();
-  });
+describe('a burst wider than the per-sync cap is a subset on push and whole on catch-up', () => {
+  for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
+    for (const syncCap of SYNC_CAPS) {
+      it(`per-sync cap ${syncCap} / events land ${whenName}: post-position events only, once`, async () => {
+        const f = install();
+        f.syncCap = syncCap; // truncates any incremental sync → forces limited:true
+        const p = await connect(false); // per-topic room
+        const T = asTopic('burst');
+        const writer = asHandle('w');
+        for (const c of PRE_HISTORY) await p.post(T, writer, c);
+        const beforeSubscribe = (await p.fetchRecent({ topic: T, limit: 100 })).nextCursor;
 
-  it('returns an empty page with a stable, replayable cursor at the blockMs timeout', async () => {
-    install();
-    const p = await connect(false);
-    const T = asTopic('block-timeout');
-    const writer = asHandle('w');
+        const got: string[] = [];
+        const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
+        await p.subscribe(T, (m) => got.push(m.content));
 
-    await p.post(T, writer, 'only');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+        // While the loop is between polls, the rest of the burst lands at once (> syncCap → the
+        // sync that carries it is truncated).
+        const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
+        for (const c of burst) f.addMessage(String(T), c);
+        const expected = [...when.landed, ...burst];
 
-    const started = Date.now();
-    const timedOut = await p.fetchRecent({ topic: T, since: tail, blockMs: 250 });
-    expect(timedOut.messages).toEqual([]);
-    expect(String(timedOut.nextCursor)).toBe(String(tail)); // stable — replaying it yields [] again
-    expect(Date.now() - started).toBeGreaterThanOrEqual(150); // actually blocked, not instant
-    await p.disconnect();
-  });
+        await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), {
+          timeout: 4000,
+          interval: 10,
+        });
+        // Keep this settle, so that a DUPLICATE arriving one poll later fails the row instead of
+        // landing after the assertion read it.
+        await new Promise((r) => setTimeout(r, 300));
 
-  it('disconnect() aborts an in-flight blocking fetch promptly (no leak, no hang)', async () => {
-    install();
-    const p = await connect(false);
-    const T = asTopic('block-disconnect');
-    const writer = asHandle('w');
+        expect(fired()).toBe(true);
+        expect(f.limitedEmitted).toBeGreaterThan(0); // the truncation really happened
+        expectSubsequence(got, expected);
+        const page = await p.fetchRecent({ topic: T, since: beforeSubscribe, limit: 100 });
+        expect(page.messages.map((m) => m.content)).toEqual(expected);
+        await p.disconnect();
+      });
+    }
+  }
 
-    await p.post(T, writer, 'seed');
-    const tail = (await p.fetchRecent({ topic: T })).nextCursor;
+  /**
+   * The same boundary in `shared_room` mode, where the pre-subscription history the live path must
+   * not replay is mostly ANOTHER topic's — the case in which a boundary derived from this topic's
+   * own messages does not exist at all.
+   */
+  for (const [whenName, when] of Object.entries(WHEN_EVENTS_LAND)) {
+    it(`shared_room / events land ${whenName}: foreign pre-history is never replayed as live`, async () => {
+      const f = install();
+      f.syncCap = 2;
+      const p = await connect(true);
+      const T = asTopic('burst');
+      const writer = asHandle('w');
+      for (const c of PRE_HISTORY) await p.post(asTopic('someone-else'), writer, c);
+      await p.post(T, writer, 'mine-before-subscribe');
+      const beforeSubscribe = (await p.fetchRecent({ topic: T, limit: 100 })).nextCursor;
 
-    const started = Date.now();
-    const pending = p.fetchRecent({ topic: T, since: tail, blockMs: 5000 });
-    setTimeout(() => void p.disconnect(), 50);
+      const got: string[] = [];
+      const fired = when.arm(f, (c) => void f.addMessage(String(T), c));
+      await p.subscribe(T, (m) => got.push(m.content));
 
-    const res = await pending; // must resolve well before the 5s budget
-    expect(res.messages).toEqual([]);
-    expect(Date.now() - started).toBeLessThan(2000);
-  });
+      const burst = Array.from({ length: BURST }, (_, i) => `m${i}`);
+      for (const c of burst) f.addMessage(String(T), c);
+      const expected = [...when.landed, ...burst];
+
+      await vi.waitFor(() => expect(got.length).toBeGreaterThan(0), { timeout: 4000, interval: 10 });
+      await new Promise((r) => setTimeout(r, 300));
+
+      expect(fired()).toBe(true);
+      expect(f.limitedEmitted).toBeGreaterThan(0);
+      expectSubsequence(got, expected);
+      const page = await p.fetchRecent({ topic: T, since: beforeSubscribe, limit: 100 });
+      expect(page.messages.map((m) => m.content)).toEqual(expected);
+      await p.disconnect();
+    });
+  }
 });
 
-describe('BUG-10 — a purged/remapped cursor 404 falls back to the recent window instead of throwing', () => {
-  it('fetchRecent with an unresolvable since resolves to the recent window (no throw)', async () => {
-    const f = install();
-    const p = await connect(false);
-    const T = asTopic('stale');
-    const writer = asHandle('w');
-    await p.post(T, writer, 'a');
-    await p.post(T, writer, 'b');
-    await p.post(T, writer, 'c');
+/**
+ * CLASS: two cursor forms with asymmetric error handling. `buildBridge` AWAITS `catchUpAll`, so any
+ * cursor a read-state file can hold and the homeserver can refuse must degrade to the documented
+ * recent window — a throw here does not fail one read, it fails every subsequent restart until the
+ * file is hand-edited. The forms are every shape a `since` argument can carry: this plugin's own two
+ * (`event_id`, `@parley-stream:`), the pre-prefix sentinel, and a value from another backend. The
+ * sentinel is the one form `ReadStateStore` refuses outright, so it grades the cold-start path
+ * instead. The last row is the negative control: a cursor the homeserver DOES resolve must not
+ * degrade.
+ */
+const STALE_CURSORS: Record<
+  string,
+  {
+    since: (p: MatrixPlugin, ids: string[]) => Promise<Cursor>;
+    /** Set when the cursor can only be minted before the topic has a room. */
+    mintFirst?: true;
+    /** Set when `ReadStateStore` refuses the form outright, so catch-up runs as a cold start. */
+    refusedByReadState?: true;
+    expected: string[];
+  }
+> = {
+  'an event id purged from the room (404 on /context)': {
+    since: async () => asCursor('$purged:fake'),
+    expected: ['a', 'b', 'c'],
+  },
+  'a value minted by another backend entirely': {
+    since: async () => asCursor('42'),
+    expected: ['a', 'b', 'c'],
+  },
+  'the pre-prefix empty sentinel': {
+    since: async () => asCursor(''),
+    refusedByReadState: true,
+    expected: ['a', 'b', 'c'],
+  },
+  'a @parley-stream: token the homeserver rejects (400 on /messages)': {
+    since: async () => asCursor('@parley-stream:garbage'),
+    expected: ['a', 'b', 'c'],
+  },
+  'a @parley-stream: token minted before the room existed': {
+    since: async (p) => (await p.fetchRecent({ topic: asTopic('stale'), limit: 100 })).nextCursor,
+    mintFirst: true,
+    expected: ['a', 'b', 'c'],
+  },
+  'an event id the homeserver still resolves': {
+    since: async (_p, ids) => asCursor(ids[0]!),
+    expected: ['b', 'c'],
+  },
+};
 
-    // Sanity: an unknown event id 404s on /context in the fake (matching M_NOT_FOUND).
-    expect(f.timeline.find((e) => e.event_id === '$purged:fake')).toBeUndefined();
+describe('every cursor form a read-state file can hold comes up rather than throwing', () => {
+  for (const [name, row] of Object.entries(STALE_CURSORS)) {
+    it(`${name}: fetchRecent resolves and catchUpTopic starts up`, async () => {
+      install();
+      const p = await connect(false);
+      const T = asTopic('stale');
+      const writer = asHandle('w');
+      const early = row.mintFirst === true ? await row.since(p, []) : undefined;
+      const ids: string[] = [];
+      for (const c of ['a', 'b', 'c']) ids.push(String(await p.post(T, writer, c)));
+      const since = early ?? (await row.since(p, ids));
 
-    const res = await p.fetchRecent({ topic: T, since: asCursor('$purged:fake'), limit: 100 });
-    expect(res.messages.map((m) => m.content)).toEqual(['a', 'b', 'c']); // recent window, ascending
-    expect(String(res.nextCursor)).toBe(String(res.messages.at(-1)!.backendMsgId));
-    await p.disconnect();
-  });
+      const res = await p.fetchRecent({ topic: T, since, limit: 100 });
+      expect(res.messages.map((m) => m.content)).toEqual(row.expected);
+      expect(String(res.nextCursor)).toBe(String(res.messages.at(-1)!.backendMsgId));
+      // The same cursor through the startup path, which is where a throw is unrecoverable.
+      const readState = new ReadStateStore(rsPath());
+      if (row.refusedByReadState === true) {
+        expect(() => readState.set(T, since)).toThrow(TypeError);
+        expect(readState.get(T)).toBeUndefined();
+      } else {
+        readState.set(T, since);
+        expect(readState.get(T)).toBe(since);
+      }
+      const total = await catchUpTopic({
+        plugin: p,
+        topic: T,
+        limit: 100,
+        readState,
+        seen: new SeenSet(),
+      });
 
-  it('catchUpTopic (the startup path) comes up cleanly with a stale persisted cursor', async () => {
-    install();
-    const p = await connect(false);
-    const T = asTopic('startup');
-    const writer = asHandle('w');
-    await p.post(T, writer, 'x');
-    await p.post(T, writer, 'y');
-
-    const readState = new ReadStateStore(rsPath());
-    const seen = new SeenSet();
-    readState.set(T, asCursor('$gone:fake')); // stale/purged cursor persisted from a prior run
-
-    // Must NOT throw a "Matrix GET .../context/$gone → 404" — that is what bricked startup.
-    const total = await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen });
-    expect(total).toBe(2); // resumed from the recent window
-    await p.disconnect();
-  });
+      expect(total).toBe(row.expected.length);
+      await p.disconnect();
+    });
+  }
 });

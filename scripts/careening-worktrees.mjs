@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// Provision one throwaway git worktree per Careening review target, all pinned to the SAME commit.
+//
+//   node scripts/careening-worktrees.mjs setup <sha>
+//   node scripts/careening-worktrees.mjs teardown
+//
+// Why: critics must review one immutable snapshot, and they must be free to mutate source to prove
+// a test is vacuous. Both are impossible in a shared tree — during round 2 the orchestrator
+// committed twice while critics were mid-read, and three round-1 agents mutated the working tree
+// other agents were building against.
+//
+// node_modules is hard-linked (`cp -al`), so a worktree costs ~3 MB rather than 173 MB, and the
+// workspace symlinks resolve INSIDE it (node_modules/@sharptrick/parley-core -> ../../packages/…),
+// which is what makes the isolation real rather than cosmetic.
+
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+
+// Derive the checkout from git, not from a literal. This said '/home/user/parley' — the path on the
+// cloud container it was written on — so every worktree it made on any other machine would have
+// pointed at a directory that does not exist.
+const ROOT = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+// Default beside the checkout, NOT under /tmp: hard-linking node_modules is what makes a worktree
+// cost no disk, and /tmp is a different filesystem from the repo on any normal desktop. Override
+// with CAREENING_WORKTREES when a same-device scratch path is wanted elsewhere.
+const BASE =
+  process.env.CAREENING_WORKTREES ?? join(ROOT, '..', '.careening', 'worktrees');
+
+export const TARGETS = [
+  'core-seam',
+  'core-engine',
+  'core-auth',
+  'sqlite',
+  'redis',
+  'postgres',
+  'matrix',
+  'xmpp',
+  'nats',
+  'zulip',
+  'discord',
+  'slack',
+  'telegram',
+  'shared',
+  'repo',
+];
+
+const sh = (cmd, args, cwd = ROOT) =>
+  execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+function setup(sha) {
+  if (!sha) throw new Error('usage: careening-worktrees.mjs setup <sha>');
+  const resolved = sh('git', ['rev-parse', sha]).trim();
+  mkdirSync(BASE, { recursive: true });
+  for (const t of TARGETS) {
+    const path = join(BASE, t);
+    if (existsSync(path)) {
+      try {
+        sh('git', ['worktree', 'remove', '--force', path]);
+      } catch {
+        rmSync(path, { recursive: true, force: true });
+      }
+    }
+    sh('git', ['worktree', 'add', '--detach', path, resolved]);
+    // Hard-link rather than copy: same inodes, so this is ~free on disk and instant.
+    sh('cp', ['-al', join(ROOT, 'node_modules'), join(path, 'node_modules')]);
+    process.stdout.write(`${t} -> ${path}\n`);
+  }
+  process.stdout.write(`\n${TARGETS.length} worktrees at ${resolved.slice(0, 7)}\n`);
+  // The runner takes this base as a required argument and refuses to guess it, so print the
+  // answer rather than leaving an operator to reconstruct it from the lines above.
+  process.stdout.write(`careening-review args.worktrees = ${BASE}\n`);
+}
+
+function teardown() {
+  for (const t of TARGETS) {
+    const path = join(BASE, t);
+    if (!existsSync(path)) continue;
+    // Remove the hard-linked tree first; `git worktree remove` would walk all 561 packages.
+    rmSync(join(path, 'node_modules'), { recursive: true, force: true });
+    try {
+      sh('git', ['worktree', 'remove', '--force', path]);
+    } catch {
+      rmSync(path, { recursive: true, force: true });
+    }
+  }
+  sh('git', ['worktree', 'prune']);
+  process.stdout.write('worktrees removed\n');
+}
+
+// Keep the CLI behind a main-module check, so that TARGETS can be imported without running a
+// command — the harness cross-check in packages/conformance reads it, and an unguarded entrypoint
+// threw `usage:` at import time.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [, , cmd, arg] = process.argv;
+  if (cmd === 'setup') setup(arg);
+  else if (cmd === 'teardown') teardown();
+  else throw new Error('usage: careening-worktrees.mjs <setup <sha>|teardown>');
+}

@@ -1,0 +1,288 @@
+/**
+ * The one fixture every zulip test file boots from, the one conformance context both passes use,
+ * and the one place the optional real-server gate is decided. Each used to be copy-pasted per call
+ * site, which let them drift apart.
+ */
+import type { ConformanceContext } from '@sharptrick/parley-conformance';
+import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { afterEach, expect, vi } from 'vitest';
+import { ZulipPlugin } from '../src/index.js';
+import { type FakeZulip, SERVER_CONSTRAINTS, startFakeZulip } from './fake-zulip.js';
+
+/**
+ * The declared type of every `backend_config` key, parsed from the source's own
+ * `ZulipBackendConfig` wherever in `src/` it is declared. Read it rather than hand-listing the
+ * keys, so a key added later is graded the day it is declared — and graded by the SAME set
+ * everywhere, so the config table and the secret-hygiene table cannot end up describing two
+ * different surfaces.
+ */
+export const DECLARED_CONFIG_TYPES: Record<string, string> = ((): Record<string, string> => {
+  const src = fileURLToPath(new URL('../src/', import.meta.url));
+  const source = readdirSync(src)
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => readFileSync(`${src}${f}`, 'utf8'))
+    .join('\n');
+  const body = /export interface ZulipBackendConfig \{([\s\S]*?)\n\}/.exec(source)?.[1] ?? '';
+  return Object.fromEntries(
+    [...body.matchAll(/^ {2}(\w+)\??: (\w+);/gm)].map((m) => [m[1] as string, m[2] as string]),
+  );
+})();
+
+export const DECLARED_CONFIG_KEYS = Object.keys(DECLARED_CONFIG_TYPES);
+
+export const rand = (): string => Math.random().toString(36).slice(2, 8);
+export const SENDER = asHandle('writer');
+export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Every character any plausible spelling of "whitespace" strips off an edge: both sets the SERVER
+ * uses ({@link SERVER_CONSTRAINTS}, which are NOT the same set as each other) plus everything
+ * JavaScript's own `\s` and `String#trim` add on top, enumerated by scanning the whole code space
+ * rather than hand-listed.
+ *
+ * Keep it generated from the divergence itself, so that a table built on it fails on the FIRST code
+ * point where a guard's character class disagrees with the server's — the four sets disagree in both
+ * directions, so a hand-picked row list cannot be trusted to contain the divergence, and the two
+ * that shipped (U+0085 and U+001C-U+001F on a body) were exactly the ones nobody listed.
+ */
+export const CANDIDATE_PADDINGS: string[] = ((): string[] => {
+  const found = new Set([
+    ...SERVER_CONSTRAINTS.stripsBodyEdges,
+    ...SERVER_CONSTRAINTS.stripsTopicEdges,
+  ]);
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const c = String.fromCodePoint(cp);
+    if (/\s/u.test(c) || c.trim() === '') found.add(c);
+  }
+  return [...found].sort();
+})();
+
+export const padName = (pad: string): string =>
+  `U+${(pad.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}`;
+
+/** Where the padding sits — a right-strip-only guard passes one placement and fails another. */
+export const PLACEMENTS: Array<{ name: string; pad: (p: string, core: string) => string }> = [
+  { name: 'leading', pad: (p, core) => `${p}${core}` },
+  { name: 'trailing', pad: (p, core) => `${core}${p}` },
+  { name: 'both ends', pad: (p, core) => `${p}${core}${p}` },
+];
+
+/** The placements above plus the two only a pure call can afford: no edge at all, and no core. */
+export const ALL_PLACEMENTS: typeof PLACEMENTS = [
+  ...PLACEMENTS,
+  { name: 'interior only', pad: (p, core) => `${core}${p}${core}` },
+  { name: 'alone', pad: (p) => p },
+];
+
+/**
+ * Every server-controlled field of a Zulip message record the plugin reads, and every shape the
+ * declared wire types say cannot arrive. Shared rather than restated per file, so that a field or a
+ * shape added here is met by every table that crosses them — the plugin's hazard sweep, its
+ * page-edge table, and the fixture-fidelity precondition that says the fake actually SERVES each
+ * one. A hazard the fixture swallows makes every plugin row that injects it an assertion about
+ * nothing, which is why the three read from one list.
+ */
+export const HAZARD_FIELDS = ['id', 'content', 'sender_email', 'timestamp'] as const;
+
+/** Shapes the declared wire types say cannot arrive. Names double as the test titles. */
+export const HAZARDS: Array<{ name: string; value: unknown }> = [
+  { name: 'missing', value: undefined },
+  { name: 'null', value: null },
+  { name: 'zero', value: 0 },
+  { name: 'negative', value: -1 },
+  { name: 'fractional', value: 1.5 },
+  { name: 'past the Date range', value: 1e18 },
+  { name: 'before the Date range', value: -1e18 },
+  { name: 'NaN', value: Number.NaN },
+  { name: 'Infinity', value: Number.POSITIVE_INFINITY },
+  { name: 'a string', value: 'nope' },
+  { name: 'an empty string', value: '' },
+  { name: 'an object', value: { nested: true } },
+  { name: 'an array', value: [1, 2] },
+  { name: 'a boolean', value: true },
+  { name: 'a huge string', value: 'x'.repeat(70_000) },
+  { name: 'non-ASCII around a control character', value: '\u{1F600}\u0000caf\u00e9' },
+];
+
+export interface ZulipPair {
+  plugin: ZulipPlugin;
+  fake: FakeZulip;
+}
+
+export type Boot = (
+  opts?: Parameters<typeof startFakeZulip>[0],
+  config?: Record<string, unknown>,
+) => Promise<ZulipPair>;
+
+/**
+ * Register the shared teardown for this test file and return its `boot`. Every booted pair is
+ * disconnected and closed after each test, so a leaked poll loop cannot bleed into the next one.
+ */
+export function useZulip(): Boot {
+  let open: ZulipPair[] = [];
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    const unexercised: string[] = [];
+    for (const { plugin, fake } of open) {
+      await plugin.disconnect().catch(() => undefined);
+      unexercised.push(...fake.armedButNeverServed());
+      await fake.close();
+    }
+    open = [];
+    expect(
+      unexercised,
+      'this case armed a server fault on a route no request ever reached, so it exercised exactly ' +
+        'the same path as an unarmed run while reading in the report as coverage',
+    ).toEqual([]);
+  });
+
+  return async (opts, config) => {
+    const fake = await startFakeZulip({ heartbeatMs: 200, ...opts });
+    const plugin = new ZulipPlugin();
+    await plugin.connect({ site_url: fake.url, events_timeout_ms: 500, ...config });
+    const pair: ZulipPair = { plugin, fake };
+    open.push(pair);
+    return pair;
+  };
+}
+
+/**
+ * Every way a live connection ends — which is every way a subscribe loop can end, because the loop
+ * is bound to the connection generation and `connect()` over a live connection tears the old one
+ * down itself. Shared so a table crossing this dimension grades a new ending the day it is declared,
+ * rather than the day someone remembers to add a row for it in each file.
+ */
+export interface ConnectionEnding {
+  name: string;
+  /** Whether a NEW connection is left behind; tables that need one filter on this. */
+  reconnects: boolean;
+  end: (plugin: ZulipPlugin, url: string) => Promise<void>;
+}
+
+export const CONNECTION_ENDINGS: ConnectionEnding[] = [
+  { name: 'disconnect', reconnects: false, end: async (plugin) => plugin.disconnect() },
+  {
+    name: 'disconnect then connect',
+    reconnects: true,
+    end: async (plugin, url) => {
+      await plugin.disconnect();
+      await plugin.connect({ site_url: url, events_timeout_ms: 500 });
+    },
+  },
+  {
+    name: 'connect with no disconnect',
+    reconnects: true,
+    end: async (plugin, url) => plugin.connect({ site_url: url, events_timeout_ms: 500 }),
+  },
+];
+
+let contextSeq = 0;
+
+/**
+ * The ONE conformance context for this backend, whichever server it is pointed at. Both passes —
+ * the in-process fake and the optional real server — go through here so a change to the concurrent
+ * writers, the capability flags, or the teardown cannot be applied to one pass and forgotten in the
+ * other; anything that must genuinely differ arrives as a named argument and is visible at the call
+ * site.
+ */
+export function makeZulipContext(args: {
+  connect: Record<string, unknown>;
+  /** Torn down after the plugin, e.g. closing the in-process fake. Omitted for a real server. */
+  closeServer?: () => Promise<void>;
+}): () => Promise<ConformanceContext> {
+  return async (): Promise<ConformanceContext> => {
+    const plugin = new ZulipPlugin();
+    await plugin.connect(args.connect);
+    return {
+      plugin,
+      // Zulip stamps the sender from the authenticated bot, not from `post`'s `identity`.
+      carriesSenderIdentity: false,
+      // The one refusal any backend in this repo takes, and it was invisible until it had to be
+      // declared: Zulip's `normalize_body` strips a body's trailing whitespace on SEND, so `post`
+      // refuses that shape rather than storing something else (`src/wire.ts`). Declaring it says
+      // what the write clause asserts — the refusal is real — and what the live floor therefore
+      // cannot carry here.
+      refusesContentShapes: ['leading and trailing spaces'],
+      freshTopic: (): Topic => asTopic(`t-${++contextSeq}-${rand()}`),
+      cleanup: async () => {
+        await plugin.disconnect();
+        await args.closeServer?.();
+      },
+      concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
+        const plugins = await Promise.all(
+          Array.from({ length: writers }, async () => {
+            const p = new ZulipPlugin();
+            await p.connect(args.connect);
+            return p;
+          }),
+        );
+        try {
+          await Promise.all(
+            plugins.map(async (p, w) => {
+              for (let i = 0; i < perWriter; i++) {
+                await p.post(topic, asHandle(`w${w}`), `w${w}-${i}`);
+              }
+            }),
+          );
+        } finally {
+          await Promise.all(plugins.map((p) => p.disconnect()));
+        }
+      },
+    };
+  };
+}
+
+/** Names of the environment variables that opt a run into the real-server conformance pass. */
+export const REAL_SERVER_VARS = [
+  'PARLEY_ZULIP_URL',
+  'PARLEY_ZULIP_EMAIL',
+  'PARLEY_ZULIP_API_KEY',
+] as const;
+
+/** What a reachability probe of the configured server found. */
+export interface GateProbe {
+  ok: boolean;
+  /** Human-readable outcome, e.g. `401 Unauthorized` or `fetch failed`. */
+  detail: string;
+}
+
+export type GateDecision =
+  | { kind: 'skip'; reason: string }
+  | { kind: 'run' }
+  | { kind: 'fail'; reason: string };
+
+/**
+ * Decide whether the optional real-server pass runs, is skipped, or FAILS. Intent and availability
+ * are separate: not asking for a real run is a skip, but asking for one against a server that does
+ * not answer is a failure — a silent skip there reports green having verified nothing.
+ */
+export function decideIntegrationGate(
+  vars: Record<string, string | undefined>,
+  probe?: GateProbe,
+): GateDecision {
+  const missing = REAL_SERVER_VARS.filter((v) => (vars[v] ?? '') === '');
+  if (missing.length === REAL_SERVER_VARS.length) {
+    return { kind: 'skip', reason: `set ${REAL_SERVER_VARS.join('/')} to run` };
+  }
+  if (missing.length > 0) {
+    return {
+      kind: 'fail',
+      reason: `a real-server run was requested but ${missing.join(', ')} ${
+        missing.length === 1 ? 'is' : 'are'
+      } unset`,
+    };
+  }
+  if (probe === undefined || !probe.ok) {
+    return {
+      kind: 'fail',
+      reason:
+        `a real-server run was requested but ${vars['PARLEY_ZULIP_URL'] ?? ''} did not answer ` +
+        `the probe: ${probe?.detail ?? 'not probed'}`,
+    };
+  }
+  return { kind: 'run' };
+}

@@ -14,7 +14,7 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-sqlite
+# Run with: parley-sqlite --config <this file>   (the binary selects the backend)
 backend_config:
   # ── Must be IDENTICAL across every config sharing this database. ──
   # Silent-split risk: a relative path resolved from a different launch `cwd` is a DIFFERENT

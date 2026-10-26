@@ -1,0 +1,14 @@
+{
+  "//": "vitest transpiles tests without typechecking them, and tsconfig.json covers only src. Run `npm run typecheck:test` (or point CI at this file) to compile the test sources too — the private-internals casts these fixtures rely on go stale silently otherwise.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "composite": false,
+    "baseUrl": ".",
+    "paths": { "@sharptrick/parley-nats": ["./src/index.ts"] }
+  },
+  "include": ["src/**/*", "test/**/*"]
+}

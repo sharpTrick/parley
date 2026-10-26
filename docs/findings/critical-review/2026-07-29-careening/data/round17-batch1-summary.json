@@ -1,0 +1,102 @@
+{
+ "round": 17,
+ "converged": false,
+ "blockingClean": false,
+ "wakeAll": false,
+ "counts": {
+  "confirmed": 26,
+  "blocking": 7,
+  "plausible": 1,
+  "total": 27
+ },
+ "ranTargets": [
+  "core-seam",
+  "core-engine",
+  "core-auth",
+  "sqlite",
+  "redis"
+ ],
+ "quiescedTargets": [
+  "postgres",
+  "matrix",
+  "xmpp",
+  "nats",
+  "zulip",
+  "discord",
+  "slack",
+  "telegram",
+  "shared",
+  "repo"
+ ],
+ "byLens": {
+  "concurrency-and-failure": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 2
+  },
+  "truth-in-docs": {
+   "total": 4,
+   "confirmed": 4,
+   "blocking": 1
+  },
+  "test-integrity": {
+   "total": 6,
+   "confirmed": 6,
+   "blocking": 1
+  },
+  "operability-and-release": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 0
+  },
+  "security": {
+   "total": 4,
+   "confirmed": 4,
+   "blocking": 3
+  },
+  "protocol-conformance": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 0
+  },
+  "maintainability": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 0
+  },
+  "test-hygiene": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 0
+  },
+  "design-principles": {
+   "total": 2,
+   "confirmed": 1,
+   "blocking": 0
+  },
+  "correctness": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 0
+  },
+  "seam-integrity": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 0
+  }
+ },
+ "batch": 1,
+ "base": "8e8d22e",
+ "byTarget": {
+  "core-seam": 6,
+  "core-engine": 3,
+  "core-auth": 6,
+  "sqlite": 7,
+  "redis": 5
+ },
+ "errored": [],
+ "tokens": 1044325,
+ "toolCalls": 301,
+ "wallMs": 4652304,
+ "batchingNote": "Round 17 runs in three batches of five targets because twelve container reprovisions killed three all-or-nothing attempts. Same 15 targets, same prompts, same eleven lenses, full surface; only persistence granularity changed. Each batch carries wakeAll=false and is individually convergence-INELIGIBLE; the round is convergence-eligible only as the union of all three, and convergence is not in play at 7+ blocking in batch 1 alone."
+}

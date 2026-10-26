@@ -27,24 +27,30 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "parley-postgres": "./dist/cli.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@sharptrick/parley-core": "^0.1.0",
     "@sharptrick/parley-net-util": "^0.1.0",
-    "pg": "^8.13.1"
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.1",
+    "pg-connection-string": "^2.14.0"
   },
   "devDependencies": {
-    "@sharptrick/parley-conformance": "^0.1.0",
-    "@types/pg": "^8.11.10"
+    "@sharptrick/parley-conformance": "^0.1.0"
   },
   "keywords": [
     "mcp",

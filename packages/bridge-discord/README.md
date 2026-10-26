@@ -18,23 +18,30 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 
 | Seam concept              | Discord mapping |
 | ------------------------- | --------------- |
-| `connect(config)`         | Stores config; auth is stateless per request (`Authorization: Bot <token>`). The gateway socket opens lazily on first `subscribe`. |
+| `connect(config)`         | Stores config; auth is stateless per request (`Authorization: Bot <token>`, alongside the `DiscordBot (<repo>, <version>)` User-Agent Discord's reference requires — Cloudflare may block a request without one). The gateway socket opens lazily on first `subscribe`. |
 | topic → channel           | `channel_map[topic]` if present; otherwise the topic string is used **as a channel id literal** — the zero-config path when topics simply are channel ids. |
-| `post`                    | `POST /channels/<id>/messages` `{ content, message_reference? }` → returns the message `id`. `inReplyTo` maps to `message_reference.message_id` (a native Discord reply). |
-| `backendMsgId` = `cursor` | The message **snowflake** id — time-ordered and strictly increasing per channel; serves as both the dedup key and the order key. Snowflakes are decimal strings and **not lexically comparable**; ordering is delegated to the API (core never compares cursors either). |
-| `fetchRecent` (no `since`) | `GET /channels/<id>/messages?limit=N` (newest-first) → reverse to ascending. The API caps a page at 100 — that cap is the default window. |
-| `fetchRecent` (`since`)   | `GET /channels/<id>/messages?after=<since>&limit=n` — `after` is **exclusive** server-side; each newest-first page is reversed, and for `limit > 100` the plugin pages forward advancing `after` until filled or a short page. |
-| `subscribe`               | **One shared gateway websocket** per plugin instance: HELLO → IDENTIFY (intents `GUILDS \| GUILD_MESSAGES \| MESSAGE_CONTENT`) → READY, then `MESSAGE_CREATE` dispatch per subscribed channel — including the bot's own sends. Starts at the tail; history is owned by catch-up. Reconnect re-IDENTIFYs (no RESUME — the push gap is harmless; cursor catch-up reconciles). |
+| `post`                    | `POST /channels/<id>/messages` `{ content, allowed_mentions, message_reference? }` → returns the message `id`. `inReplyTo` maps to `message_reference.message_id` (a native Discord reply). **Discord caps a message at 2000 characters** — counted in Unicode CODE POINTS, so astral text (emoji, CJK extensions) is measured the way Discord measures it and not at half the limit; a longer `content` is rejected up front with an error naming the limit and the actual length (the plugin never chunks — one post is one `backendMsgId`). |
+| `backendMsgId` = `cursor` | The message **snowflake** id — time-ordered and strictly increasing per channel; serves as both the dedup key and the order key. Snowflakes are decimal strings and **not lexically comparable**; ordering is delegated to the API (core never orders by a cursor either). |
+| `fetchRecent` (no `since`) | `GET /channels/<id>/messages?limit=N` (newest-first) → reverse to ascending. The API caps a page at 100, so a larger `limit` pages **backwards** with `before=` until it is satisfied, the channel head is reached, or the call's 30 s deadline runs out: that deadline bounds the whole call, the page walk included (see below). |
+| absent topic              | A channel Discord does not know (`10003 Unknown Channel`) makes `fetchRecent` reject with core's `NoSuchTopicError`, which core reads as "topic not present yet" (an empty `parley_fetch_recent` page). Every other non-2xx — including `50001 Missing Access`, where the channel exists but the bot cannot see it — stays a real failure. |
+| `fetchRecent` (`since`)   | `GET /channels/<id>/messages?after=<since>&limit=n` — `after` is **exclusive** server-side; each newest-first page is reversed, and for `limit > 100` the plugin pages forward advancing `after` until filled, a short page, or the call's budget runs out (same coupling as the row above). |
+| `subscribe`               | **One shared gateway websocket** per plugin instance: HELLO → IDENTIFY (intents `GUILDS \| GUILD_MESSAGES \| MESSAGE_CONTENT`) → READY, then `MESSAGE_CREATE` dispatch per subscribed channel — including the bot's own sends. Starts at the tail; history is owned by catch-up. The channel is then checked once (`GET /channels/<id>`): an id Discord does not know becomes `NoSuchTopicError` (core skips the topic with a diagnostic), and one that can never carry push under this intent set — the bot cannot access it (`50001`), or its type is not one of 0/2/5/10/11/12/13 — is reported on stderr naming the channel and the reason, and that one subscription is dropped, instead of leaving a permanently idle bridge or failing core's attach for every other topic. A **transient** dial failure (stalled handshake, close before READY, or a failure of the `GET /gateway/bot` url lookup itself) does **not** fail `subscribe`: it is reported on stderr and joins the reconnect ladder, which re-resolves the gateway url on every attempt, because failing here would fail core's attach and take the REST half of the bridge down with it. Reconnect re-IDENTIFYs (no RESUME — the push gap is harmless; cursor catch-up reconciles) with backoff capped at `120s × gateway_dialers`, and the cap is only forgiven once a socket stays up `120s × gateway_dialers`. Whatever the ladder allows, no instance sends more than `1000 ÷ gateway_dialers` IDENTIFYs in any 24h — its share of Discord's 1000-IDENTIFY/24h quota, whose penalty is a **bot-token reset** — and once that share is spent, live push waits (with a stderr line saying so) until the oldest IDENTIFY ages out of the window; catch-up is unaffected. The count is held in memory, so a restarted process starts a fresh one. A terminal close (4004/4010–4014) is different in kind: it stops the loop, is reported on stderr, makes later gateway calls fail fast with the reason — and, unlike every transient failure above, **it fails `subscribe`**. When one lands while the first `subscribe` is attaching (a bad token, or the MESSAGE CONTENT intent never toggled on), core's attach fails and **the bridge exits**: the operator symptom is `parley-discord: fatal: …` at startup, not an idle bridge. Only a human can fix those, so the catch-up half is not left running against a bot that can never carry push. |
 | `resolveIdentity`         | `GET /users/@me` (memoized): our own bot handle resolves to its real user id; every other handle passes through as a string convention — Discord has **no global name → id lookup**. |
 
 `senderHandle` ← `author.username`, `content` ← `content`, `timestamp` ← the message `timestamp`
-(informational only — never used for ordering or dedup).
+(informational only — never used for ordering or dedup). Discord serializes a mention as `<@id>`
+markup, never as `@handle` text, so the plugin rewrites it to `@username` using the payload's own
+resolved `mentions[]` before core parses mentions — otherwise `Message.mentions` would hold raw
+snowflakes and core's `mention_filter` would drop every message.
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
-Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `block_ms` here.** `fetchRecent` reads REST history and has no wait to spend a caller's budget
+on, so it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`.
+
+**A 30 s per-call deadline bounds the whole call, the page walk included.** So a `limit` above 100
+asked for on a slow or rate-limited API can come back after one page (100 messages), and a short
+page looks exactly like "the topic has nothing older".
 
 > **`post`'s `identity` argument (your config's `identity.handle`) is not used.** Discord stamps
 > `author` from whichever bot token is configured — see "Multiple concurrent sessions".
@@ -44,9 +51,44 @@ Discord serves this natively off the gateway `MESSAGE_CREATE` stream. Core caps 
 | key           | default                       | meaning |
 | ------------- | ----------------------------- | ------- |
 | `token`       | _(unset)_                     | Bot token (secret — `.env`, never committed). |
-| `api_url`     | `https://discord.com/api/v10` | REST base URL. Tests point this at an in-process fake. |
-| `gateway_url` | _(unset)_                     | Gateway websocket URL override (tests/fakes). Default: resolved live via `GET /gateway/bot`. |
-| `channel_map` | `{}`                          | Parley topic → channel id. Unmapped topics are used as channel ids directly. |
+| `api_url`     | `https://discord.com/api/v10` | REST base URL. Tests point this at an in-process fake. A plaintext `http://` URL to a non-loopback host is **warned about on stderr** (not refused): it puts the bot token on the wire in the clear. |
+| `gateway_url` | _(unset)_                     | Gateway websocket URL override (tests/fakes). Default: resolved live via `GET /gateway/bot`. Either way the socket is dialed with Discord's required `?v=10&encoding=json` — the url `GET /gateway/bot` returns carries neither, and an unversioned connect is closed `4012`. A plaintext `ws://` URL to a non-loopback host is warned about like `api_url`. |
+| `channel_map` | `{}`                          | Parley topic → channel id, as an object of **quoted** strings. Unmapped topics are used as channel ids directly. Targets must be **distinct** — two topics folding onto one channel is rejected at `connect()`, because one of them would otherwise lose its subscription silently. A topic used as a literal channel id that another topic already maps to is refused the same way, on every call that resolves it. **Quote every channel id:** a Discord channel id is 17–19 digits, past JavaScript's exact integer range, so an unquoted YAML id both loses precision and is not a string — either is a load error here. |
+| `handshake_timeout_ms` | `10000` | How long HELLO → IDENTIFY → READY may take before the socket is terminated and the attempt fails (the reconnect loop then retries with backoff). A whole number of milliseconds from 1 to 2147483647 — Node fires a delay outside that range at 1 ms instead, which would fail every dial forever. |
+| `gateway_dialers` | `1` | How many bridge instances **share this bot token and open a gateway socket**. The 1000-IDENTIFY/24h quota is per **bot token**, not per process, so each instance may IDENTIFY at most `1000 ÷ gateway_dialers` times in any 24h, and the reconnect ceiling is `120s × gateway_dialers` — see "Multiple concurrent sessions". An integer from 1 to 1000; past that the quota cannot give each instance even one IDENTIFY a day. |
+| `allowed_mentions` | `{ parse: ["users"], replied_user: false }` | Mention scope of every `post`. The default lets a `<@id>` user mention ping and refuses `@everyone`/`@here`/role pings, because `post` content can be untrusted inbound text an agent relayed. Widen it (e.g. add `"roles"` or `"everyone"` to `parse`) only deliberately. |
+
+Every key **and value** is checked before anything is dialled. An **unknown key is a load error**
+naming the accepted set — a misspelled `chanel_map` would otherwise be dropped in silence, leaving
+every topic used as a literal channel id, and a misspelled `allowed_mentions` leaving the
+mention blast radius at the built-in default. A value of the wrong **type** is a load error too,
+naming the key and what the value is (never what it holds, so a refusal cannot print the token):
+`token`, `api_url` and `gateway_url` are strings, `channel_map` is an object of topic → non-empty
+channel id string, and the two figures above are whole numbers inside the ranges their rows give.
+Each of those would otherwise be a bridge that comes up reporting success and is wired to nothing —
+an unquoted channel id keys live dispatch under a number Discord never sends, and a duration
+spelled `10s` reaches `setTimeout` as `NaN`.
+
+## Rate limits (429)
+
+The retry loop is `@sharptrick/parley-net-util`'s, shared by every HTTP backend, and one cap does
+not describe it. What this plugin contributes is the field and the unit: Discord's own
+`retry_after` body field, in seconds (float). The standard `Retry-After` header is a **floor**, not
+a fallback — whichever of the two states the longer wait is the one waited, so a CDN stamping
+`Retry-After: 1` in front of Discord asking 60 s does not retry 59 s early:
+
+| what the 429 carries | what the call does |
+| -------------------- | ------------------ |
+| no usable hint       | waits net-util's shared `DEFAULT_BACKOFF_MS`. Nothing here clamps a wait. |
+| a stated hint        | waits it **in full**, however long Discord asked for. Retrying sooner than the vendor asked is what turns a rate limit into a ban. |
+| both a header and a body hint | waits **the longer of the two**, in either order. |
+| a hint longer than the call's remaining budget (`DEFAULT_DEADLINE_MS`) | the call **fails** with an error naming both numbers instead of sleeping past its budget. Nothing is retried. |
+
+Discord's *global* rate limits routinely ask for longer than that budget. When one lands, the tool
+call comes back as an error in the model's context rather than parking the session — this plugin
+does not expose a per-call deadline override, so the operator fix is to reduce the load on the bot
+token (fewer concurrent bridge instances sharing it, or a token per session) rather than to wait
+the limit out.
 
 ## Provisioning the bot (pointers, not infra)
 
@@ -60,6 +102,25 @@ this package authors none of it:
    permissions to **View Channels**, **Send Messages**, and **Read Message History** in the
    channels you'll map as topics.
 
+> **Getting 1 or 2 wrong stops the bridge from starting at all.** A bad token closes the gateway
+> with 4004, and an untoggled MESSAGE CONTENT intent closes it with 4013/4014 — terminal codes,
+> which fail the first `subscribe` and therefore core's attach, so the process prints
+> `parley-discord: fatal: …` and exits 1 rather than serving the REST half. That is deliberate: no
+> reconnect can fix either one, and retrying spends the per-token IDENTIFY quota whose penalty is a
+> token reset. Fix the token or the portal toggle and start the bridge again.
+
+> **Topics must be GUILD channels.** The intent set is `GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT`
+> — no `DIRECT_MESSAGES` — so live push only reaches guild text (0), voice (2) and stage (13) text
+> chat, announcements (5), and threads (10/11/12). `subscribe` checks the channel once and reports
+> anything else **on stderr**, naming the channel and the reason, then drops that one subscription:
+> a DM or group DM, a category, a forum or media container, a directory, a channel the bot cannot
+> access (`50001`), or a channel type Discord adds later. The mistyped snowflake and the guild the
+> bot was never invited to both land here rather than as an idle bridge with no error. It is a
+> **diagnostic, not a rejection**, deliberately: core fails its whole attach on a `subscribe`
+> rejection, so one mis-mapped topic would take catch-up and `post` down for every other topic. An
+> id Discord does not know at all is the seam's absent topic (`NoSuchTopicError`), which core is
+> built to skip one topic at a time.
+
 ## Multiple concurrent sessions (one `backend_config` per config file, same bot)
 
 Any number of bridge instances — one per Claude Code session plus the remote/chat server — may
@@ -72,6 +133,32 @@ that session's `backend_config` — the same role `identity.handle` plays for SQ
 just carried in the token. `channel_map` must agree across configs that share topics;
 `api_url`/`gateway_url` only ever vary for tests.
 
+> **The IDENTIFY quota is per BOT TOKEN, not per process — set `gateway_dialers`.** Discord allows
+> **1000 IDENTIFYs per 24h per bot token** and penalizes an overrun by **resetting the token**,
+> which kills every Parley instance on it until a human re-provisions. Each instance holds itself
+> to `1000 ÷ gateway_dialers` IDENTIFYs in any 24h, so two instances sharing a token on the default
+> `gateway_dialers: 1` each believe they own the whole quota and can together exceed it.
+> Set `gateway_dialers` to the number of push-enabled instances sharing the token, and the fleet's
+> total stays within 1000 per 24h however its gateways flap.
+> Instances that never open a gateway socket — no `subscribe` — cost nothing against it and need
+> not be counted.
+
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-discord --config parley.config.yaml
+# or: node packages/bridge-discord/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-discord
+parley-discord --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another bot token, `channel_map`, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
+
 ## Tests
 
 ```
@@ -80,7 +167,9 @@ npx vitest run packages/bridge-discord
 
 The shared seam conformance suite (`@sharptrick/parley-conformance`) runs against an
 **in-process fake** (`test/fake-discord.ts`) that speaks the same REST + gateway subset —
-hermetic, no credentials, always on. To exercise a real server manually: put a real `token` in
-`backend_config`, use a real channel id as the topic (or map one in `channel_map`), and drive
-`post`/`fetchRecent`/`subscribe` from a scratch script — mind Discord's rate limits (the plugin
-honors `429 retry_after` automatically).
+hermetic, no credentials, always on. The fake also speaks Discord's *failure* surface (unknown
+channels, injectable statuses/headers/bodies, the 2000-character and 100-per-page caps), so the
+error half of the plugin is exercised rather than assumed. To exercise a real server manually: put
+a real `token` in `backend_config`, use a real channel id as the topic (or map one in
+`channel_map`), and drive `post`/`fetchRecent`/`subscribe` from a scratch script — mind the rate
+limits described below.

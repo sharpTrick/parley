@@ -1,0 +1,140 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { consumedNames } from '@sharptrick/parley-net-util/testing';
+
+/**
+ * The repo scan two checks in this package share. Both of them ask a question about a PACKAGE — does
+ * anything re-implement an export of this one, does anything import a given export — and both were
+ * answering it from a NON-recursive `readdirSync`, so a file one directory deeper was invisible in
+ * both directions: a forked security predicate went unrecorded, and a live import read as dead.
+ *
+ * Keep the listing recursive and the root a PARAMETER, so that the recursion is gradable against a
+ * synthetic tree instead of against whatever shape `packages/` happens to have today.
+ */
+
+const HERE = new URL('../', import.meta.url);
+
+export const PACKAGES = new URL('../', HERE);
+
+export const SELF_DIR = HERE.pathname.replace(/\/$/, '').split('/').at(-1) as string;
+
+export const SELF = (
+  JSON.parse(readFileSync(new URL('package.json', HERE), 'utf8')) as { name: string }
+).name;
+
+export interface SourceFile {
+  pkg: string;
+  path: string;
+  text: string;
+  /** Comments stripped, so that a name mentioned only in prose does not read as code. */
+  code: string;
+}
+
+const stripComments = (text: string): string =>
+  text.replaceAll(/\/\*[\s\S]*?\*\//g, '').replaceAll(/^\s*\/\/.*$/gm, '');
+
+export function packageSources(
+  subdirs: string[],
+  root: URL = PACKAGES,
+  selfDir: string = SELF_DIR,
+): SourceFile[] {
+  const out: SourceFile[] = [];
+  for (const pkg of readdirSync(root)) {
+    if (pkg === selfDir) continue;
+    for (const sub of subdirs) {
+      let names: string[] = [];
+      try {
+        names = readdirSync(new URL(`${pkg}/${sub}/`, root), { recursive: true }).map(String);
+      } catch {
+        continue;
+      }
+      for (const name of names.filter((n) => n.endsWith('.ts'))) {
+        const path = `${pkg}/${sub}/${name}`;
+        const text = readFileSync(new URL(path, root), 'utf8');
+        out.push({ pkg, path, text, code: stripComments(text) });
+      }
+    }
+  }
+  return out;
+}
+
+/** Every package's README, as a source file, so a claim in prose is scanned with the code. */
+export function packageDocs(root: URL = PACKAGES, selfDir: string = SELF_DIR): SourceFile[] {
+  const out: SourceFile[] = [];
+  for (const pkg of readdirSync(root)) {
+    if (pkg === selfDir) continue;
+    const path = `${pkg}/README.md`;
+    try {
+      const text = readFileSync(new URL(path, root), 'utf8');
+      out.push({ pkg, path, text, code: text });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether a file loads this package as a MODULE — `from '…'`, `import('…')`, `vi.mock('…')` — rather
+ * than merely spelling its name. Keep the module position required, so that a package listing this
+ * one in a table of names it must NOT depend on is not read as a consumer of it: `bridge-core`
+ * names it in a licence-gap list and imports it nowhere, and counting that made a same-named local
+ * helper of core's read as a fork of an export it is forbidden to import.
+ */
+const namesModule = (code: string): boolean =>
+  new RegExp(`(?:\\bfrom\\s*|\\(\\s*)['"]${SELF}['"]`).test(code);
+
+/**
+ * Every `src/` file of every package that imports this one. The whole package, not only the files
+ * that name the import: a fork is a debt the PACKAGE owes, and splitting one file into several moves
+ * the copy away from the import without retiring anything.
+ */
+export function consumerPackageSources(
+  root: URL = PACKAGES,
+  selfDir: string = SELF_DIR,
+): SourceFile[] {
+  const sources = packageSources(['src'], root, selfDir);
+  const consuming = new Set(sources.filter(({ code }) => namesModule(code)).map(({ pkg }) => pkg));
+  return sources.filter(({ pkg }) => consuming.has(pkg));
+}
+
+/** Every `src/` or `test/` file that loads this package, wherever it is nested. */
+export function importingFiles(root: URL = PACKAGES, selfDir: string = SELF_DIR): SourceFile[] {
+  return packageSources(['src', 'test'], root, selfDir).filter(({ code }) => namesModule(code));
+}
+
+/**
+ * The names a file IMPORTS from this package, under the names THIS package publishes them: an
+ * `import { x as y }` rename next door is not a change to what this package owes.
+ *
+ * Word-matching the file's text instead counts a name that merely happens to be SPELLED in it:
+ * `label` is a property at half a dozen call sites, so appending `export const label = 1;` here —
+ * imported by nothing — passed the dead-export guard, and the whole surface count it produced was
+ * wrong.
+ */
+export function importedNames(file: SourceFile): Set<string> {
+  const out = consumedNames(file.text, (specifier) => specifier === SELF);
+  for (const ns of mockedNamespaces(file.code))
+    for (const read of file.code.matchAll(new RegExp(`\\b${ns}\\.(\\w+)`, 'g')))
+      out.add(read[1] as string);
+  return out;
+}
+
+/**
+ * The identifiers holding this package's namespace through a vitest module mock —
+ * `type T = typeof import(SELF)` then `await importOriginal<T>()`, which is how a mock reaches the
+ * real module and the form that makes `actual.HttpStatusError` a consumption rather than a
+ * spelling. A star import and a dynamic one are the import graph's own business and are read off
+ * the parse tree.
+ */
+function mockedNamespaces(code: string): string[] {
+  const out = new Set<string>();
+  const FROM = `['"]${SELF}['"]`;
+  for (const alias of code.matchAll(
+    new RegExp(`type\\s+(\\w+)\\s*=\\s*typeof\\s+import\\(\\s*${FROM}\\s*\\)`, 'g'),
+  ))
+    for (const m of code.matchAll(
+      new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*await\\s+\\w+<${alias[1] as string}>\\(`, 'g'),
+    ))
+      out.add(m[1] as string);
+  return [...out];
+}

@@ -9,6 +9,13 @@ import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
 import { fetchOidcDiscovery } from './oidc-discovery.js';
 import { OidcTokenVerifier } from './oidc-verifier.js';
+import { hardenErrorSurface } from './error-surface.js';
+import {
+  assertOidcPolicy,
+  assertPublicBaseUrl,
+  assertTrustRootUrl,
+  canonicalResourceId,
+} from './invariants.js';
 
 export interface OidcRemoteOptions {
   /** Public base URL of THIS resource server (what Claude reaches) — NOT the OAuth issuer;
@@ -48,11 +55,15 @@ export async function createOidcRemoteApp(
   opts: OidcRemoteOptions,
 ): Promise<OidcRemoteServer> {
   const mcpPath = opts.mcpPath ?? '/mcp';
-  const resource = new URL(mcpPath, opts.publicUrl); // canonical resource id (no trailing slash)
+  assertPublicBaseUrl(opts.publicUrl, 'publicUrl');
+  const resource = canonicalResourceId(opts.publicUrl, mcpPath, 'mcpPath');
   const oidc = opts.oidc;
+  assertOidcPolicy(oidc);
+  assertTrustRootUrl(oidc.issuer, 'auth.oidc.issuer');
 
   const metadata = await fetchOidcDiscovery(oidc.issuer, opts.fetchFn ?? fetch);
   const jwksUri = oidc.jwks_uri ?? metadata.jwks_uri;
+  assertTrustRootUrl(jwksUri, oidc.jwks_uri === undefined ? 'the discovered jwks_uri' : 'auth.oidc.jwks_uri');
   if (oidc.jwks_uri === undefined) {
     // Defense-in-depth: a discovery-supplied JWKS must share the issuer's origin. An explicit
     // `auth.oidc.jwks_uri` config override is the trusted pin (e.g. a CDN-hosted JWKS).
@@ -71,9 +82,8 @@ export async function createOidcRemoteApp(
   const audience = oidc.audience ?? resource.href;
 
   const verifier = new OidcTokenVerifier({
-    // Use the discovery document's canonical issuer (already validated to equal oidc.issuer
-    // modulo a trailing slash) — it is exactly what the IdP stamps in `iss`, so jose's exact
-    // match lines up in both slash directions (BUG-24).
+    // Keep the discovery document's issuer rather than the configured one, so that jose's exact
+    // `iss` match lines up whichever way the operator wrote the trailing slash.
     issuer: metadata.issuer,
     audience,
     jwksUri,
@@ -84,17 +94,13 @@ export async function createOidcRemoteApp(
     ...(oidc.required_role !== undefined ? { requiredRole: oidc.required_role } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
-  const bearer = requireBearerAuth({
-    verifier,
-    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
-  });
+  const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
+  const bearer = requireBearerAuth({ verifier, resourceMetadataUrl });
 
   const remote = createRemoteHttpApp(plugin, cfg, {
     mcpPath,
     protect: bearer,
     configureApp: (app) => {
-      // Protected Resource Metadata (authorization_servers → the external issuer) + a mirror of
-      // the IdP's AS metadata at this origin. No AS endpoints are mounted here.
       app.use(
         mcpAuthMetadataRouter({
           // OIDC discovery metadata is a superset of the RFC 8414 shape the router mirrors.
@@ -106,6 +112,8 @@ export async function createOidcRemoteApp(
       );
     },
   });
+
+  hardenErrorSurface(remote.app);
 
   return Object.assign(remote, {
     verifier,

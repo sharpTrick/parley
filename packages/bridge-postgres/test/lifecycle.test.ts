@@ -1,9 +1,11 @@
-import { asHandle, asTopic, type Message } from '@sharptrick/parley-core';
+import { asCursor, asHandle, asTopic, type Message } from '@sharptrick/parley-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
+import { sleep } from './pg-harness.js';
+import { SOURCE } from './sources.js';
 
-// Deterministic listener-lifecycle tests for BUG-16 (disconnect() racing a reconnect must leak no
-// live Client) and BUG-29 (a failed LISTEN leaves no registration; repeat subscribe fans out).
+// Deterministic listener-lifecycle tests: a disconnect() racing a reconnect must leak no live
+// Client, a failed LISTEN must leave no registration, and a repeat subscribe must fan out.
 // These never touch a real server: `pg` is mocked so `new Client()` (the LISTEN connection) is a
 // controllable stub. The network-gated conformance suite covers the live paths.
 
@@ -19,37 +21,76 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // Shared mock state, hoisted so the vi.mock factory can close over it.
 const state = vi.hoisted(() => ({
   clients: [] as MockClientShape[],
+  /** How many further `connect()`s on a replacement listener must fail before one lands. */
+  connectFailures: 0,
   // When set, the next `new Client().connect()` parks on this deferred (used to hold a reconnect
   // candidate mid-connect while a disconnect() races it).
   connectGate: null as Deferred | null,
-  // When true, `query('LISTEN …')` rejects (drives the BUG-29(1) failed-subscribe path).
+  // When set, the next `query('LISTEN …')` parks on this deferred — the window in which a
+  // disconnect() can land between "the LISTEN was issued" and "the subscription was registered".
+  listenGate: null as Deferred | null,
+  /** Every channel a LISTEN was issued for, in order. */
+  listenAttempts: [] as string[],
+  // When true, `query('LISTEN …')` rejects (drives the failed-subscribe path).
   listenRejects: false,
-  // Rows the pool hands back on the NEXT drain SELECT (then it is emptied — one delivery).
-  drainRows: [] as Record<string, unknown>[],
+  // When set, the next pooled DELETE parks on this deferred — the window between two prune
+  // batches, in which a disconnect() (and a successor connect()) can land.
+  deleteGate: null as Deferred | null,
+  /** Every DELETE the prune loop issued, in order. */
+  deletes: [] as string[],
+  // When set, the next pooled cursor read takes its snapshot and then parks on this deferred — the
+  // window in which a whole disconnect()/connect() lands inside ONE seam call.
+  readGate: null as Deferred | null,
+  /** Every table a cursor read was issued against, in order. */
+  cursorReads: [] as string[],
+  // The table, per topic. Rows STAY here: what a query returns is decided by the SQL's cursor
+  // predicate and ORDER BY, exactly as the server decides it.
+  rows: new Map<string, Record<string, unknown>[]>(),
+  /**
+   * Rows per TABLE, then per topic — what one lifecycle's own table holds. Seeding a successor here
+   * is the only way to tell WHICH lifecycle answered a call: a page is not graded by arriving, it is
+   * graded by whose rows and whose sequence it carries.
+   */
+  tableRows: new Map<string, Map<string, Record<string, unknown>[]>>(),
 }));
 
 interface MockClientShape {
   ended: boolean;
-  emit: (event: string, arg?: unknown) => void;
+  listened: string[];
+  unlistened: string[];
+  emit: (event: string, arg?: unknown) => boolean;
 }
 
-vi.mock('pg', () => {
-  class MockClient implements MockClientShape {
-    private readonly handlers: Record<string, ((arg?: unknown) => void)[]> = {};
+/**
+ * LISTEN minus UNLISTEN, as ONE connection saw it — the only view a server-side registration is in.
+ * The plugin's own `listens` map is its BELIEF; a channel installed on the socket and absent from
+ * that map wakes the process for every future post to a topic nothing is subscribed to, and no
+ * entry is left anywhere to undo it. Containment cannot see that; only the equality can.
+ */
+function observed(client: MockClientShape): string[] {
+  const net = new Map<string, number>();
+  for (const channel of client.listened) net.set(channel, (net.get(channel) ?? 0) + 1);
+  for (const channel of client.unlistened) net.set(channel, (net.get(channel) ?? 0) - 1);
+  return [...net.entries()]
+    .filter(([, n]) => n > 0)
+    .map(([channel]) => channel)
+    .sort();
+}
+
+vi.mock('pg', async () => {
+  const { FakeEmitter, fakePool, servePool } = await import('./fake-pg.js');
+
+  class MockClient extends FakeEmitter implements MockClientShape {
     ended = false;
+    readonly listened: string[] = [];
+    readonly unlistened: string[] = [];
     constructor() {
+      super();
       state.clients.push(this);
-    }
-    on(event: string, cb: (arg?: unknown) => void): void {
-      (this.handlers[event] ??= []).push(cb);
-    }
-    emit(event: string, arg?: unknown): void {
-      for (const cb of this.handlers[event] ?? []) cb(arg);
     }
     async connect(): Promise<void> {
       const gate = state.connectGate;
@@ -57,9 +98,28 @@ vi.mock('pg', () => {
         state.connectGate = null;
         await gate.promise;
       }
+      if (state.connectFailures > 0) {
+        state.connectFailures--;
+        throw new Error('connect ECONNREFUSED 127.0.0.1:5432');
+      }
     }
     async query(sql: string): Promise<{ rows: unknown[] }> {
+      const unlisten = /^UNLISTEN "(.+)"$/.exec(sql);
+      if (unlisten !== null) {
+        this.unlistened.push(unlisten[1] as string);
+        return { rows: [] };
+      }
+      const listen = /^LISTEN "(.+)"$/.exec(sql);
+      if (listen !== null) {
+        state.listenAttempts.push(listen[1] as string);
+        const gate = state.listenGate;
+        if (gate !== null) {
+          state.listenGate = null;
+          await gate.promise;
+        }
+      }
       if (state.listenRejects && /LISTEN/.test(sql)) throw new Error('LISTEN failed (mock)');
+      if (listen !== null) this.listened.push(listen[1] as string);
       return { rows: [] };
     }
     async end(): Promise<void> {
@@ -67,88 +127,435 @@ vi.mock('pg', () => {
     }
   }
 
-  const poolQuery = async (sql: string): Promise<{ rows: unknown[] }> => {
-    if (/MAX\(seq\)/.test(sql)) return { rows: [{ max: '0' }] };
-    // Drain SELECT (seq > $2, ascending): hand back the queued rows once, then nothing.
-    if (/seq > \$2/.test(sql)) {
-      const rows = state.drainRows.splice(0);
-      return { rows };
+  const poolQuery = async (
+    sql: string,
+    values: readonly unknown[],
+  ): Promise<{ rows: unknown[]; rowCount?: number }> => {
+    if (/^\s*DELETE/.test(sql)) {
+      state.deletes.push(sql);
+      const gate = state.deleteGate;
+      if (gate !== null) {
+        state.deleteGate = null;
+        await gate.promise;
+      }
+      // A full batch, so the prune loop goes round again and re-reaches its teardown guard — but
+      // only a few, so a loop that no longer stops is a failed assertion rather than a suite that
+      // never finishes and reports nothing.
+      const limit = /LIMIT (\d+)/.exec(sql);
+      return { rows: [], rowCount: state.deletes.length <= 3 ? Number(limit?.[1] ?? 0) : 0 };
     }
-    return { rows: [] };
+    const table = /FROM "([^"]+)"/.exec(sql)?.[1] ?? '';
+    const topic = String(values[0]);
+    const all = state.tableRows.get(table)?.get(topic) ?? state.rows.get(topic) ?? [];
+    const served = servePool(all, sql, values);
+    if (!/seq > \$\d+::bigint/.test(sql)) return { rows: served ?? [] };
+    state.cursorReads.push(table);
+    const gate = state.readGate;
+    if (gate !== null) {
+      state.readGate = null;
+      // `served` was computed BEFORE the park, so a row committed while this statement is in flight
+      // is legitimately absent from its result — the snapshot semantics the server really has.
+      await gate.promise;
+    }
+    return { rows: served ?? [] };
   };
 
   return {
-    Pool: vi.fn(() => ({
-      on: vi.fn(),
-      connect: vi.fn(async () => ({
-        query: vi.fn(async () => ({ rows: [] })),
-        release: vi.fn(),
-      })),
-      query: vi.fn(poolQuery),
-      end: vi.fn(async () => undefined),
-    })),
+    Pool: vi.fn(() => fakePool(poolQuery)),
     Client: MockClient,
   };
 });
 
-// A real DSN so the SEC-06 default-credential warning stays quiet.
+// A real DSN so the default-credential warning stays quiet.
 const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
 
 beforeEach(() => {
   state.clients.length = 0;
+  state.connectFailures = 0;
   state.connectGate = null;
+  state.listenGate = null;
+  state.listenAttempts.length = 0;
   state.listenRejects = false;
-  state.drainRows.length = 0;
+  state.deleteGate = null;
+  state.deletes.length = 0;
+  state.readGate = null;
+  state.cursorReads.length = 0;
+  state.rows.clear();
+  state.tableRows.clear();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('Postgres listener lifecycle (BUG-16)', () => {
-  it('a disconnect() racing an in-flight reconnect ends the candidate and does not resurrect the listener', async () => {
-    const plugin = new PostgresPlugin();
-    await plugin.connect({ url: REAL_URL });
-    await plugin.subscribe(asTopic('t'), () => undefined);
+// Every chore this plugin runs in the background parks on an await, and `disconnect()` can land in
+// that await. `stopped` alone cannot detect it, because `connect()` sets `stopped` back to false: a
+// chore that slept across a whole teardown AND restart wakes up believing it is live and publishes
+// into the NEXT lifecycle's registries. The two shapes that costs are a listener connection the new
+// session created being overwritten and never end()ed (a leaked socket and server backend for the
+// life of the process), and a TopicSubscription surviving into the new session, where subscribe()'s
+// fast path hands it back and no LISTEN is ever issued — push silently dead for that topic.
+//
+// So this is parameterized over every chore that can be parked here x whether a connect() follows
+// the disconnect, and asserts the same two invariants in each cell: nothing the old lifecycle built
+// is reachable from the plugin afterwards, and every Client ever constructed is either the current
+// listener or ended.
 
-    const priv = plugin as unknown as {
-      listener?: unknown;
-      listenerPromise?: unknown;
-    };
-    const client0 = state.clients[0];
-    expect(client0).toBeDefined();
+interface Priv {
+  listener?: { ended: boolean } | undefined;
+  listenerPromise?: unknown;
+  subs: Map<string, { handlers: unknown[] }>;
+  subscribing: Map<string, unknown>;
+  listens: Map<string, unknown>;
+}
 
-    // Hold the reconnect candidate's connect() open, then drop the live listener so the 'end'
-    // handler kicks off reconnectListener(). (connect() nulls state.connectGate when it consumes
-    // the gate, so keep a local reference to release it later.)
-    const gate = deferred();
-    state.connectGate = gate;
-    client0?.emit('end');
+function registrySizes(priv: Priv): Record<string, number> {
+  return {
+    subs: priv.subs.size,
+    subscribing: priv.subscribing.size,
+    listens: priv.listens.size,
+  };
+}
 
-    // Wait past the reconnect backoff (RECONNECT_DELAY_MS = 500ms) so the candidate reaches its
-    // parked connect(); a second Client now exists but is stuck.
-    await sleep(700);
-    expect(state.clients.length).toBe(2);
-    const candidate = state.clients[1];
-    expect(candidate?.ended).toBe(false);
+async function until(pred: () => boolean, budgetMs = 2000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  while (!pred() && Date.now() < deadline) await sleep(2);
+}
 
-    // disconnect() wins the race: it completes teardown while the candidate is mid-connect.
-    await plugin.disconnect();
-    expect(priv.listener).toBeUndefined();
-    expect(priv.listenerPromise).toBeUndefined();
+type Chore =
+  | 'subscribe-listen'
+  | 'reconnect-backoff'
+  | 'reconnect-connect'
+  | 'prune-batch';
+type Next = 'disconnect' | 'disconnect+connect';
 
-    // Now let the candidate's connect() resolve. The post-await stopped check must end it and
-    // return WITHOUT publishing this.listener.
-    gate.resolve();
-    await sleep(50);
+const CHORES: Chore[] = [
+  'subscribe-listen',
+  'reconnect-backoff',
+  'reconnect-connect',
+  'prune-batch',
+];
 
-    expect(candidate?.ended).toBe(true);
-    expect(priv.listener).toBeUndefined();
-    expect(priv.listenerPromise).toBeUndefined();
-  }, 5000);
+/**
+ * A teardown guard is how a call that parked across an await asks whether it is still the live
+ * lifecycle's: a comparison of a captured epoch against `this.epoch`, in either operand order and
+ * whichever way round the test is written, OR a claim on the `starting` slot the call published its
+ * unadopted resource into. The census below counted `epoch !== this.epoch` alone, so the three
+ * guards already written as `epoch === this.epoch` were invisible to it and a new teardown-crossing
+ * await in that spelling shipped with the file still green; it then counted epoch comparisons alone,
+ * so `connect()`'s bootstrap await went uncounted the moment its guard changed spelling.
+ */
+const TEARDOWN_GUARD =
+  /(?:\w+\s*[!=]==?\s*this\.epoch|this\.epoch\s*[!=]==?\s*\w+|this\.starting\.delete\()/g;
+
+/**
+ * Every form the rule has to recognise, each with a sample it must find. Keep this table beside the
+ * pattern, so that a guard written in a shape the regex cannot see fails here rather than silently
+ * shrinking the census to whatever spelling it happens to match.
+ */
+const TEARDOWN_GUARD_FORMS: [what: string, sample: string][] = [
+  ['an inequality guard', 'if (this.stopped || epoch !== this.epoch) return;'],
+  ['a while condition in the equality form', 'while (!this.stopped && epoch === this.epoch) {'],
+  ['a do…while condition in the equality form', '} while (sub.pending && epoch === this.epoch);'],
+  ['a bare statement guard', 'if (epoch === this.epoch) this.reconnecting = false;'],
+  ['the comparison written with this.epoch first', 'if (this.epoch !== guardEpoch) return;'],
+  ['a loose comparison', 'if (epoch != this.epoch) return;'],
+  ['a claim on the in-flight slot', 'if (!this.starting.delete(pool)) throw disconnected();'],
+  ['the in-flight slot released on a failure path', 'this.starting.delete(client);'],
+];
+
+/**
+ * Every await in this plugin that a `disconnect()` can land in re-checks afterwards whether it is
+ * still the live lifecycle's, and the table below drives one row per chore into that window. Pinned
+ * by VALUE so a guard site added later is a missing row rather than silence: a new one means a new
+ * await that can cross a teardown, and it needs its own row here, in teardown-races-setup.test.ts
+ * (which owns the setup calls, parameterized over the await each is held at, on the arm where the
+ * held await SUCCEEDS), in silent-peer.test.ts (which owns the arm where it never answers, so the
+ * call releases its own unadopted resource), in teardown-delivery.test.ts (which owns a drain read
+ * parked at the boundary), in push-self-heal.test.ts (which owns the drain's re-drain timer) or —
+ * when the guarded await is inside a call that RETURNS something — in the value-graded table
+ * further down this file, because a census counts the guards that exist and can never see the one
+ * that is missing.
+ */
+const TEARDOWN_GUARD_SITES = 18;
+
+const CROSS_CELLS = CHORES.flatMap((chore) =>
+  (['disconnect', 'disconnect+connect'] as Next[]).map((next) => ({ chore, next })),
+);
+
+describe('a chore in flight when disconnect lands never touches the next lifecycle', () => {
+  it.each(TEARDOWN_GUARD_FORMS)('the census sees a guard written as %s', (_what, sample) => {
+    expect(
+      sample.match(TEARDOWN_GUARD),
+      'this guard form is invisible to the census below',
+    ).toHaveLength(1);
+  });
+
+  it('every teardown guard in the source is represented by a row above', () => {
+    const sites = [...SOURCE.matchAll(TEARDOWN_GUARD)].length;
+    expect(sites, 'a guard site was added or removed — give the new await a row').toBe(
+      TEARDOWN_GUARD_SITES,
+    );
+  });
+
+  it.each(CROSS_CELLS.map((c) => [`${c.chore}, ${c.next}`, c] as const))(
+    '%s',
+    async (_label, cell) => {
+      const plugin = new PostgresPlugin();
+      const priv = plugin as unknown as Priv;
+      const topic = asTopic('t');
+      const settle = (p: Promise<unknown>): Promise<unknown> => p.catch(() => undefined);
+      // The prune loop is what parks on a DELETE, and it only runs when retention is configured.
+      await plugin.connect(
+        cell.chore === 'prune-batch' ? { url: REAL_URL, retention_days: 1 } : { url: REAL_URL },
+      );
+
+      const pending: Promise<unknown>[] = [];
+      const settledAt: number[] = [];
+      const timed = (p: Promise<unknown>): Promise<unknown> =>
+        settle(p).then((v) => {
+          settledAt.push(Date.now());
+          return v;
+        });
+      let release: (() => void) | undefined;
+
+      if (cell.chore === 'prune-batch') {
+        const gate = deferred();
+        state.deleteGate = gate;
+        release = gate.resolve;
+        await until(() => state.deletes.length > 0);
+      } else if (cell.chore === 'subscribe-listen') {
+        const gate = deferred();
+        state.listenGate = gate;
+        release = gate.resolve;
+        pending.push(timed(plugin.subscribe(topic, () => undefined)));
+        await until(() => state.listenAttempts.length > 0);
+      } else {
+        await plugin.subscribe(topic, () => undefined);
+        if (cell.chore === 'reconnect-connect') {
+          const gate = deferred();
+          state.connectGate = gate;
+          release = gate.resolve;
+        }
+        state.clients[0]?.emit('end');
+        // reconnect-connect must reach the candidate's parked connect() (past the 500ms backoff);
+        // reconnect-backoff must land while the loop is still sleeping.
+        await sleep(cell.chore === 'reconnect-connect' ? 700 : 100);
+      }
+
+      const older = [...state.clients];
+      await plugin.disconnect();
+      const got: Message[] = [];
+      if (cell.next === 'disconnect+connect') {
+        // The successor builds its OWN listener and registration BEFORE the parked chore wakes, so
+        // a chore that publishes anyway overwrites something live rather than filling a vacuum.
+        await plugin.connect({ url: REAL_URL });
+        await plugin.subscribe(topic, (m) => got.push(m));
+      }
+      const deletesAtBoundary = state.deletes.length;
+      const releasedAt = Date.now();
+      release?.();
+      // Past one whole reconnect backoff, so a loop that did not abort has woken and acted.
+      await sleep(900);
+      await Promise.all(pending);
+
+      // The parked seam call has to come back when the teardown releases it, not when its own
+      // block budget finally runs out: a guard that only stops the chore from PUBLISHING still
+      // leaves the caller parked for up to catchup.block_max_ms past the teardown.
+      for (const at of settledAt) {
+        expect(at - releasedAt, 'a parked seam call outlived the teardown that released it').toBeLessThan(
+          1000,
+        );
+      }
+      // A chore woken after the boundary must not issue one more statement — least of all against
+      // the successor lifecycle's pool, which is a different table with a different retention.
+      expect(
+        state.deletes.length - deletesAtBoundary,
+        'the prune loop kept deleting past the teardown',
+      ).toBe(0);
+
+      if (cell.next === 'disconnect') {
+        expect(priv.listener, 'listener resurrected after disconnect').toBeUndefined();
+        expect(priv.listenerPromise).toBeUndefined();
+        expect(registrySizes(priv), 'registry survived teardown').toEqual({
+          subs: 0,
+          subscribing: 0,
+          listens: 0,
+        });
+      } else {
+        expect(priv.listener, 'the new lifecycle has no listener connection').toBeDefined();
+        expect(older, 'a connection from the previous lifecycle is still the live listener').not.toContain(
+          priv.listener,
+        );
+        expect(registrySizes(priv), 'the new lifecycle inherited registry state').toEqual({
+          subs: 1,
+          subscribing: 0,
+          listens: 1,
+        });
+
+        const channel = [...priv.listens.keys()][0] as string;
+        expect(
+          (priv.listener as unknown as MockClientShape & { listened: string[] }).listened,
+          'the new lifecycle never LISTENed the topic it subscribed to',
+        ).toContain(channel);
+
+        state.rows.set('t', [
+          {
+            seq: '1',
+            topic: 't',
+            sender: asHandle('u'),
+            content: 'after-reuse',
+            ts: new Date().toISOString(),
+            in_reply_to: null,
+          },
+        ]);
+        (priv.listener as unknown as MockClientShape).emit('notification', { channel });
+        await sleep(60);
+        expect(got.map((m) => m.content), 'push is dead on the reused topic').toEqual([
+          'after-reuse',
+        ]);
+        await plugin.disconnect();
+      }
+
+      // Whatever happened, no socket is left both unreachable and open.
+      for (const c of state.clients) {
+        expect(
+          c === priv.listener || c.ended,
+          'a Client is neither the current listener nor ended',
+        ).toBe(true);
+      }
+    },
+    15000,
+  );
 });
 
-describe('Postgres subscribe registration (BUG-29)', () => {
+// The matrix above grades that a parked chore comes BACK. It cannot see what it came back WITH.
+// A seam call that slept across a whole disconnect()/connect() finds `stopped` false again, and if
+// it decides with `stopped` it re-resolves the plugin's pool and table and answers out of the
+// SUCCESSOR lifecycle: rows from a table the caller never asked for, and a `nextCursor` from a
+// foreign sequence that core persists as this topic's read state — every message at or below it
+// skipped forever, with no error anywhere. So these cells seed the successor's table with a row the
+// caller's cursor WOULD return, and grade the VALUE: an empty page carrying the caller's own
+// `since`. Parameterized over where the call is parked when the teardown lands and over what the
+// successor is, because a guard that is right for one parking point is not thereby right for the
+// others.
+
+type ParkedAt = 'the opening read';
+type Successor = 'nothing' | 'the same table' | 'a different table';
+
+const TABLE_A = 'lifecycle_tbl_a';
+const TABLE_B = 'lifecycle_tbl_b';
+/** The caller's own cursor. The successor's row sits above it, so a foreign read is visible. */
+const CALLER_SINCE = '5';
+
+const VALUE_CELLS = (['the opening read'] as ParkedAt[]).flatMap((parkedAt) =>
+  (['nothing', 'the same table', 'a different table'] as Successor[]).map((next) => ({
+    parkedAt,
+    next,
+  })),
+);
+
+function seed(table: string, topic: string, content: string, seq: string): void {
+  const byTopic = state.tableRows.get(table) ?? new Map<string, Record<string, unknown>[]>();
+  state.tableRows.set(table, byTopic);
+  byTopic.set(topic, [
+    {
+      seq,
+      topic,
+      sender: asHandle('u'),
+      content,
+      ts: new Date().toISOString(),
+      in_reply_to: null,
+    },
+  ]);
+}
+
+describe('a seam call that spanned a teardown answers for the lifecycle that was asked', () => {
+  it.each(
+    VALUE_CELLS.map(
+      (c) => [`parked on ${c.parkedAt}, then disconnect + ${c.next}`, c] as const,
+    ),
+  )('%s', async (_label, cell) => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL, table_name: TABLE_A });
+    const topic = asTopic('t');
+
+    const gate = deferred();
+    state.readGate = gate;
+
+    const parked = plugin.fetchRecent({ topic, since: asCursor(CALLER_SINCE) });
+    await until(() => state.cursorReads.length > 0);
+
+    await plugin.disconnect();
+    if (cell.next !== 'nothing') {
+      const successor = cell.next === 'a different table' ? TABLE_B : TABLE_A;
+      seed(successor, 't', 'from-lifecycle-B', '7');
+      await plugin.connect({ url: REAL_URL, table_name: successor });
+    }
+
+    gate.resolve();
+    const page = await parked;
+
+    expect(
+      page.messages.map((m) => m.content),
+      "the parked call answered out of the successor lifecycle's table",
+    ).toEqual([]);
+    expect(
+      page.nextCursor,
+      "the parked call advanced the caller's read state onto a foreign sequence",
+    ).toBe(CALLER_SINCE);
+
+    await plugin.disconnect();
+  }, 15000);
+});
+
+describe('Postgres subscribe registration', () => {
+  // `subscribing` is keyed by channel, and the channel for a topic is the same in every lifecycle.
+  // So the cleanup in subscribe()'s `finally` is aimed at a key a SUCCESSOR may already own: evicting
+  // it makes a concurrent subscribe miss the in-flight registration, build a second one, and LISTEN
+  // the channel again while dropping the first registration's handlers.
+  it('a subscribe rejected by teardown does not evict the successor lifecycle in-flight entry', async () => {
+    const plugin = new PostgresPlugin();
+    const priv = plugin as unknown as {
+      subs: Map<string, { handlers: unknown[] }>;
+      subscribing: Map<string, unknown>;
+      listens: Map<string, unknown>;
+    };
+    const topic = asTopic('t');
+    await plugin.connect({ url: REAL_URL });
+
+    const first = deferred();
+    state.listenGate = first;
+    const doomed = plugin.subscribe(topic, () => undefined).catch(() => 'rejected');
+    await until(() => state.listenAttempts.length === 1);
+
+    await plugin.disconnect();
+    await plugin.connect({ url: REAL_URL });
+
+    const successor = deferred();
+    state.listenGate = successor;
+    const boxA: Message[] = [];
+    const joinA = plugin.subscribe(topic, (m) => boxA.push(m));
+    await until(() => state.listenAttempts.length === 2);
+
+    first.resolve();
+    expect(await doomed).toBe('rejected');
+    expect(priv.subscribing.size, 'the successor in-flight registration was evicted').toBe(1);
+
+    const boxB: Message[] = [];
+    const joinB = plugin.subscribe(topic, (m) => boxB.push(m));
+    successor.resolve();
+    await Promise.all([joinA, joinB]);
+
+    expect(priv.subs.size).toBe(1);
+    expect([...priv.subs.values()][0]?.handlers.length, 'a handler was dropped').toBe(2);
+    expect(priv.listens.size, 'a second LISTEN entry was built for the channel').toBe(1);
+    expect(state.listenAttempts.length, 'a duplicate LISTEN was issued').toBe(2);
+
+    await plugin.disconnect();
+  }, 10000);
+
+
   it('a subscribe whose LISTEN rejects leaves no entry in this.subs', async () => {
     const plugin = new PostgresPlugin();
     await plugin.connect({ url: REAL_URL });
@@ -183,14 +590,16 @@ describe('Postgres subscribe registration (BUG-29)', () => {
     expect(sub.handlers.length).toBe(2);
 
     // Deliver one row via a NOTIFY on the shared listener connection.
-    state.drainRows.push({
-      seq: '1',
-      topic: 't',
-      sender: asHandle('u'),
-      content: 'hi',
-      ts: new Date().toISOString(),
-      in_reply_to: null,
-    });
+    state.rows.set('t', [
+      {
+        seq: '1',
+        topic: 't',
+        sender: asHandle('u'),
+        content: 'hi',
+        ts: new Date().toISOString(),
+        in_reply_to: null,
+      },
+    ]);
     const listener = state.clients[0];
     listener?.emit('notification', { channel });
     await sleep(50);
@@ -201,4 +610,117 @@ describe('Postgres subscribe registration (BUG-29)', () => {
 
     await plugin.disconnect();
   });
+});
+
+// The reconnect loop exists to make a notification blackout cost latency and not a message. A
+// NOTIFY rung while the connection was down reached NOBODY and nothing rings it again, so the
+// reconnect owes a re-drive to every subscription whose channel it re-LISTENed. Re-LISTENing
+// without re-driving is invisible to a test that only asks whether the channel came back.
+//
+// So rows are seeded landing DURING the blackout and graded on delivery, swept over how many
+// channels the reconnect carries and how deep the backlog it has to drain is.
+
+const DRAIN_BATCH = 512;
+/** The plugin's own backoff between listener reconnect attempts. */
+const RECONNECT_DELAY_MS = 500;
+
+interface ReconnectCell {
+  topics: number;
+  rows: number;
+  /** Which reconnect attempt is allowed to land — a blackout the first try does not end. */
+  attempt: number;
+}
+
+const RECONNECT_CELLS: ReconnectCell[] = [0, 1, 2].flatMap((topics) =>
+  [0, 1, DRAIN_BATCH + 1].map((rows) => ({ topics, rows, attempt: 1 })),
+);
+
+/**
+ * The same class one layer out: the re-drive has to be tied to the attempt that ACTUALLY landed,
+ * not to entering the loop.
+ */
+const RETRY_CELLS: ReconnectCell[] = [{ topics: 1, rows: 1, attempt: 3 }];
+
+function blackoutRows(topic: string, count: number): Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, i) => ({
+    seq: String(i + 1),
+    topic,
+    sender: asHandle('u'),
+    content: `m${i}`,
+    ts: new Date().toISOString(),
+    in_reply_to: null,
+  }));
+}
+
+const reconnectLabel = (c: ReconnectCell): string =>
+  `${c.topics} subscription(s), ${c.rows} row(s), reconnect lands on attempt ${c.attempt}`;
+
+async function reconnectCase(cell: ReconnectCell): Promise<void> {
+  const plugin = new PostgresPlugin();
+  await plugin.connect({ url: REAL_URL });
+
+  const seen = new Map<string, Message[]>();
+  const subTopics = Array.from({ length: cell.topics }, (_, i) => `sub${i}`);
+  for (const t of subTopics) {
+    seen.set(t, []);
+    await plugin.subscribe(asTopic(t), (m) => {
+      seen.get(t)?.push(m);
+    });
+  }
+
+  const channelsNeeded = [...(plugin as unknown as { listens: Map<string, unknown> }).listens.keys()];
+
+  const listener = state.clients[0];
+  if (listener === undefined) {
+    // Nothing subscribed: the listener connection is lazy, so there is no blackout to recover from.
+    expect(channelsNeeded).toEqual([]);
+    expect(cell.topics, 'a subscription registered no LISTEN at all').toBe(0);
+    await plugin.disconnect();
+    return;
+  }
+  state.connectFailures = cell.attempt - 1;
+  listener.emit('end');
+  // The rows land DURING the blackout: their NOTIFY reaches nobody, and nothing rings it again.
+  for (const t of subTopics) state.rows.set(t, blackoutRows(t, cell.rows));
+
+  // Past the backoff of every attempt this cell burns, the replacement client must be live.
+  await sleep(RECONNECT_DELAY_MS * cell.attempt + 400);
+  const replacement = state.clients.at(-1);
+  expect(replacement).toBeDefined();
+  expect(replacement).not.toBe(listener);
+  // SET EQUALITY, never containment: a replacement carrying MORE than the plugin believes it
+  // carries is the leak — the doorbell nothing will ever ring off again — and it satisfies every
+  // containment check perfectly.
+  expect(
+    observed(replacement as MockClientShape),
+    'the replacement is LISTENed for a set other than what the plugin believes it needs',
+  ).toEqual([...channelsNeeded].sort());
+
+  // No NOTIFY is emitted: the reconnect's own re-drive is what must serve the subscriptions.
+  await sleep(100);
+  const want = Array.from({ length: cell.rows }, (_, i) => `m${i}`);
+  for (const t of subTopics) {
+    const got = seen.get(t) ?? [];
+    expect(got.map((m) => m.content), `the subscription on ${t} was not re-driven`).toEqual(want);
+    expect(new Set(got.map((m) => m.backendMsgId)).size, 'duplicate delivery').toBe(got.length);
+  }
+  await plugin.disconnect();
+}
+
+describe('Postgres listener reconnect re-drives every participant the blackout starved', () => {
+  it.each(RECONNECT_CELLS.map((c) => [reconnectLabel(c), c] as const))(
+    '%s',
+    async (_label, cell) => {
+      await reconnectCase(cell);
+    },
+    15000,
+  );
+
+  it.each(RETRY_CELLS.map((c) => [reconnectLabel(c), c] as const))(
+    '%s',
+    async (_label, cell) => {
+      await reconnectCase(cell);
+    },
+    15000,
+  );
 });

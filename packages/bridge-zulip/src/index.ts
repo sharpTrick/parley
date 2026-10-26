@@ -1,64 +1,24 @@
 import {
   asBackendMsgId,
   asCursor,
+  assertBlockMsUnsupported,
   type BackendConfig,
   type BackendIdentity,
   type BackendMsgId,
   type BackendPlugin,
-  buildMessage,
-  type Cursor,
   type FetchRecentArgs,
   type FetchRecentResult,
   type Handle,
-  type Message,
   type MessageHandler,
   type Topic,
 } from '@sharptrick/parley-core';
-import { delay, fetchWithRetry } from '@sharptrick/parley-net-util';
+import { configRisks, describeRisk, resolveConfig } from './config.js';
+import { ZulipConnection } from './connection.js';
+import { readWindow } from './history.js';
+import { startPushLoop } from './push-loop.js';
+import { asArray, type RealmMember, requireSendableBody } from './wire.js';
 
-/** Plugin-specific backend_config. */
-export interface ZulipBackendConfig {
-  /** Zulip server base URL. Default `http://127.0.0.1:9991` (docker-zulip dev default). */
-  site_url?: string;
-  /** Bot email for HTTP Basic auth. Default `parley-bot@localhost`. */
-  email?: string;
-  /** Bot API key for HTTP Basic auth. Default `parley-api-key`. */
-  api_key?: string;
-  /** The ONE Zulip stream (channel) carrying all Parley traffic. Default `parley`. */
-  stream?: string;
-  /**
-   * Client-side cap (ms) on each `/api/v1/events` long-poll before it is aborted and reissued —
-   * the loop re-checks shutdown each interval. Un-acked events survive the abort. Default 25000.
-   */
-  events_timeout_ms?: number;
-}
-
-/** The subset of a Zulip message object we read (wire format). */
-interface ZulipMessage {
-  id: number;
-  content?: string;
-  sender_email?: string;
-  /** Unix seconds. */
-  timestamp?: number;
-}
-
-/** One entry from `GET /api/v1/events`. Non-`message` types (heartbeat, …) only advance the ack. */
-interface ZulipEvent {
-  id: number;
-  type: string;
-  message?: ZulipMessage;
-}
-
-interface EventsResponse {
-  result?: string;
-  code?: string;
-  events?: ZulipEvent[];
-}
-
-/** Per-subscription live state; `queueId` is mutable because a GC'd queue is re-registered. */
-interface QueueState {
-  queueId: string;
-}
+export type { ZulipBackendConfig } from './config.js';
 
 /**
  * Zulip backend (DESIGN §6/§9) — self-hosted, and the closest native fit of any backend: Zulip's
@@ -68,527 +28,101 @@ interface QueueState {
  *
  * The Zulip message `id` is a globally monotonic integer, hence per-topic monotonic — it serves as
  * BOTH `backendMsgId` (dedup key) AND `cursor` (order key); the zero cursor is `'0'`.
- * `fetchRecent` = `GET /api/v1/messages` with an `anchor` (exclusive via `include_anchor=false`);
- * `subscribe` = a registered per-topic event queue driven by a `GET /api/v1/events` long-poll —
- * genuine push, not a poll timer. Zulip DOES deliver our own sends back to our own queue.
  *
- * ONE INEXACTNESS to know about: Zulip topics are MUTABLE namespaces — admins (and, by default
- * policy, members) can move or rename messages between topics after the fact. Message ids and
- * cursors survive a move, but topic *membership* can drift: a moved message silently leaves one
- * Parley topic's history and appears in another's. Ids/cursors stay valid; topic isolation is
- * only as strong as the server's move policy.
+ * Topic isolation is only as strong as the server's message-move policy — see README, "The one
+ * inexactness: topics are mutable".
  */
 export class ZulipPlugin implements BackendPlugin {
-  private baseUrl = 'http://127.0.0.1:9991';
-  private email = 'parley-bot@localhost';
-  private apiKey = 'parley-api-key';
-  private stream = 'parley';
-  private eventsTimeoutMs = 25_000;
-  private connected = false;
-  private stopped = false;
-  /** In-flight event long-polls, aborted on disconnect so teardown is immediate. */
-  private readonly controllers = new Set<AbortController>();
-  /** Live queues (one per subscribe), so disconnect can best-effort delete them server-side. */
-  private readonly queues = new Set<QueueState>();
-  /**
-   * Topics with a live `subscribe` loop → the set of wake callbacks for blocking `fetchRecent`
-   * calls piggybacking on that loop's already-registered event queue (issue #20). Presence of a
-   * topic key means "subscribed"; the loop fires these when a message event lands so a blocked
-   * fetch re-queries WITHOUT opening a second event queue for the topic.
-   */
-  private readonly waiters = new Map<Topic, Set<() => void>>();
-  /**
-   * Aborts for every in-flight blocking-fetch wait (both the piggyback and the dedicated-queue
-   * kind), fired on `disconnect()` so a blocked `fetchRecent` releases immediately with no leaked
-   * timer or listener — reuses the same teardown discipline as the event-poll controllers.
-   */
-  private readonly pendingAborts = new Set<() => void>();
+  private readonly conn = new ZulipConnection();
 
   /**
-   * Zulip auth is per-request HTTP Basic (`email:api_key`) — there is no session or token to
-   * establish, so `connect` only captures config. A bad URL/key surfaces on the first call.
+   * A `connect()` over a live connection tears that one down FIRST, against the config it was made
+   * with. Keep the teardown here and the validation ahead of it, so that no per-connection registry
+   * — subscribe loops, event queues — can address the new connection with
+   * the old one's state, and a rejected config leaves the live connection running.
    */
   async connect(config: BackendConfig): Promise<void> {
-    const cfg = config as ZulipBackendConfig;
-    this.baseUrl = (cfg.site_url ?? 'http://127.0.0.1:9991').replace(/\/+$/, '');
-    this.email = cfg.email ?? 'parley-bot@localhost';
-    this.apiKey = cfg.api_key ?? 'parley-api-key';
-    this.stream = cfg.stream ?? 'parley';
-    this.eventsTimeoutMs = cfg.events_timeout_ms ?? 25_000;
-    this.stopped = false;
-    this.connected = true;
+    const cfg = resolveConfig(config);
+    if (this.conn.connected) await this.conn.close();
+    this.conn.open(cfg);
 
-    // SEC-06: connect() never contacts the server (auth is per-request), so a bad key surfaces
-    // only on first use — warn here when the effective API key is the repo-public default so the
-    // operator is told at startup rather than silently running with a well-known credential.
-    if (cfg.api_key === undefined || this.apiKey === 'parley-api-key') {
-      console.warn(
-        '[parley-zulip] SECURITY: connecting with the built-in default API key ' +
-          "('parley-api-key'). Set backend_config.api_key to a real secret; a network-reachable " +
-          'Zulip bot provisioned with this key is world-readable/injectable.',
-      );
+    for (const risk of configRisks(cfg)) {
+      console.warn(`[parley-zulip] SECURITY: ${describeRisk(risk)}`);
     }
   }
 
   async disconnect(): Promise<void> {
-    this.stopped = true;
-    // Release any blocked fetchRecent waits first — clears their timers/listeners deterministically.
-    for (const abort of this.pendingAborts) abort();
-    this.pendingAborts.clear();
-    this.waiters.clear();
-    for (const c of this.controllers) c.abort();
-    this.controllers.clear();
-    // Best-effort server-side cleanup — Zulip GCs idle queues after ~10 min anyway.
-    for (const q of this.queues) {
-      await this.http('DELETE', '/api/v1/events', { query: { queue_id: q.queueId } }).catch(
-        () => undefined,
-      );
-    }
-    this.queues.clear();
-    this.connected = false;
+    await this.conn.close();
   }
 
   /**
    * `POST /api/v1/messages` (form-encoded — Zulip rejects JSON bodies) → the new message `id`.
    * `identity` is informational only: Zulip stamps the sender from the authenticated bot account
-   * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored — Zulip has no
-   * per-message reply parent; it threads BY topic, and the topic is already the addressing unit.
+   * (see README "Multiple concurrent sessions"). `opts.inReplyTo` is ignored: Zulip threads by topic.
    */
   async post(
-    topic: Topic,
-    identity: Handle,
-    content: string,
-    _opts?: { inReplyTo?: BackendMsgId },
+    topic: Topic, _identity: Handle, content: string, _opts?: { inReplyTo?: BackendMsgId },
   ): Promise<BackendMsgId> {
-    this.require();
-    const res = await this.http('POST', '/api/v1/messages', {
-      form: { type: 'stream', to: this.stream, topic, content },
+    const { conn } = this;
+    conn.require();
+    const generation = conn.generation;
+    const body = requireSendableBody(content);
+    const res = await conn.rest.request('POST', '/api/v1/messages', {
+      form: { type: 'stream', to: conn.cfg.stream, topic: conn.claimWireTopic(topic), content: body },
     });
-    const json = (await res.json()) as { id: number };
-    // identity is the logical sender; Zulip stamps `sender_email` from the authenticated bot.
-    void identity;
-    return asBackendMsgId(String(json.id));
+    const id = ((await res.json()) as { id?: number } | null)?.id;
+    conn.assertGeneration(generation);
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+      throw new Error(
+        `Zulip POST /api/v1/messages answered without a usable message id (got ${JSON.stringify(id)})`,
+      );
+    }
+    return asBackendMsgId(String(id));
   }
 
-  /**
-   * `GET /api/v1/messages` narrowed to `<stream, topic>`. With `since`: `anchor=<since>` +
-   * `include_anchor=false` + `num_after=<limit>` — the anchor itself is excluded, making `since`
-   * strictly exclusive server-side. Without: `anchor=newest` + `num_before=<limit>` for the most
-   * recent window. Zulip returns messages ascending by id — no client-side reordering needed.
-   */
   async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
-    this.require();
+    assertBlockMsUnsupported('parley-zulip', args.blockMs);
+    const { conn } = this;
+    conn.require();
     const limit = args.limit ?? 100;
-    let messages = await this.fetchMessages(args.topic, args.since, limit);
-    // Native long-poll (issue #20): only when the exclusive `since` query came back EMPTY and the
-    // caller asked to block. With no `since` there is no cursor to advance past, so we never block
-    // (matches the seam's "default recent window returns at once"). Returning early/empty stays
-    // safe — core's generic wrapper polls the remaining budget — so this only ever SHORTENS the wait.
-    if (messages.length === 0 && args.since !== undefined && (args.blockMs ?? 0) > 0) {
-      messages = await this.blockingFetch(args.topic, args.since, limit, args.blockMs as number);
-    }
+    const messages = await readWindow(conn, args.topic, args.since, limit, {
+      generation: conn.generation,
+    });
     const nextCursor = messages.at(-1)?.cursor ?? args.since ?? asCursor('0');
     return { messages, nextCursor };
   }
 
-  /**
-   * Wait up to `blockMs` for a message strictly after `since`, then re-run the normal exclusive
-   * query and return it (possibly empty, with a cursor === `since`, which is correct at timeout).
-   * Reuses Zulip's live primitive — the `/api/v1/events` event-queue long-poll `subscribe` uses:
-   *   - If a `subscribe` loop already owns a queue for this topic, PIGGYBACK on it (never open a
-   *     second queue): register a wake callback the loop fires on the next message event.
-   *   - Otherwise register a short-lived dedicated queue and issue ONE bounded long-poll.
-   * Either wait aborts cleanly on `disconnect()` via {@link pendingAborts}/{@link controllers}.
-   */
-  private async blockingFetch(
-    topic: Topic,
-    since: Cursor,
-    limit: number,
-    blockMs: number,
-  ): Promise<Message[]> {
-    const deadline = Date.now() + blockMs;
-    if (this.waiters.has(topic)) {
-      // A subscribe loop owns the topic's queue — hook it rather than open our own. Arm the wake
-      // callback FIRST, then re-check history: a message delivered by the loop between the caller's
-      // initial empty read and this registration fired `waiters` before our callback existed, so
-      // the re-check (with the callback already live) closes that lost-wakeup window.
-      const { waited, cancel } = this.armSubscriptionWaiter(topic, blockMs);
-      const raced = this.stopped ? [] : await this.fetchMessages(topic, since, limit);
-      if (raced.length > 0) {
-        cancel();
-        return raced;
-      }
-      await waited;
-      return this.stopped ? [] : this.fetchMessages(topic, since, limit);
-    }
-    return this.waitViaDedicatedQueue(topic, since, limit, deadline);
-  }
-
-  /**
-   * Synchronously register a wake callback on the live `subscribe` loop for `topic` and return the
-   * promise that resolves when the loop signals a message (or `blockMs` elapses / disconnect), plus
-   * a `cancel` to release it early. Registering synchronously keeps the callback live across the
-   * caller's subsequent re-check snapshot, so no wake fired in that window is lost.
-   */
-  private armSubscriptionWaiter(topic: Topic, blockMs: number): {
-    waited: Promise<void>;
-    cancel: () => void;
-  } {
-    const set = this.waiters.get(topic);
-    let finish!: () => void;
-    const waited = new Promise<void>((resolve) => {
-      let done = false;
-      finish = (): void => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        set?.delete(finish);
-        this.pendingAborts.delete(finish);
-        resolve();
-      };
-      const timer = setTimeout(finish, blockMs);
-      this.pendingAborts.add(finish);
-      set?.add(finish);
-      if (this.stopped) finish(); // disconnect may have raced the registration
-    });
-    return { waited, cancel: () => finish() };
-  }
-
-  /**
-   * No live subscription for this topic: register a short-lived narrowed event queue, re-check for
-   * a message that raced registration, then issue a single `/api/v1/events` long-poll bounded by
-   * the remaining budget. Any wake (a matching message) OR timeout/abort falls through to a final
-   * exclusive read. The queue is always torn down; the poll aborts on disconnect.
-   */
-  private async waitViaDedicatedQueue(
-    topic: Topic,
-    since: Cursor,
-    limit: number,
-    deadline: number,
-  ): Promise<Message[]> {
-    if (this.stopped) return [];
-    const reg = await this.register(topic);
-    const state: QueueState = { queueId: reg.queue_id };
-    this.queues.add(state);
-    try {
-      // A message landing between the caller's first read and register is now visible to this read.
-      const raced = await this.fetchMessages(topic, since, limit);
-      if (raced.length > 0) return raced;
-      const remaining = deadline - Date.now();
-      if (remaining > 0 && !this.stopped) {
-        const controller = new AbortController();
-        this.controllers.add(controller);
-        const abort = (): void => controller.abort();
-        const timer = setTimeout(abort, remaining);
-        this.pendingAborts.add(abort);
-        try {
-          // Blocks server-side until a matching message enters the queue, our timer fires, or
-          // disconnect aborts. We only need the wake edge — the events themselves are re-read below.
-          await this.http('GET', '/api/v1/events', {
-            query: {
-              queue_id: reg.queue_id,
-              last_event_id: String(reg.last_event_id),
-              dont_block: 'false',
-            },
-            signal: controller.signal,
-            allowStatuses: [400],
-          });
-        } catch {
-          /* aborted (timeout/disconnect) or a transient blip — fall through to the final read */
-        } finally {
-          clearTimeout(timer);
-          this.controllers.delete(controller);
-          this.pendingAborts.delete(abort);
-        }
-      }
-      return this.stopped ? [] : this.fetchMessages(topic, since, limit);
-    } finally {
-      this.queues.delete(state);
-      await this.http('DELETE', '/api/v1/events', { query: { queue_id: reg.queue_id } }).catch(
-        () => undefined,
-      );
-    }
-  }
-
-  /**
-   * Live path = a registered per-topic event queue + `GET /api/v1/events` long-poll loop
-   * (DESIGN §9 — genuine events, not a poll timer). `POST /api/v1/register` narrowed to
-   * `<stream, topic>` IS the tail: only messages sent after registration enter the queue, and it
-   * is awaited before subscribe resolves, so a post immediately after subscribe() is guaranteed
-   * to be queued. Zulip delivers our own sends to our own queue, matching the seam's echo
-   * expectation.
-   *
-   * Queue GC: Zulip garbage-collects queues after ~10 min idle; the server then answers
-   * `BAD_EVENT_QUEUE_ID`. Recovery: re-register (new tail) and ARM a pending gap
-   * (`needsGapFillFrom`); the top of the loop then GAP-FILLS — replays every message with id > the
-   * last delivered id through the catch-up path — RETRYING until it succeeds before polling the
-   * fresh queue, so a transient gap-fill failure (a network blip / non-2xx history read) can no
-   * longer punch a permanent hole in the push stream. Register failures and gap-fill failures
-   * retry independently. Gap-fill advances the delivered watermark PER PAGE, so a mid-pagination
-   * throw keeps its partial progress and a retry does not re-deliver already-delivered pages.
-   * `lastDeliveredId` also dedupes the overlap when a gap-filled message's event later arrives on
-   * the fresh queue.
-   */
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
-    this.require();
-    const reg = await this.register(topic);
-    // Mark the topic subscribed so a blocking fetchRecent piggybacks on THIS queue (issue #20)
-    // instead of opening a second one; the loop below wakes any registered fetchers per message.
-    // Seeded AFTER a successful register so a register failure leaves no dead waiter set that a
-    // later piggyback fetch would park on for its full blockMs.
-    if (!this.waiters.has(topic)) this.waiters.set(topic, new Set());
-    const state: QueueState = { queueId: reg.queue_id };
-    this.queues.add(state);
-    let lastEventId = reg.last_event_id;
-    // Gap-fill baseline: the current tail id (0 for an empty topic). Probed AFTER register so a
-    // message landing in between is never lost — worst case it is delivered once via the queue.
-    const tail = await this.fetchMessages(topic, undefined, 1);
-    let lastDeliveredId = Number(tail.at(-1)?.backendMsgId ?? '0');
-    // A queue GC arms this with the last-delivered id; the top of the loop then drains it, retrying
-    // until the gap-fill read succeeds, so a transient failure can't leave a permanent push hole.
-    let needsGapFillFrom: number | undefined;
-
-    const loop = async (): Promise<void> => {
-      while (!this.stopped) {
-        // Drain a pending gap-fill BEFORE polling the fresh queue — retry the gap (not the events
-        // poll) until it clears, advancing `lastDeliveredId`/`needsGapFillFrom` per delivered page
-        // so a mid-pagination throw keeps its progress and a retry resumes past delivered pages.
-        if (needsGapFillFrom !== undefined) {
-          try {
-            lastDeliveredId = await this.gapFill(topic, needsGapFillFrom, handler, (id) => {
-              lastDeliveredId = id;
-              needsGapFillFrom = id;
-            });
-            needsGapFillFrom = undefined; // gap closed — resume normal polling
-          } catch {
-            if (this.stopped) break;
-            await delay(200);
-          }
-          continue; // re-check stopped / re-attempt before polling the fresh queue
-        }
-        const controller = new AbortController();
-        this.controllers.add(controller);
-        // Client-side long-poll cap so the loop re-checks shutdown; un-acked events survive.
-        const timer = setTimeout(() => controller.abort(), this.eventsTimeoutMs);
-        let json: EventsResponse;
-        try {
-          const res = await this.http('GET', '/api/v1/events', {
-            query: {
-              queue_id: state.queueId,
-              last_event_id: String(lastEventId),
-              dont_block: 'false',
-            },
-            signal: controller.signal,
-            allowStatuses: [400],
-          });
-          json = (await res.json()) as EventsResponse;
-        } catch {
-          if (this.stopped) break;
-          await delay(200);
-          continue;
-        } finally {
-          clearTimeout(timer);
-          this.controllers.delete(controller);
-        }
-        if (this.stopped) break;
-        if (json.result === 'error') {
-          if (json.code === 'BAD_EVENT_QUEUE_ID') {
-            // Re-register the queue, then ARM the pending gap — the top of the loop drains it.
-            // Splitting register from gap-fill lets each retry independently: a register throw
-            // retries register, a gap-fill throw retries the gap-fill (not a wasted re-register).
-            try {
-              const fresh = await this.register(topic);
-              state.queueId = fresh.queue_id;
-              lastEventId = fresh.last_event_id;
-              // Arm from the lowest outstanding watermark so a second GC racing before the first
-              // gap closes never skips messages (`lastDeliveredId` only moves forward in practice).
-              needsGapFillFrom = Math.min(needsGapFillFrom ?? lastDeliveredId, lastDeliveredId);
-            } catch {
-              if (this.stopped) break;
-              await delay(200);
-            }
-          } else {
-            await delay(200);
-          }
-          continue;
-        }
-        let sawMessage = false;
-        for (const ev of json.events ?? []) {
-          if (ev.id > lastEventId) lastEventId = ev.id; // ack everything, incl. heartbeats
-          if (ev.type !== 'message' || ev.message === undefined) continue;
-          sawMessage = true; // a message landed on this topic — release any blocked fetchers
-          if (ev.message.id <= lastDeliveredId) continue; // already gap-filled — dedup
-          lastDeliveredId = ev.message.id;
-          try {
-            handler(zulipToMessage(topic, ev.message));
-          } catch {
-            /* handler is best-effort; never break the loop (DESIGN §6) */
-          }
-        }
-        // Wake piggybacking blocking-fetch waiters; they re-query and return whatever is newly past
-        // their `since`. A spurious wake only ends a wait early, which core covers by re-polling.
-        if (sawMessage) {
-          const set = this.waiters.get(topic);
-          if (set !== undefined) for (const w of [...set]) w();
-        }
-      }
-    };
-    void loop();
+    this.conn.require();
+    await startPushLoop(this.conn, topic, handler);
   }
 
   /**
-   * Real account lookup (DESIGN §4): `GET /api/v1/users`, matched on `email` or `full_name` →
-   * `backendRef` = the Zulip `user_id`. Miss (or any error) degrades to the string convention.
+   * Real account lookup (DESIGN §4): `GET /api/v1/users` → `backendRef` = the Zulip `user_id`.
+   * `email` is unique per realm; `full_name` is a self-service, NON-unique display name and is only
+   * consulted when no active member carries the handle as an email. Both branches resolve only on
+   * exactly ONE active match: a tie or a deactivated-only match degrades to the string convention
+   * rather than letting whoever the server happens to list first answer for the handle, and any
+   * error degrades the same way.
    */
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
-    this.require();
+    this.conn.require();
+    const generation = this.conn.generation;
+    let members: RealmMember[] = [];
     try {
-      const res = await this.http('GET', '/api/v1/users');
-      const { members } = (await res.json()) as {
-        members: Array<{ user_id: number; email: string; full_name: string }>;
-      };
-      const user = members.find((u) => u.email === handle || u.full_name === handle);
-      if (user !== undefined) return { handle, backendRef: String(user.user_id) };
+      const res = await this.conn.rest.request('GET', '/api/v1/users');
+      members = asArray(((await res.json()) as { members?: RealmMember[] } | null)?.members);
     } catch {
       /* lookup is best-effort; fall through to the string convention */
     }
+    this.conn.assertGeneration(generation);
+    const active = members.filter((u) => u?.is_active !== false);
+    const byEmail = active.filter((u) => u?.email === handle);
+    if (byEmail.length === 1) return { handle, backendRef: String(byEmail[0]!.user_id) };
+    if (byEmail.length === 0) {
+      const byName = active.filter((u) => u?.full_name === handle);
+      if (byName.length === 1) return { handle, backendRef: String(byName[0]!.user_id) };
+    }
     return { handle, backendRef: handle };
   }
-
-  /** Shared narrowed read used by fetchRecent AND the gap-fill after a queue GC. */
-  private async fetchMessages(topic: Topic, since: Cursor | undefined, limit: number): Promise<Message[]> {
-    const narrow = JSON.stringify([
-      { operator: 'stream', operand: this.stream },
-      { operator: 'topic', operand: topic },
-    ]);
-    const query: Record<string, string> =
-      since === undefined
-        ? { narrow, anchor: 'newest', include_anchor: 'true', num_before: String(limit), num_after: '0' }
-        : { narrow, anchor: String(since), include_anchor: 'false', num_before: '0', num_after: String(limit) };
-    query.apply_markdown = 'false'; // raw content, not rendered HTML
-    const res = await this.http('GET', '/api/v1/messages', { query });
-    const { messages } = (await res.json()) as { messages: ZulipMessage[] };
-    return messages.map((m) => zulipToMessage(topic, m)); // Zulip returns ascending by id
-  }
-
-  /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
-  private async register(topic: Topic): Promise<{ queue_id: string; last_event_id: number }> {
-    const res = await this.http('POST', '/api/v1/register', {
-      form: {
-        event_types: JSON.stringify(['message']),
-        narrow: JSON.stringify([
-          ['stream', this.stream],
-          ['topic', topic],
-        ]),
-        apply_markdown: 'false',
-      },
-    });
-    return (await res.json()) as { queue_id: string; last_event_id: number };
-  }
-
-  /**
-   * Replay everything after `sinceId` through `handler`; returns the new last delivered id.
-   * `onProgress` is invoked with the last delivered id after EACH page lands, so a caller retrying
-   * a throwing gap-fill can resume past already-delivered pages instead of re-delivering them (the
-   * history read at the top of the loop may throw on any non-2xx/network blip — the caller retries).
-   */
-  private async gapFill(
-    topic: Topic,
-    sinceId: number,
-    handler: MessageHandler,
-    onProgress: (id: number) => void,
-  ): Promise<number> {
-    const page = 500;
-    let cursor = asCursor(String(sinceId));
-    for (;;) {
-      const messages = await this.fetchMessages(topic, cursor, page); // may throw → caller retries
-      for (const m of messages) {
-        try {
-          handler(m);
-        } catch {
-          /* handler is best-effort; never break the loop (DESIGN §6) */
-        }
-      }
-      const last = messages.at(-1);
-      if (last === undefined) return Number(cursor);
-      cursor = last.cursor; // advance so a retry resumes past this delivered page
-      onProgress(Number(cursor)); // report per-page progress — durable across a later throw
-      if (messages.length < page) return Number(cursor);
-    }
-  }
-
-  private require(): void {
-    if (!this.connected) {
-      throw new Error('ZulipPlugin not connected — call connect() first');
-    }
-  }
-
-  /**
-   * Single HTTP entry point. Adds HTTP Basic auth (`email:api_key`), encodes bodies as
-   * `application/x-www-form-urlencoded` (Zulip REJECTS JSON bodies), and transparently retries on
-   * 429 honoring `Retry-After` (header, or the `retry-after` JSON field — Zulip sends both,
-   * in seconds). Retries stop the moment we disconnect, so an aborted test never leaves a loop
-   * hammering the server. Throws on unexpected non-2xx unless the caller marks the status as
-   * expected via `allowStatuses`.
-   */
-  private async http(
-    method: string,
-    path: string,
-    opts?: {
-      form?: Record<string, string>;
-      query?: Record<string, string>;
-      signal?: AbortSignal;
-      allowStatuses?: number[];
-    },
-  ): Promise<Response> {
-    const qs = opts?.query !== undefined ? `?${new URLSearchParams(opts.query)}` : '';
-    const url = `${this.baseUrl}${path}${qs}`;
-    const headers: Record<string, string> = {
-      Authorization: `Basic ${Buffer.from(`${this.email}:${this.apiKey}`).toString('base64')}`,
-    };
-    if (opts?.form !== undefined) {
-      headers['Content-Type'] = 'application/x-www-form-urlencoded';
-    }
-
-    return fetchWithRetry(
-      url,
-      {
-        method,
-        headers,
-        body: opts?.form !== undefined ? new URLSearchParams(opts.form).toString() : undefined,
-        signal: opts?.signal,
-      },
-      {
-        label: `Zulip ${method} ${path}`,
-        // Stop retrying once disconnected — don't compete for the rate-limit budget post-teardown.
-        isStopped: () => this.stopped,
-        retryAfterOf: readRetryAfter,
-        allowStatuses: opts?.allowStatuses,
-      },
-    );
-  }
-}
-
-function zulipToMessage(topic: Topic, m: ZulipMessage): Message {
-  return buildMessage({
-    topic,
-    sender: m.sender_email ?? '',
-    content: m.content ?? '',
-    timestamp: new Date((m.timestamp ?? 0) * 1000).toISOString(),
-    id: String(m.id),
-  });
-}
-
-/** Zulip 429s carry `Retry-After` (header) and `retry-after` (JSON body), both in SECONDS. */
-async function readRetryAfter(res: Response): Promise<number> {
-  const header = Number(res.headers.get('retry-after'));
-  if (Number.isFinite(header) && header > 0) return Math.min(header * 1000, 5000);
-  try {
-    const json = (await res.clone().json()) as { 'retry-after'?: number };
-    const field = json['retry-after'];
-    if (typeof field === 'number' && field > 0) return Math.min(field * 1000, 5000);
-  } catch {
-    /* fall through to default backoff */
-  }
-  return 500;
 }

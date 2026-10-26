@@ -2,7 +2,7 @@
   "name": "@sharptrick/parley-xmpp",
   "version": "0.1.0",
   "type": "module",
-  "description": "@sharptrick/parley-xmpp — MUC->topic, MAM->fetchRecent/cursor (MAM must be enabled), PubSub->subscribe. Skeleton against the frozen Parley seam — planned v0.5.",
+  "description": "@sharptrick/parley-xmpp \u2014 Parley backend on XMPP MUC rooms, using MAM for exclusive-since catch-up (the server MUST have MAM enabled). Archive id as both cursor and backendMsgId; live push rides the joined-room message stream.",
   "license": "MIT",
   "engines": {
     "node": ">=22.0.0"
@@ -27,24 +27,29 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "parley-xmpp": "./dist/cli.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -b tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@sharptrick/parley-core": "^0.1.0",
     "@sharptrick/parley-net-util": "^0.1.0",
-    "@xmpp/client": "^0.14.0",
-    "@xmpp/debug": "^0.14.0"
+    "@xmpp/client": "^0.14.0"
   },
   "devDependencies": {
-    "@sharptrick/parley-conformance": "^0.1.0"
+    "@sharptrick/parley-conformance": "^0.1.0",
+    "@xmpp/error": "^0.14.0"
   },
   "keywords": [
     "mcp",

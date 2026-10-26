@@ -4,12 +4,15 @@ import {
 } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { MemoryStore } from 'express-rate-limit';
 import type { ParleyConfig } from '../config.js';
 import type { BackendPlugin } from '../seam.js';
 import { createRemoteHttpApp, type RemoteHttpServer } from '../transport/http.js';
-import { escapeHtml } from './html.js';
+import { renderConsentRefusal } from './consent-page.js';
+import { DEFAULT_SCOPES_SUPPORTED } from './grant-params.js';
 import { ConsentError, ParleyOAuthProvider } from './oauth-provider.js';
+import { hardenErrorSurface } from './error-surface.js';
+import { assertPublicBaseUrl, assertTrustProxy, canonicalResourceId } from './invariants.js';
 
 export interface OAuthRemoteOptions {
   /** Public origin = issuer = base URL (AS = RS, single tenant). HTTPS in production; localhost ok in dev. */
@@ -19,12 +22,26 @@ export interface OAuthRemoteOptions {
   /** MCP endpoint path. Default `/mcp`. The canonical resource id is `issuerUrl + mcpPath` (no trailing slash). */
   mcpPath?: string;
   scopesSupported?: string[];
+  /**
+   * Express `trust proxy` value, describing the real deployment: the default `false` is correct
+   * only when the socket peer IS the client, and behind the TLS terminator of
+   * examples/self-host-remote it is `'loopback'` (or the hop count). Every endpoint below is
+   * rate-limited on the `req.ip` this decides, so anything that trusts the whole address space is
+   * refused at boot with a message naming the value and the exposure.
+   */
+  trustProxy?: boolean | number | string | string[];
   /** Injectable clock for tests. */
   now?: () => number;
 }
 
 const CONSENT_PATH = '/parley/consent';
 
+/**
+ * The built-in OAuth front door. Its `close()` is TERMINAL, unlike the idempotent and re-listenable
+ * one on {@link RemoteHttpServer} it extends: it drops every issued credential and shuts down the
+ * provider's sweeper and the rate limiters' stores, none of which are re-armed. A later `listen()`
+ * is refused rather than serving a complete authorization server whose background eviction is dead.
+ */
 export interface OAuthRemoteServer extends RemoteHttpServer {
   provider: ParleyOAuthProvider;
   /** The canonical RFC 8707 resource identifier (token audience). */
@@ -44,39 +61,44 @@ export function createOAuthRemoteApp(
   oauth: OAuthRemoteOptions,
 ): OAuthRemoteServer {
   const mcpPath = oauth.mcpPath ?? '/mcp';
-  const resource = new URL(mcpPath, oauth.issuerUrl); // canonical resource id (no trailing slash)
+  assertPublicBaseUrl(oauth.issuerUrl, 'issuerUrl');
+  assertTrustProxy(oauth.trustProxy, 'trustProxy');
+  const resource = canonicalResourceId(oauth.issuerUrl, mcpPath, 'mcpPath');
+  const scopesSupported = oauth.scopesSupported ?? DEFAULT_SCOPES_SUPPORTED;
 
   const provider = new ParleyOAuthProvider({
     resource,
     verifyOwner: oauth.verifyOwner,
     consentPath: CONSENT_PATH,
+    scopesSupported,
     ...(oauth.now !== undefined ? { now: oauth.now } : {}),
   });
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resource);
   const bearer = requireBearerAuth({ verifier: provider, resourceMetadataUrl });
 
-  // Strict rate limit on the hand-mounted consent route, mirroring how the SDK guards its own auth
-  // endpoints (/register|/authorize|/token). A legit owner needs one attempt; brute force needs
-  // thousands, so keep the ceiling low and return 429 on exceed. Per-app instance (its own store)
-  // so the counter is scoped to this server, not shared process-wide.
-  //
-  // Trust-proxy note: the limiter keys on req.ip. Behind the documented reverse proxy (Caddy) all
-  // requests would otherwise share the proxy's IP, so per-IP throttling is defense-in-depth here —
-  // the load-bearing brute-force defense is the one-shot consent invalidation in completeConsent
-  // (each guess costs a fresh /authorize). We deliberately do NOT reconfigure the global `trust
-  // proxy` setting from this route (an app-wide change with its own security implications).
+  // Every limiter gets a store this app owns, so that its counters stay scoped to this server
+  // rather than shared process-wide, and so that close() can stop their sweep timers.
+  const stores: MemoryStore[] = [];
+  const ownedStore = (): MemoryStore => {
+    const store = new MemoryStore();
+    stores.push(store);
+    return store;
+  };
+
   const consentLimiter = rateLimit({
     windowMs: 15 * 60_000,
     limit: 10,
     standardHeaders: true,
     legacyHeaders: false,
+    store: ownedStore(),
   });
 
   const remote = createRemoteHttpApp(plugin, cfg, {
     mcpPath,
     protect: bearer,
     configureApp: (app) => {
-      // OAuth AS endpoints + AS metadata + Protected Resource Metadata, mounted at the root.
+      app.set('trust proxy', oauth.trustProxy ?? false);
+
       // (Do NOT add json/urlencoded parsers in front — these handlers install their own.)
       app.use(
         mcpAuthRouter({
@@ -84,14 +106,17 @@ export function createOAuthRemoteApp(
           issuerUrl: oauth.issuerUrl,
           baseUrl: oauth.issuerUrl,
           resourceServerUrl: resource,
-          scopesSupported: oauth.scopesSupported ?? ['mcp'],
+          scopesSupported,
           resourceName: 'Parley',
+          authorizationOptions: { rateLimit: { store: ownedStore() } },
+          clientRegistrationOptions: { rateLimit: { store: ownedStore() } },
+          revocationOptions: { rateLimit: { store: ownedStore() } },
+          tokenOptions: { rateLimit: { store: ownedStore() } },
         }),
       );
 
-      // Owner-consent submit (browser-driven). The /authorize handler renders a consent page that
-      // POSTs here; on the correct owner passphrase we mint the code and redirect back to Claude.
       app.post(CONSENT_PATH, consentLimiter, express.urlencoded({ extended: false }), async (req, res) => {
+        res.setHeader('Cache-Control', 'no-store');
         const body = (req.body ?? {}) as Record<string, unknown>;
         const consentId = String(body.consent_id ?? '');
         const passphrase = String(body.passphrase ?? '');
@@ -100,10 +125,7 @@ export function createOAuthRemoteApp(
           res.redirect(302, redirectUrl);
         } catch (err) {
           if (err instanceof ConsentError) {
-            res.status(403).type('html').send(
-              `<!doctype html><meta charset="utf-8"><body style="font:16px system-ui;max-width:32rem;margin:3rem auto">` +
-                `<h1>Not authorized</h1><p>${escapeHtml(err.message)}.</p><p><a href="javascript:history.back()">Go back</a></p></body>`,
-            );
+            res.status(403).type('html').send(renderConsentRefusal(err.message));
             return;
           }
           throw err;
@@ -112,5 +134,25 @@ export function createOAuthRemoteApp(
     },
   });
 
-  return Object.assign(remote, { provider, resource });
+  hardenErrorSurface(remote.app);
+
+  const closeHttp = remote.close.bind(remote);
+  const listenHttp = remote.listen.bind(remote);
+  let closed = false;
+  return Object.assign(remote, {
+    provider,
+    resource,
+    listen: async (port: number, host?: string) => {
+      if (closed) {
+        throw new Error('this remote auth app has been closed and cannot listen again');
+      }
+      return listenHttp(port, host);
+    },
+    close: async (): Promise<void> => {
+      closed = true;
+      provider.stop();
+      for (const store of stores) store.shutdown();
+      await closeHttp();
+    },
+  });
 }

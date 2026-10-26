@@ -2,28 +2,120 @@ import type { Server as NodeHttpServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type RequestHandler } from 'express';
+import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
+import { withInboundTrustBoundary } from '../inbound-trust.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
-import { startPresenceLoop } from './presence-loop.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
+
+/**
+ * What a reactive-only client is told before the untrusted-inbound boundary
+ * {@link withInboundTrustBoundary} appends to it. This root serves the chat front door, which reads
+ * backend history into a conversation and so needs the boundary as much as the channel does.
+ */
+const REACTIVE_INSTRUCTIONS_BODY = [
+  'Parley: a shared, topic-organized message backend. To catch up on a topic, call',
+  'parley_fetch_recent (on session start for each topic you work in, then on demand). To answer a',
+  'message, call parley_reply with the same `topic`. To publish or hand off, call parley_post.',
+  'This root receives no live push at all; parley_live_status says so rather than reporting a',
+  'health it cannot observe.',
+];
 
 /**
  * Build a REACTIVE-ONLY MCP server (DESIGN §8/§10 remote mode): the post / fetchRecent / reply
  * tools over the same seam, with NO `claude/channel` capability and NO push loop — the chat
  * client cannot receive pushes. `deps` is derived ONCE at app scope (see {@link createRemoteHttpApp})
  * and shared across every per-request server, so the allowlist/regexes are compiled a single time,
- * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain (CX-06).
+ * not per POST. No `seen` is passed: without a push loop there is no dedup state to maintain.
  */
 export function buildReactiveServer(deps: ToolDeps): McpServer {
-  const server = new McpServer({ name: 'parley', version: CORE_VERSION }, { capabilities: { tools: {} } });
+  const server = new McpServer(
+    { name: 'parley', version: CORE_VERSION },
+    { capabilities: { tools: {} }, instructions: withInboundTrustBoundary(REACTIVE_INSTRUCTIONS_BODY) },
+  );
   registerTools(server, deps);
   return server;
+}
+
+/**
+ * Tear one per-request object down without letting its failure escape. Keep the WHOLE call inside
+ * the try, so that a `close` which throws synchronously — or rejects a tick later, as a transport
+ * over an already-destroyed socket does — cannot become an unhandledRejection: this runs from a
+ * response `close` event, where nothing is awaiting it and Node would take the process down.
+ */
+async function closeQuietly(what: string, target: { close: () => Promise<void> }): Promise<void> {
+  try {
+    await target.close();
+  } catch (err) {
+    console.error(`[parley] ${what} close failed:`, err);
+  }
+}
+
+/**
+ * How long {@link RemoteHttpServer.close} lets an in-flight request finish before its socket is
+ * destroyed. Node's `server.close()` waits for every open connection, and a `parley_fetch_recent`
+ * long-poll holds one for its whole `catchup.block_max_ms` budget (60 s by default) — past a
+ * `docker stop` grace period. The tool layer answers an aborted long-poll with an empty result, so
+ * cutting one short is safe.
+ */
+const CLOSE_GRACE_MS = 250;
+
+/**
+ * Host header values accepted when no explicit `allowedHosts` is configured: loopback only, on any
+ * port. This is the DNS-rebinding gate — a browser the operator visits can be pointed at
+ * 127.0.0.1 by re-resolving an attacker domain, and the request is then same-origin so CORS does
+ * not protect it. Only the `Host`/`Origin` the attacker's page carries gives it away.
+ */
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '[::1]'];
+
+/** The host part of a `Host`/`Origin` header value, port stripped, lowercased. */
+function hostnameOf(value: string): string {
+  const authority = value.includes('://') ? value.slice(value.indexOf('://') + 3) : value;
+  const hostname = authority.startsWith('[')
+    ? authority.slice(0, authority.indexOf(']') + 1)
+    : (authority.split(':')[0] ?? '');
+  return hostname.toLowerCase();
+}
+
+/**
+ * An `allowedHosts` entry: an optional scheme, a bracketed IPv6 literal or a reg-name/IPv4, an
+ * optional port, and nothing else.
+ */
+const HOST_ENTRY = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/)?(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::\d+)?$/;
+
+/**
+ * Refuse a gate entry {@link hostnameOf} cannot turn into the host it names. That parser splits an
+ * unbracketed value on `:`, so `::1` collapses to the empty string and `fe80::1%eth0` to `fe80` —
+ * and a collapsed entry moves BOTH halves of the gate the wrong way: the operator's own client is
+ * 403'd forever, while an entry that collapses to nothing joins the allow set, where a request
+ * carrying no `Host` header at all matches it. Refusing at construction is the only place either
+ * half is visible; at request time both look like an ordinary decision.
+ */
+function assertNamesAHost(entry: string): void {
+  if (!HOST_ENTRY.test(entry))
+    throw new RangeError(
+      `allowedHosts entry ${JSON.stringify(entry)} does not name a host. Write a hostname or ` +
+        'address with an optional scheme and port, and put an IPv6 literal in brackets ' +
+        '(e.g. "parley.internal", "parley.internal:8443", "[::1]") — anything else is parsed ' +
+        'into a value no request can match, which locks out the host it was meant to admit.',
+    );
 }
 
 export interface RemoteHttpOptions {
   /** Middleware protecting the /mcp route (e.g. requireBearerAuth). Default: FAIL CLOSED (401). */
   protect?: RequestHandler;
+  /**
+   * Hostnames this app answers to (ports ignored). Requests whose `Host` — or whose `Origin`, when
+   * the browser sent one — names anything else get a 403, which is what stops DNS rebinding from
+   * reaching the endpoint through a browser the operator visits.
+   *
+   * Enforced whenever this is set, and by default whenever {@link insecureNoAuth} is on (loopback
+   * only). A bearer-protected deployment without this option is not gated here: it is typically
+   * reached through a proxy under a public name this layer is not told, and a rebinding page cannot
+   * forge the `Authorization` header anyway.
+   */
+  allowedHosts?: string[];
   /**
    * Explicitly run /mcp with NO auth — dev/loopback only. Named so the insecurity is visible at
    * the call site. Ignored when `protect` is set. Default: false (fail closed).
@@ -43,9 +135,9 @@ export interface RemoteHttpServer {
 
 /**
  * Create the remote-mode Express app: a Streamable-HTTP MCP endpoint backed by the reactive
- * server. Session-per-connection (stateful): a new transport + server is created on the
- * initialize request and reused by `mcp-session-id`. The same seam/tools are reused across
- * stdio and HTTP — only this transport/auth layer differs (DESIGN §10).
+ * server. STATELESS — a fresh transport + server per POST, no `mcp-session-id`, no SSE, no server
+ * push; GET and DELETE answer 405. The same seam/tools are reused across stdio and HTTP — only
+ * this transport/auth layer differs (DESIGN §10).
  */
 export function createRemoteHttpApp(
   plugin: BackendPlugin,
@@ -54,8 +146,9 @@ export function createRemoteHttpApp(
 ): RemoteHttpServer {
   const app = express();
   app.disable('x-powered-by');
-  // SEC-04: anti-clickjacking + hardening headers on every response, including the browser-facing
-  // OAuth /authorize consent page (owner-passphrase form) and /parley/consent. Applied app-wide
+  // Keep these anti-clickjacking / hardening headers on every response, so the browser-facing
+  // OAuth /authorize consent page (owner-passphrase form) and /parley/consent stay covered too.
+  // Applied app-wide
   // because the whole app is single-purpose. HSTS is ignored by browsers over plain HTTP, so it is
   // safe to send unconditionally and takes effect only on the HTTPS deployment.
   app.use((_req, res, next) => {
@@ -65,24 +158,37 @@ export function createRemoteHttpApp(
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     next();
   });
+  const allowedHosts =
+    opts.allowedHosts ?? (opts.insecureNoAuth === true && opts.protect === undefined ? LOOPBACK_HOSTS : undefined);
+  if (allowedHosts !== undefined) {
+    for (const entry of allowedHosts) assertNamesAHost(entry);
+    const allowed = new Set(allowedHosts.map((h) => hostnameOf(h)));
+    // Keep this ahead of configureApp, so that the OAuth consent/authorize routes are covered too.
+    app.use((req, res, next) => {
+      const origin = req.headers.origin;
+      const bad =
+        !allowed.has(hostnameOf(req.headers.host ?? '')) ||
+        (typeof origin === 'string' && origin.length > 0 && !allowed.has(hostnameOf(origin)));
+      if (bad) {
+        res.status(403).json({
+          jsonrpc: '2.0',
+          error: { code: -32002, message: 'Forbidden: host not allowed' },
+          id: null,
+        });
+        return;
+      }
+      next();
+    });
+  }
+
   const mcpPath = opts.mcpPath ?? '/mcp';
   opts.configureApp?.(app);
 
-  // Derive the tool deps ONCE at app scope (config is constant): the allowlist/regexes and tool
-  // descriptions are compiled a single time and reused by every per-request reactive server and by
-  // the presence loop below — no per-POST recompilation, no duplicate app-scope derivation (CX-09).
+  // Derive the tool deps ONCE at app scope (config is constant), so the allowlist and its compiled
+  // regexes are shared by every per-request reactive server.
   const deps = toolDepsFor(plugin, cfg);
 
-  // The chat bridge is a long-lived participant too: announce presence off the shared plugin
-  // (the reactive servers are per-request and stateless, so presence lives at app scope).
-  const presence = cfg.presence.enabled
-    ? startPresenceLoop(plugin, deps.identity, deps.allow, {
-        presenceTopic: deps.presenceTopic,
-        heartbeatMs: cfg.presence.heartbeat_ms,
-      })
-    : undefined;
-
-  // SEC-17: fail CLOSED by default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
+  // Keep this fail-CLOSED default. Omitting both `protect` and `insecureNoAuth` yields a 401, not
   // an open endpoint. A no-arg call must never mean "no auth".
   const failClosed: RequestHandler = (_req, res) => {
     res.status(401).json({
@@ -112,14 +218,14 @@ export function createRemoteHttpApp(
         enableJsonResponse: true,
       });
       res.on('close', () => {
-        void transport.close();
-        void server.close();
+        void closeQuietly('transport', transport);
+        void closeQuietly('reactive server', server);
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
-      // SEC-14: never echo internal error detail to the client; log it for the operator instead.
-      console.error('[parley] /mcp request failed:', err);
+      // Never echo internal error detail to the client; log a redacted digest for the operator.
+      console.error('[parley] /mcp request failed:', errorDigest(err));
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: '2.0',
@@ -134,10 +240,17 @@ export function createRemoteHttpApp(
   app.get(mcpPath, protect, methodNotAllowed);
   app.delete(mcpPath, protect, methodNotAllowed);
 
+  // Keep this LAST, and here rather than in each caller, so that a failure raised by the framework
+  // itself — an oversized or unparseable body, an unsupported charset — reaches it instead of
+  // Express's default handler, which renders err.stack into the response body.
+  hardenErrorSurface(app);
+
   let httpServer: NodeHttpServer | undefined;
+  let starting = false;
+  let binding: Promise<unknown> | undefined;
   return {
     app,
-    // BUG-12: REJECT on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
+    // Keep rejecting on a bind failure (EADDRINUSE, EACCES, bad host) instead of resolving a
     // never-bound server (address() === null) the composition root cannot detect, retry, or
     // cleanly shut down. Express 5 (`app.listen`) wraps our callback in `once()` and ALSO
     // registers it as `server.once('error', done)` BEFORE we can attach our own listener — so on
@@ -147,28 +260,70 @@ export function createRemoteHttpApp(
     // belt-and-suspenders for any error path that skips the callback; the success branch removes
     // it so a later runtime error on the live server cannot reject an already-settled promise.
     // `httpServer = s` is set synchronously so close() can still find it.
-    listen: (port, host = '127.0.0.1') =>
-      new Promise<NodeHttpServer>((resolve, reject) => {
-        const s = app.listen(port, host, (err?: Error) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          s.off('error', reject);
-          resolve(s);
-        });
-        s.once('error', reject);
-        httpServer = s;
-      }),
-    close: async () => {
-      await presence?.stop(); // best-effort goodbye
-      await new Promise<void>((resolve, reject) => {
-        if (httpServer === undefined) {
-          resolve();
-          return;
+    listen: (port, host = '127.0.0.1') => {
+      // Keep a live socket from being orphaned by a second start: overwriting `httpServer` would
+      // leave the first one bound forever, serving past close(). Latch this SYNCHRONOUSLY rather
+      // than reading `server.listening`, which stays false for the whole window between
+      // `app.listen` and its `listening` event — two overlapping starts both pass that check. A
+      // bind failure clears the latch, so a failed listen stays retryable.
+      if (starting || httpServer?.listening === true) {
+        return Promise.reject(new Error('remote HTTP server already listening'));
+      }
+      starting = true;
+      const bound = new Promise<NodeHttpServer>((resolve, reject) => {
+        const failed = (err: Error): void => {
+          starting = false;
+          reject(err);
+        };
+        // Keep the bind inside this try, so that EVERY way it can fail lowers the latch. Node has
+        // three channels for one bind failure — a synchronous throw (ERR_SOCKET_BAD_PORT on a port
+        // out of range), the callback's error argument, and an 'error' event — and a latch released
+        // on only some of them leaves a retryable failure poisoning the server until close().
+        try {
+          const s = app.listen(port, host, (err?: Error) => {
+            if (err) {
+              failed(err);
+              return;
+            }
+            s.off('error', failed);
+            resolve(s);
+          });
+          s.once('error', failed);
+          httpServer = s;
+        } catch (err) {
+          failed(err as Error);
         }
-        httpServer.close((e) => (e ? reject(e) : resolve()));
       });
+      // Keep this recorded for close(), so that a teardown arriving mid-bind can WAIT for the bind
+      // instead of reading `s.listening === false` and walking away from a socket that is about to
+      // exist with nothing left to stop it.
+      binding = bound.catch(() => undefined);
+      return bound;
+    },
+    // Keep close() a no-op on a server that is not up — never listened on, bind failed, or already
+    // closed — so that a `try { await listen() } finally { await close() }` root, or a signal
+    // handler racing an explicit shutdown, cannot turn teardown into a fatal
+    // ERR_SERVER_NOT_RUNNING. Dropping the reference is what makes it both idempotent and
+    // re-listenable.
+    close: async () => {
+      await binding;
+      binding = undefined;
+      const s = httpServer;
+      httpServer = undefined;
+      starting = false;
+      if (s === undefined || !s.listening) return;
+      s.closeIdleConnections();
+      // Keep this deadline armed: `s.close()` alone resolves only once every in-flight request has
+      // finished, and a long-poll's is measured in tens of seconds.
+      const cutoff = setTimeout(() => s.closeAllConnections(), CLOSE_GRACE_MS);
+      cutoff.unref?.();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          s.close((e) => (e ? reject(e) : resolve()));
+        });
+      } finally {
+        clearTimeout(cutoff);
+      }
     },
   };
 }

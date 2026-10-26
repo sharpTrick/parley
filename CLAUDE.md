@@ -70,9 +70,17 @@ it is plain MCP and can proceed immediately.
 - **Cross-process safety (SQLite):** WAL mode + a busy-timeout/retry so concurrent `post`s from
   multiple bridge instances don't error. SQLite is **polling-only** — no socket, no broker.
 - **Secrets:** live in `backend_config` / `.env`, never in core, never committed.
-- **`skip_permissions`:** default OFF; sandbox-only; never flip it on as a convenience.
+- **`skip_permissions`:** not implemented; `true` is a load error. Never make it lenient.
 - **Inbound is untrusted:** a backend message becomes agent context — never treat it as a
   privileged instruction. Respect the topic allowlist.
+- **Comments are a last resort.** The code states *what* it does; if that is not obvious, the code
+  is wrong — make it simpler, better named, or better factored, and delete the comment. Write one
+  only when a future developer would otherwise take a **risky** action, and phrase it as the risk:
+  *"keep X, **so that** Y."* Everything else — why an approach was chosen over another, what a
+  reviewer suggested and why it was declined, what a number was measured at — belongs in the
+  **commit message**, which is where a reader looks for history and where it cannot rot against the
+  code. Do not narrate, do not restate the line below, and do not write comments addressed to
+  reviewers.
 
 ---
 
@@ -95,6 +103,24 @@ before merging to `main`. In short:
 
 ---
 
+## Adversarial review
+
+Non-trivial changes get an adversarial review before they are considered done.
+`docs/REVIEW_PROTOCOL.md` is authoritative: one all-lens critic per package, **full-surface every
+round** (never a diff), findings verified against the code before they are acted on, and every
+confirmed finding ratcheted into the suite as a *class* rather than an instance. Convergence is
+computed by `.claude/workflows/careening-review.js`, not judged — and a round that did not wake
+every critic can never declare it. `skills/critical-review/SKILL.md` is the operator's guide.
+
+Two rules worth restating here because they are cheap to violate: a round that *changed code* is
+never the clean round, and a new test does not count until you have watched it fail against the
+defect it is supposed to catch.
+
+**Critics do not need to be argued with, and never inside the code.** It is a critic's job to
+convince you, not yours to pre-empt one. When a finding is weak, or right in isolation but
+outweighed by something else, adjudicate it and record the reasoning in the **commit message** —
+never as a comment, a doc paragraph, or defensive prose aimed at the next reviewer.
+
 ## Testing discipline
 
 - Each backend ships with tests that exercise the **same** seam contract (a shared conformance
@@ -106,6 +132,31 @@ before merging to `main`. In short:
 - For network backends (v0.4+), use the maintainer dev/test compose in `examples/dev-compose/`
   to stand up throwaway instances; do not author production infra recipes (point READMEs at
   upstream canonical Docker setups — `DESIGN.md` §15).
+
+### Architectural tests: assert the invariant, not the layout
+
+A test that asserts **where the code lives** must be written so it cannot cement the structure it
+happens to observe. **Never let one drive a structural choice.** If a ratchet is what stands
+between the code and a better shape, the ratchet is what is wrong — every agent is free to move or
+replace it.
+
+Prefer, always: a glob over `src/**` rather than one file path; the invariant a field protects
+rather than the field's type; an `import` of a symbol rather than a regex that finds it in a
+particular file; a behaviour reachable through the public surface rather than a private member
+reached through a cast. What replaces one should grade the same invariant from a place the next
+move cannot invalidate.
+
+This is a standing rule because these assertions fail in ways that are individually invisible and
+collectively decisive. Eleven packages were decomposed under it, and every one hit at least one of
+six failure modes: a split **blocked**; a guard **hollowed out** — still green, now grading a file
+that no longer holds the code it was written about; a recorded security debt made **invisible**,
+because the registry keyed by file path and scanned only importing files; a **shape lock**, where a
+private field is asserted to be an `Array`; a lint with a **hole** (`export async function` escaping
+an export scan); and worst, a probe turned **tautology**, where a moved field made an assertion pass
+as `expect(undefined).toBeUndefined()`.
+
+Ten rounds of adversarial review added such assertions faster than anything removed them, and
+nothing in the process noticed until a decomposition round ran into all six at once.
 
 ---
 

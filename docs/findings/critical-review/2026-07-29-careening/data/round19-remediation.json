@@ -1,0 +1,192 @@
+{
+  "round": 19,
+  "phase": "remediation",
+  "base": "3c6fe75",
+  "blockingFindings": 32,
+  "closed": 32,
+  "status": "COMPLETE — every landed diff mutation-replayed",
+  "runShape": "Second round at full fan-out, and the first where the fan-out was total: eight agents covering all thirteen package-scoped targets dispatched concurrently, then the repo target last and alone. The repo agent was based on the POST-remediation tree rather than the round's base, so its cross-package guards graded the twelve sibling commits rather than a tree that no longer existed.",
+  "wrongPrescriptions": {
+    "note": "Round 19 produced nineteen more, none caught by any test suite. Running total across rounds 9-19 is 89 — a sound FORWARD sum (43 stated for 9-16, +13, +14, +19) from a soft anchor: the 43 cannot be reconstructed from the component records, which sum to >=32 for rounds 9-15 against a stated 29, and round 16 gives three mutually inconsistent counts (note says nine, cases list eleven, running total implies fourteen). The inspectable case-level corpus is 65; ~82 including round 15's twelve named cases and round 9's five prose cases. Treat 89 as +-5.",
+    "cases": [
+      {
+        "target": "zulip",
+        "mode": "the diagnosis is refutable from the vendor's own source, and following it would corrupt the fixture",
+        "detail": "anchor-newest-modelled-as-infinity-disarms-a-flag claimed the fake's POSITIVE_INFINITY for anchor=newest disarmed include_anchor, and that the mutation would make every sinceless fetchRecent silently omit the newest message against a real Zulip. Upstream zerver/lib/narrow.py: `newest` maps to LARGER_THAN_MAX_MESSAGE_ID, a SENTINEL, not the newest matching id; anchored_to_right then skips the id filter entirely and guards `before_limit += include_anchor` behind `if not anchored_to_right`; post_process_limited_query sets anchor_rows = []. include_anchor is a provable no-op on that read. The fake was FAITHFUL. The measurement half — a flag graded by a some() any one request can satisfy — still stood and was ratcheted per request shape."
+      },
+      {
+        "target": "postgres",
+        "mode": "the prescribed mechanism cannot work, and the reason disproves the diagnosis with it",
+        "detail": "The prescription was to walk pool._clients on the give-up path. pg-pool's _pulseQueue empties that array SYNCHRONOUSLY and calls _endCallback() before the per-client end()s complete, so pool.end() RESOLVES with every socket still open and the array is already empty when the give-up fires. The filed diagnosis was also half wrong: the idle-pooled row never reaches the give-up path at all — disconnect() resolved in 0 ms with a live socket, where the finding predicted a 5 s deadline."
+      },
+      {
+        "target": "telegram",
+        "mode": "the prescribed fix is measurably worse than no fix on the axis it was written for",
+        "detail": "Evict-oldest-first was implemented literally and run: the sweep row reports `expected 2500 to be less than or equal to 257`. An LRU bounds the map and leaves the LOG exactly as unbounded as before, because a caller recycling names buys back every line the throttle exists to withhold."
+      },
+      {
+        "target": "core-seam",
+        "mode": "the load-bearing premise is false — the fixture fix does not restore the ability to see the class",
+        "detail": "The finding said gating the fake 'restores the suite's ability to see the class'. With the gate in place, its OWN mutation (swapping presence?.stop() and plugin.disconnect() in stdio-bridge) left all 3386 tests green. Nothing anywhere asserted that a goodbye reaches the presence topic through a composition root's teardown. The fixture fix restores the ability to FAIL; a new assertion was required to exercise it. Measured both ways."
+      },
+      {
+        "target": "core-seam",
+        "mode": "the one stated live risk does not exist",
+        "detail": "The remediationCheck's single named risk was that 'the two examples/* workspaces are in publicWorkspaces() but not under packages/'. Running the release's own module: publicWorkspaces() returns exactly 13 entries, every one under packages/. No examples/* workspace is public."
+      },
+      {
+        "target": "redis",
+        "mode": "a row of the prescribed corpus does not do what the prescription says",
+        "detail": "The prescription's fourth hostile shape was a null-prototype object, said to throw in the renderer. It does not — JSON.stringify renders it fine. Replaced with a shape that does: a null-prototype object whose toJSON returns undefined, so JSON.stringify yields undefined and the `?? String(value)` fallback throws too."
+      },
+      {
+        "target": "repo",
+        "mode": "the prescribed guard is the layout-shaped assertion the repo's own standing rule bans",
+        "detail": "hardcoded-package-list-in-repo-wide-lint asked for a scanner hunting every *.test.ts for 'an array literal of package-name-shaped strings whose length is within one of readdirSync(packages).length'. A Set, a union type, or two arrays walk straight through it, and it cements layout. Replaced by an EXECUTED derivation run against a planted tree."
+      },
+      {
+        "target": "repo",
+        "mode": "the prescribed fix is correct in spirit and wrong at one boundary",
+        "detail": "literal-only-path-scan said 'resolve the literal prefix, then flag if any package directory is a prefix-match of the resolved head'. The head must be cut at the last complete DIRECTORY, or a wildcard INSIDE a segment (../../beta-${x}/src) resolves to packages/beta-, a prefix of no package, matching nothing. That control row stayed green until the cut was added."
+      },
+      {
+        "target": "repo",
+        "mode": "the prescribed shared helper crosses a line core has written down about itself, and enforces nothing once it is parameterised",
+        "detail": "shared-config-key-divergent-contract prescribed normalizeRetentionDays in bridge-core. backend-config-keys.ts states its own limit — 'Core is handed the NAMES and never their meanings' — and a function named after one backend_config key's MEANING is the first crossing. With the bounds passed in it enforces nothing (redis passes its own floor and the divergence returns); with core owning the floor, core owns a retention policy for four of ten backends. And it is opt-in: a fifth backend need never call it. Declined; the agreement is held by a mandatory conformance matrix instead."
+      },
+      {
+        "target": "discord",
+        "mode": "the prescription asks for two guards each independently sufficient, so neither can be reddened alone",
+        "detail": "It asked for widening the post-wait guard AND capturing the generation in pager(). The pager guard subsumes the post-wait one. Took the pager guard and left the other exactly as it was, so `stopped` covers disconnect() and the generation covers connect() — the two partition the axis instead of masking it. Both confirmed independently mutatable."
+      },
+      {
+        "target": "discord",
+        "mode": "a clause of the prescription does not reproduce",
+        "detail": "Its third clause said subscribe() must capture the generation. subs.set() runs before any await and connect()'s forgetTopics() clears it, so the entry is lost, never transplanted. The residual there is the OPPOSITE defect — a subscribe that resolves having silently lost its subscription — which is not this finding and was left unfiled rather than fixed unreviewed."
+      },
+      {
+        "target": "slack",
+        "mode": "the prescribed refusal would fail every catch-up on every channel if the unprobeable vendor reading is the other one",
+        "detail": "It asked for a THROW on any entry at or below `since`, 'consistent with the ordering guard'. The ordering guard throws because a walk that cannot trust position as age can conclude nothing; this one CAN — two ts values and the plugin's own comparator give a definite answer. Slack is hosted SaaS and cannot be probed, and if slack.com counts the boundary entry as inside the window that throw is permanent and total. A filter is correct under the documented reading and under both deviations."
+      },
+      {
+        "target": "slack",
+        "mode": "the prescribed fix would break the assertions that grade the request",
+        "detail": "Its first option was to teach decodeFormValue to return booleans for 'true'/'false'. Every form value is a string on the wire and the suite's whole-body assertions compare strings, so a global decode would rewrite unrelated fields and redden the very rows that grade the request."
+      },
+      {
+        "target": "xmpp",
+        "mode": "the prescribed minimal arm closes only part of the window",
+        "detail": "Measured both ways: with the wake source armed after the join (the prescribed fix) a reflection landing in that window parked the full 4006 ms with ZERO waiters registered; armed at the top of fetchRecent, 653 ms with one waiter. ensureJoinedRoom resolves only after a disco#info that runs after the server has admitted this connection, so live groupchat reaches fireWaiters INSIDE it."
+      },
+      {
+        "target": "core-engine",
+        "mode": "the prescription stopped at two of three instances of its own class",
+        "detail": "It named heartbeatMs and goodbyeTimeoutMs. pollIntervalMs is the same class and was unguarded above the ceiling AND at 0.5, where its old guard was `> 0`. Measured: blockMs 3e9 with pollIntervalMs 2**31 gives 287 backend fetches in 300 ms instead of ~6."
+      },
+      {
+        "target": "matrix",
+        "mode": "the second premise does not reproduce",
+        "detail": "It claimed backfill re-deriving `const generation = this.generation` lets a stale loop issue up to 50 authenticated /messages pages under the NEW generation's token. Measured: 0 pages after the reconnect. backfill reads this.generation synchronously at entry and the only path to it is synchronously after the loop's own isStale break — nothing interleaves between two synchronous statements."
+      },
+      {
+        "target": "shared",
+        "mode": "one of the three named assertions is redundant rather than uncovered",
+        "detail": "assertions.ts:50 is covered: every one of its three call sites asserts content itself first, and the property has its own control. No contrived variant was manufactured for it and it was not deleted — it is defence-in-depth for a future caller that does not check content itself."
+      },
+      {
+        "target": "nats",
+        "mode": "the prescribed second guard is unnecessary and would have created the asymmetry the finding is about",
+        "detail": "It asked for a pre-round-trip re-check plus 'a second, narrower guard is likely also needed'. One guard with three independently falsifiable terms covers both interleavings. The `blocking` term is what keeps the branches symmetric: without it a read with no block_ms would have had its fault swallowed too — the same asymmetry, in the other direction."
+      },
+      {
+        "target": "zulip",
+        "mode": "the residual the prescription calls rare is the common case",
+        "detail": "It called 'a page with zero nameable records' a residual. It is reachable by an ordinary fetchRecent({limit:1}) whose newest record is mangled, so it is the common small-limit case. Widening to the server cap from the same anchor was required, not optional."
+      }
+    ],
+    "modeShiftClaimCorrected": "CORRECTION to this record's earlier claim, and to the README paragraph that repeated it. The claim was that the modes shifted from 'this fix is weak' to 'this fix is impossible, would make things worse, or rests on a fact that is false'. Coded over all 57 machine-readable cases in rounds 16-19, that shift IS NOT IN THE DATA: the strong-mode share (premise-false + mechanism-cannot-work + worse-than-no-fix) oscillates 50-69% with no trend, and round 13 — the EARLIEST round with a case-level record — is the highest in the series at 88%, its eight cases being almost all 'worse' or 'impossible'. What did move, both monotonically: (1) the RATE of wrong prescriptions, 18% of blocking findings at round 9 to 59% at round 19 (18, 17, 24, >=40, ~32, 43, 45, 59); and (2) the EVIDENTIARY BASIS on which they were disproved — cases settled by executing something rather than by reading and arguing went 9% (r16), 31% (r17), 36% (r18), 63% (r19). The modes did not change kind; the FIXERS CHANGED METHOD, which is what this record's own scannersReplacedByExecutions block describes. The most accurate one-line summary of the corpus is round 19's other sentence: the dominant mode is a critic being right about the measurement and wrong about the cause — 30% of cases, the largest bucket."
+  },
+  "guardsCorrectInFormWrongAboutTheirSubject": {
+    "note": "Round 19's defining shape, and the reason the repo target was the sharpest set of the run: three of its five findings were guards that grade the whole repo and exempt themselves. Two came with mutations the critic had already run and watched pass green.",
+    "cases": [
+      {
+        "target": "repo",
+        "detail": "source-hygiene's backend roster was hand-written, and the only assertion tying it to anything was satisfied by rows generated from the array itself. Removing 'telegram' and putting a backend name into core prose left 80 cases green — and repo-contract plus package-boundaries green at 197 under the same mutation."
+      },
+      {
+        "target": "repo",
+        "detail": "package-boundaries extracted paths with three regexes that saw only fully-literal spellings, the template one excluding `$` outright. Four escapes measured: an interpolated template yields [], join() with a variable segment yields ['../../src'], and both concatenations yield ['../../'] — the packages root, an accepted row."
+      },
+      {
+        "target": "core-seam",
+        "detail": "packaging.test.ts simulated the tarball with a files-glob rather than reading npm pack, and NOTHING in the repo had ever imported a built entrypoint — every test resolves src/ through the vitest alias, so a dist/index.js that exists and throws shipped green."
+      },
+      {
+        "target": "shared",
+        "detail": "The conformance suite never reconnects. A counting fixture wrapped around every case shows connect() is called exactly once per fixture across all 32 cases, so no clause can observe a cursor crossing a connection boundary and a plugin whose cursor namespace is per-connection is certified in full."
+      },
+      {
+        "target": "zulip",
+        "detail": "Three untrusted-payload rows were passing because 1e18 happened to work as a COORDINATE in the fake's own id arithmetic — they were grading the fixture's filter, not the plugin's walk."
+      }
+    ]
+  },
+  "scannersReplacedByExecutions": {
+    "note": "Every class-level ratchet added this round that could have been a scan was written as a run instead. This is now the default rather than a preference, and it was added to the shared contract as 'prefer running the thing to scanning for it' before the round began.",
+    "cases": [
+      {
+        "target": "core-seam",
+        "detail": "The consumer-typecheck rule is a real tsc against a pruned install rather than a regex over dist/**/*.d.ts, because a scanner goes blind on import() types, triple-slash references, and anything a .d.ts pulls in transitively. Cost measured at 1.7-2.2s per workspace, ~24s for the file."
+      },
+      {
+        "target": "core-engine",
+        "detail": "The degenerate timer vector is MEASURED: a case arms a real setTimeout with each too-large value and asserts it fires within 50 ms despite naming >= 24 days, with MAX_TIMER_MS itself as the control that does not fire. And `timerBacked` is DERIVED by wrapping global setTimeout/setInterval and comparing the set of knobs that armed a timer with their own value against the set marked."
+      },
+      {
+        "target": "repo",
+        "detail": "The skip_permissions guard runs every yaml block in every root document through the real parseConfig, and derives WHICH keys to grade by asking the loader which boolean it refuses at that key's own path with a not-implemented reason."
+      },
+      {
+        "target": "repo",
+        "detail": "The backend-roster derivation is executed against a planted tree holding a new backend beside bridge-core and bridge-net-util; the rule built from it must name the first and neither of the others."
+      },
+      {
+        "target": "shared",
+        "detail": "The negative-control registry requires every diagnosed assertion to appear in some broken variant's failureMessages in the child report — a registry can be satisfied by declaring a mapping; this can only be satisfied by a plugin that really reaches the line."
+      }
+    ]
+  },
+  "regressionIntroducedAndCaught": "Two, both by the independent diff guard, both real, both measured before being accepted. In repo, the first boundary regex `(?<![\\w@/-])` silently WEAKENED the lint versus the `\\b` it replaced — packages/bridge-redis/src/schema.ts, ../../bridge-nats/src/config.js and my-bridge-redis all fired at base and were green under it; all three forms were measured side by side and replaced with a strictly stronger one. In core-engine, Number.isInteger was shipped, flagged as unpaid narrowing, and withdrawn on re-measurement — a fraction INSIDE the range merely truncates (1500.5 -> 1500 ms); only the two ends collapse to ~1 ms. The same guard also caught MAX_TIMER_MS on the public barrel, against this same round's own published-exports-kept-for-nobody finding.",
+  "theThirdFiling": "shipped-d-ts-type-imports-a-devdependency was filed twice, once as the guard that misses it and once as the manifest that causes it. Built as a real compile against a pruned install and run over all 13 workspaces BEFORE any manifest edit, 12 failed on THREE independent root causes: @types/express in bridge-core (propagating to all 11 dependents), @types/pg in bridge-postgres, @types/ws in bridge-slack. Only bridge-net-util was clean. Every published .d.ts in the repo except one package's was importing a type package no consumer install would carry. The reason the repo could not see it is itself the lesson: the prune must COPY each workspace, not symlink it — a symlink realpaths back into the repo, walks up to the hoisted node_modules, and resolves the exact types the rule exists to withhold.",
+  "declinedAndEscalated": {
+    "note": "Two changes were confirmed and deliberately NOT landed, both under the standing rule that a change to what conformance asserts about the seam is escalated rather than absorbed. This is the first round where a confirmed blocking finding was closed by surfacing it with a costed plan instead of by fixing it.",
+    "cases": [
+      {
+        "target": "shared",
+        "finding": "cursor-durability-across-reconnect-ungraded",
+        "detail": "Confirmed by measurement, not argument. Not landed: it needs a new ConformanceContext field (a second, independently-connected plugin); factory.ts's doctrine is that every capability field is REQUIRED and context-validation.test.ts asserts optionalFields() is exactly ['absentTopicBehaviour'], so it cannot be optional and assertConformanceContext would fail in eleven backend packages until each supplied it. It also adds a 22nd CLAUSE. Recommended shape recorded for scheduling."
+      },
+      {
+        "target": "repo",
+        "finding": "redis null-as-omitted selects an unauthenticated default",
+        "detail": "Larger than the filed retention finding and security-relevant: redis's null-as-omitted is a package-wide convention covering url, key_prefix, block_ms and connect_timeout_ms, so `url: null` falls through to redis://127.0.0.1:6379 — silently pointing the bridge at an unauthenticated localhost server, the precise failure the comment three lines above normalizeString says the empty-string rejection prevents. Reversing it reverses another package's documented, live-tested convention across four knobs. The same shape exists on telegram's api_url. Recorded in the exception map and flagged for the next round."
+      }
+    ]
+  },
+  "fixtureFirstOrdering": "Round 18's xmpp lesson held a second and third time, and this round it was tested deliberately rather than discovered. In zulip the fixture was checked FIRST and that was decisive: finding 1's own reproduction case measured GREEN because the fake never served the bad record, and measured RED once the fake was fixed. Fixing the plugin first would have made a real fix indistinguishable from a no-op. In slack the fixture defect did not mask its sibling, but the fixture could not EXPRESS any vendor reading other than the documented one, so fixing it is what made the sibling's ratchet writable at all. In discord the two were genuinely disjoint, which was established by measurement rather than assumed.",
+  "environmentalDefectFoundAtTheGate": {
+    "note": "The one gate round 19 deliberately did not claim — matrix live conformance — turned out to be measuring the test environment rather than the code, and the first explanation for it was wrong. Recorded because it would have corrupted round 20 silently: accumulated server state gets worse every round, where contention does not.",
+    "sequence": [
+      "Under load, matrix conformance failed 5, then 17, then 25 of 32. A control on the UNTOUCHED base tree failed 12 of 32, which correctly established that the round-19 remediation was not the cause.",
+      "That control was read as CPU/service contention. The attribution was wrong.",
+      "The re-gate on a quiet machine, nothing else running, failed 10 of 32 — barely different from 12 under full load. Contention was refuted.",
+      "The Synapse access log showed the shape: repeated backward /messages pagination on ONE room, 500 events per page at ~0.87s per page, walking t3809 -> t3572 -> t3328 -> ... and ending in 'already disconnected'.",
+      "The database gave the number: one room held 14,881 of the server's 17,789 events — 84% — while every other room held exactly 14.",
+      "Cause: the shared-room-mode alias is deterministic, so every conformance run for 15 hours adopted the SAME room instead of a fresh one. 14,881 events at ~500/page and ~0.87s/page is ~26s against a 20s timeout. The arithmetic matches the failure exactly.",
+      "After wiping the throwaway Synapse volume and re-bootstrapping through the repo's own dev-infra.sh: 32/32 passed in 10.95s, against 361s with 10 failures immediately before. A 33x speedup and full green."
+    ],
+    "lessonForTheInstrument": "A live-service gate can degrade monotonically across rounds while every per-round control still says 'not this change'. The control that was run — base tree versus changed tree — was the right control for the question asked (did the remediation break it) and useless for the question that mattered (is the gate still measuring the code). A round that reuses a stateful service needs a control against a FRESH service, not only against an unchanged tree.",
+    "notFiled": "A production shared-room deployment would hit the same wall: the room grows without bound and catch-up walks it. Deliberately NOT filed by the operator mid-remediation — round 20's critics review this surface full-scope, and finding it independently is a stronger result than planting it."
+  }
+}

@@ -1,0 +1,154 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from 'vitest';
+import { inboundTrustBreach } from '../inbound-trust.js';
+import { CATCH_UP_TERMINAL_CONDITION, TOOL_TEXT } from './tools.js';
+
+/**
+ * A skill Parley ships is agent context: `skills/<name>/SKILL.md` is executed verbatim by whatever
+ * reads it, so the DESIGN §14 trust boundary has to be stated where the agent will see it, and
+ * cannot come to say the opposite. Graded on MEANING by {@link inboundTrustBreach} — a reworded
+ * boundary is accepted, a weakened, carved-out or inverted one is not, and a skill it cannot place
+ * is refused rather than passed.
+ *
+ * The skill SET is discovered, not listed, so a new skill arrives as a red row rather than shipping
+ * ungraded, and the exemption below is graded against the skill's own text rather than taken on
+ * trust.
+ *
+ * Proof it can fail: reword chat-handoff's Safety section to grant topic content instruction
+ * authority, or delete it, and this reds — on the grant and on the refusal respectively.
+ */
+const REPO = fileURLToPath(new URL('../../../../', import.meta.url));
+const SKILLS = `${REPO}skills/`;
+
+const discovered = (): string[] =>
+  readdirSync(SKILLS, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .sort();
+
+/**
+ * Skills that never reach an agent acting on backend traffic, and why. A skill here is not graded;
+ * anything else is. Recorded rather than inferred, so adding a skill is a decision someone makes on
+ * the record instead of a default — and the exemption is checked against the skill's own text below
+ * rather than taken on trust.
+ */
+const NO_AGENT_CONTEXT: Record<string, string> = {
+  'critical-review': 'an operator runbook for this repo; it reads no topic and instructs no agent',
+};
+
+const skillText = (skill: string): string => readFileSync(`${SKILLS}${skill}/SKILL.md`, 'utf8');
+
+/** The fenced block CONVENTIONS.md tells operators to paste into another repository's `CLAUDE.md`. */
+const pastedSnippet = (): string | undefined =>
+  /```md\n([\s\S]*?)```/.exec(readFileSync(`${REPO}docs/CONVENTIONS.md`, 'utf8'))?.[1];
+
+const graded = (): string[] => discovered().filter((s) => !(s in NO_AGENT_CONTEXT));
+
+describe('every shipped skill tells an agent that topic content is data', () => {
+  it('finds skills to check (guards against a broken discovery)', () => {
+    expect(discovered().length).toBeGreaterThan(0);
+    expect(graded().length).toBeGreaterThan(0);
+  });
+
+  it('records no exemption for a skill that no longer exists', () => {
+    const stale = Object.keys(NO_AGENT_CONTEXT).filter((s) => !discovered().includes(s));
+    expect(stale, 'NO_AGENT_CONTEXT names a skill the repo no longer ships').toEqual([]);
+  });
+
+  /**
+   * The exemption, graded against the artifact rather than against the sentence written beside it.
+   * "Never reaches an agent acting on backend traffic" is a claim about the text, and a skill that
+   * drives a `parley_` tool is acting on backend traffic whatever the note says — so the note alone
+   * could silence a skill with no signal anywhere that it had been silenced.
+   */
+  it.each(Object.keys(NO_AGENT_CONTEXT))('%s really instructs no agent about a topic', (skill) => {
+    expect(
+      [...skillText(skill).matchAll(/parley_\w+/g)].map((m) => m[0]),
+      `${skill} is exempt from the safety check because it "${NO_AGENT_CONTEXT[skill] ?? ''}", ` +
+        'but it names Parley tools — so it does reach an agent acting on backend traffic, and the ' +
+        'exemption is silencing the check rather than recording a fact',
+    ).toEqual([]);
+  });
+
+  it.each(graded())('%s states the untrusted-input boundary', (skill) => {
+    expect(
+      inboundTrustBreach(skillText(skill)),
+      `${skill}/SKILL.md ships into agent context, and the DESIGN §14 untrusted-input boundary is ` +
+        'what stops a topic message being read as an instruction',
+    ).toBeUndefined();
+  });
+
+  /**
+   * The pasted snippet is agent context in a repository this suite will never see, so it has to
+   * carry the boundary on its own — nothing around it travels with it.
+   */
+  it('the CLAUDE.md snippet CONVENTIONS.md ships into other repos states the boundary too', () => {
+    const snippet = pastedSnippet();
+    expect(snippet, 'CONVENTIONS.md no longer ships a ```md snippet to paste').toBeDefined();
+    expect(inboundTrustBreach(snippet!)).toBeUndefined();
+  });
+
+});
+
+/** Whitespace-insensitive, so a markdown reflow is not a failure and a reworded clause is. */
+const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Every shipped artifact that teaches an agent to drive `parley_fetch_recent`, DISCOVERED rather
+ * than listed. `docs/` is read non-recursively, so the review archive under `docs/findings/` — which
+ * quotes the tool by name in every round's JSON — is not mistaken for an instruction to an agent.
+ */
+const teachesTheLoop = (): Array<[rel: string, text: string]> =>
+  [
+    ...readdirSync(`${REPO}docs`, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.md'))
+      .map((e) => `docs/${e.name}`),
+    ...discovered().map((s) => `skills/${s}/SKILL.md`),
+  ]
+    .map((rel): [string, string] => [rel, readFileSync(`${REPO}${rel}`, 'utf8')])
+    .filter(([, text]) => text.includes('parley_fetch_recent'))
+    .sort();
+
+/**
+ * A byte-pin detects that a shipped skill CHANGED; it can never detect that it is FALSE. The skill
+ * above shipped a catch-up procedure with no terminal condition at all, and stayed pinned, green and
+ * wrong, while `docs/CONVENTIONS.md` and the tool description carried the correction — an agent
+ * executing it reached 0 of 3 missed messages on live Synapse.
+ *
+ * So the condition is ONE exported statement and every artifact that teaches the loop is graded
+ * against it. Correcting it in one place and not the others is what reddens.
+ */
+describe('one statement of the catch-up terminal condition, read by everything that teaches it', () => {
+  const artifacts = teachesTheLoop();
+  const rels = artifacts.map(([rel]) => rel);
+
+  it('finds the artifacts that teach it (witness: the skill and the convention doc)', () => {
+    expect(rels).toEqual(
+      expect.arrayContaining(['docs/CONVENTIONS.md', 'skills/chat-handoff/SKILL.md']),
+    );
+  });
+
+  it('the tool description core sends the model is built from it', () => {
+    expect(flat(TOOL_TEXT.fetch_recent)).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
+  });
+
+  it.each(rels)('%s states it, in those words', (rel) => {
+    expect(
+      flat(artifacts.find(([r]) => r === rel)![1]),
+      `${rel} teaches an agent to call parley_fetch_recent but does not state the terminal ` +
+        'condition CATCH_UP_TERMINAL_CONDITION holds. An agent that stops on the first EMPTY page ' +
+        'reaches none of what it missed on a backend whose history read is coarser than one topic',
+    ).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
+  });
+
+  /**
+   * Grade the pasted snippet on its own: the prose around it satisfying the row above says nothing
+   * about what was copied out.
+   */
+  it('the CLAUDE.md snippet CONVENTIONS.md ships into other repos states it too', () => {
+    const snippet = pastedSnippet();
+    expect(snippet, 'CONVENTIONS.md no longer ships a ```md snippet to paste').toBeDefined();
+    expect(flat(snippet!)).toContain(flat(CATCH_UP_TERMINAL_CONDITION));
+  });
+});

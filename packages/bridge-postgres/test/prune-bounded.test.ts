@@ -1,0 +1,86 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PostgresPlugin } from '../src/index.js';
+import { sleep } from './pg-harness.js';
+
+// Retention is enabled on a table that already exists — typically one that has been accumulating
+// forever, because "keep every message" is the default. The first prune after an operator sets
+// `retention_days` therefore has the whole backlog to remove. Deleting old rows never blocks
+// inserting new ones under MVCC, so it is not post()'s locks that are at stake; what is, is that
+// one statement over millions of rows keeps a single transaction — and a snapshot that holds
+// vacuum off — open for as long as it runs, on a pooled connection post() shares for the same
+// span. So the property is not "the old rows are gone" — the real-server cases cover that — it is
+// that the work is issued in BOUNDED statements and still completes exactly.
+
+const state = vi.hoisted(() => ({
+  /** Rows still older than the cutoff; each DELETE removes up to its own LIMIT. */
+  remaining: 0,
+  deletes: [] as string[],
+}));
+
+vi.mock('pg', async () => {
+  const { FakeIdleClient, fakePool } = await import('./fake-pg.js');
+
+  const poolQuery = async (sql: string): Promise<{ rows: unknown[]; rowCount: number }> => {
+    if (!/^\s*DELETE/.test(sql)) return { rows: [], rowCount: 0 };
+    state.deletes.push(sql);
+    const limit = /LIMIT (\d+)/.exec(sql);
+    const took = limit === null ? state.remaining : Math.min(state.remaining, Number(limit[1]));
+    state.remaining -= took;
+    return { rows: [], rowCount: took };
+  };
+
+  return {
+    Pool: vi.fn(() => fakePool(poolQuery)),
+    Client: FakeIdleClient,
+  };
+});
+
+const REAL_URL = 'postgres://app:s3cret@db.example.com:5432/prod';
+
+beforeEach(() => {
+  state.remaining = 0;
+  state.deletes.length = 0;
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+// Expressed as multiples of whatever batch size the plugin actually asks for, so the case cannot
+// silently stop testing the boundary when that number is tuned.
+const BACKLOGS = [
+  ['nothing to remove', (b: number) => 0 * b],
+  ['one row', () => 1],
+  ['one under a batch', (b: number) => b - 1],
+  ['exactly one batch', (b: number) => b],
+  ['one over a batch', (b: number) => b + 1],
+  ['several batches', (b: number) => 3 * b + 7],
+] as const;
+
+describe('prune issues bounded statements and still removes the whole backlog', () => {
+  it.each(BACKLOGS)('%s', async (_label, backlogFor) => {
+    const plugin = new PostgresPlugin();
+    await plugin.connect({ url: REAL_URL, retention_days: 1 });
+    await sleep(20);
+    const prune = (plugin as unknown as { prune: () => Promise<void> }).prune.bind(plugin);
+
+    state.deletes.length = 0;
+    state.remaining = 1;
+    await prune();
+    const batch = Number(/LIMIT (\d+)/.exec(state.deletes[0] ?? '')?.[1]);
+    expect(batch, 'prune issued a DELETE with no row cap').toBeGreaterThan(0);
+
+    state.deletes.length = 0;
+    state.remaining = backlogFor(batch);
+    const backlog = state.remaining;
+    await prune();
+
+    expect(state.remaining, 'prune stopped before the backlog was gone').toBe(0);
+    for (const sql of state.deletes) {
+      expect(sql, 'an unbounded DELETE reached the server').toMatch(/LIMIT \d+/);
+    }
+    expect(state.deletes.length, 'statement count').toBe(Math.floor(backlog / batch) + 1);
+
+    await plugin.disconnect();
+  }, 15000);
+});

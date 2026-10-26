@@ -1,47 +1,28 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { Client } from 'pg';
 import { describe, it } from 'vitest';
 import { PostgresPlugin } from '../src/index.js';
-
-const PG_URL = process.env.PARLEY_PG_URL ?? 'postgres://parley:parley@127.0.0.1:5432/parley';
-
-async function isPostgresUp(url: string): Promise<boolean> {
-  const c = new Client({ connectionString: url, connectionTimeoutMillis: 800 });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.query('SELECT 1');
-    await c.end();
-    return true;
-  } catch {
-    await c.end().catch(() => undefined);
-    return false;
-  }
-}
+import { dropTable, isUp, PG_URL, rand } from './pg-harness.js';
 
 let seq = 0;
-const rand = () => Math.random().toString(36).slice(2, 8);
 
-async function makeContext() {
-  const table = `parley_test_${rand()}`;
+// The NOTIFY channel is derived from the topic on BOTH sides (Node and the trigger), so the whole
+// suite is run over topic shapes that stress that derivation — not just the ASCII shape a naive
+// generator emits. Rotating rather than fixing keeps every case seeing several shapes.
+const TOPIC_SHAPES = ['plain', 'café', '日本語', 'room-🚀', 'école'.normalize('NFD'), ' padded '];
+
+async function makeContext(table: string) {
   const plugin = new PostgresPlugin();
   await plugin.connect({ url: PG_URL, table_name: table });
   return {
     plugin,
-    // Postgres honors blockMs natively via LISTEN/NOTIFY (issue #20) — run the long-poll case.
-    supportsBlockingFetch: true,
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    freshTopic: (): Topic =>
+      asTopic(`${TOPIC_SHAPES[++seq % TOPIC_SHAPES.length] as string}-${seq}-${rand()}`),
+    carriesSenderIdentity: true,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
-      // wipe this context's tables + trigger function
-      const admin = new Client({ connectionString: PG_URL });
-      admin.on('error', () => undefined);
-      await admin.connect();
-      await admin.query(`DROP TABLE IF EXISTS ${table} CASCADE`);
-      await admin.query(`DROP TABLE IF EXISTS ${table}_senders CASCADE`);
-      await admin.query(`DROP FUNCTION IF EXISTS ${table}_notify() CASCADE`);
-      await admin.end();
+      await dropTable(table);
     },
     // N independent plugin instances (own pools/connections) against the SAME table — the
     // per-topic advisory lock in post() is what keeps seq order == visibility order here.
@@ -68,8 +49,12 @@ async function makeContext() {
   };
 }
 
-if (await isPostgresUp(PG_URL)) {
-  runConformanceSuite('postgres', makeContext);
+if (await isUp(PG_URL)) {
+  // One representative context. `table_name` reaches the server only during bootstrap — past
+  // `connect()` every seam method behaves identically whatever the stem was — so the accepted-name
+  // shapes are driven end to end once each in table-name.test.ts rather than by re-running all of
+  // this against a second stem.
+  runConformanceSuite('postgres', () => makeContext(`parley_test_${rand()}`));
 } else {
   describe.skip(`seam conformance: postgres (no server at ${PG_URL})`, () => {
     it('skipped — start postgres (examples/dev-compose) to run', () => undefined);

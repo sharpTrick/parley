@@ -163,6 +163,10 @@ auth:
 
     # Rarely needed:
     # jwks_uri: "https://kc.example.com/realms/myrealm/protocol/openid-connect/certs"
+    #   Overrides discovery AND its issuer-origin check, so it is a trust pin. It must be
+    #   https (loopback excepted, for dev fakes) or startup is refused: these are the keys
+    #   every token is verified against, and over http anyone on the path can substitute
+    #   their own and mint a token that passes iss, aud, exp and the identity gate.
     # clock_skew_s: 30                   # exp/nbf tolerance, 0–300
 ```
 
@@ -179,9 +183,10 @@ dispatches on `cfg.auth.mode`; the OIDC composition is also available directly a
 - **Issuer + audience validation is not optional** and cannot be configured off. Audience
   binding is what stops a token minted for some other service in the same realm from reaching
   your bridge (token-passthrough/confused-deputy).
-- **Claim-gate failures return 401, not 403**, and all validation failures share one error
-  message — an unauthorized caller learns nothing about which check failed or what the gate
-  policy is.
+- **Identity-gate failures return 401, not 403**, and every 401 this server emits carries the
+  same error message — an unauthorized caller learns nothing about which check failed or what the
+  gate policy is. `required_scope` is the one deliberate exception, as RFC 6750 requires: an
+  otherwise-valid token that lacks the scope gets 403 `insufficient_scope`.
 - **Configure at least one identity gate.** Without one, every user in the realm who can log
   in can drive your bridge; `allowed_subjects` is the recommended default (`required_role` can
   silently 401 under `fullScopeAllowed=false` — see §3).
@@ -203,10 +208,13 @@ Three tiers cover this mode:
   RS256 JWTs — valid/expired/wrong-aud/wrong-iss/rogue-key tokens, scope and identity gates,
   and full MCP tool calls through the real SDK client. `examples/self-host-remote/test/oidc-smoke.test.ts`
   boots the reference server from YAML alone.
-- **Gated, real Keycloak:** `packages/bridge-core/src/auth/keycloak.e2e.test.ts` self-skips
-  unless a realm answers at `http://127.0.0.1:8080/realms/parley` (override with
-  `PARLEY_KEYCLOAK_URL`). Stand one up with the maintainer dev compose — realm, users, roles,
-  and the audience mapper are imported automatically:
+- **Gated, real Keycloak:** `packages/bridge-core/src/auth/keycloak.e2e.test.ts` runs whenever a
+  realm answers at `http://127.0.0.1:8080/realms/parley` (override with `PARLEY_KEYCLOAK_URL`).
+  It does **not** skip itself when one does not: after waiting 30s for the realm it FAILS, so an
+  unreachable IdP turns the run red instead of quietly verifying nothing. The only way out is the
+  deliberate opt-out `PARLEY_E2E=0`. CI starts keycloak in its dev-compose step, so the gate is
+  always live there. Stand one up with the maintainer dev compose — realm, users, roles, and the
+  audience mapper are imported automatically:
 
   ```bash
   docker compose -f examples/dev-compose/docker-compose.yml up -d keycloak

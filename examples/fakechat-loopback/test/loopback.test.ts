@@ -86,7 +86,7 @@ describe('fakechat loopback (headless)', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'parley_fetch_recent',
-      'parley_list_users',
+      'parley_live_status',
       'parley_post',
       'parley_reply',
     ]);

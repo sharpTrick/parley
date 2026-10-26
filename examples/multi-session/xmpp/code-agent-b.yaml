@@ -1,6 +1,6 @@
 instance_id: "code-agent-b"
 identity:
-  handle: "agent-b"
+  handle: "agent-b"                       # Distinct from code-agent-a.yaml's: on XMPP it IS the sender.
 topics:
   - "ctx-infra"
 catchup:
@@ -12,12 +12,12 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-xmpp
+# Run with: parley-xmpp --config <this file>   (the binary selects the backend)
 backend_config:
-  service: "xmpp://xmpp.internal:5222"   # identical to code-agent-a.yaml
+  service: "xmpps://xmpp.internal:5223"  # identical to code-agent-a.yaml
   domain: "parley.local"                  # identical
   muc_service: "muc.parley.local"         # identical
   username: "parley"                       # identical — fine, see code-agent-a.yaml's nick note
   password: "change-me"                    # identical
-  # `nick` left unset here too — this session gets its own random nick automatically. Do NOT
-  # copy a pinned `nick` value from another config; see code-agent-a.yaml for why.
+  # `nick` left unset here too — this session posts as its own `identity.handle` ("agent-b").
+  # Do NOT copy a pinned `nick`, or a handle, from another config; see code-agent-a.yaml for why.

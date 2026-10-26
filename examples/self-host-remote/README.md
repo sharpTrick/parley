@@ -45,6 +45,7 @@ origin Claude reaches (issuer = base = resource origin, AS = RS).
 
 ```bash
 PARLEY_ISSUER_URL='https://parley.example.com' \
+PARLEY_TRUST_PROXY='loopback' \
 PORT=3000 HOST=127.0.0.1 \
 PARLEY_CONFIG='examples/self-host-remote/parley.config.yaml' \
 node examples/self-host-remote/server.ts
@@ -57,6 +58,25 @@ parley.example.com {
   reverse_proxy 127.0.0.1:3000
 }
 ```
+
+**`PARLEY_TRUST_PROXY` is not optional once a proxy is in front.** Every OAuth endpoint —
+`/authorize`, `/token`, `/register`, `/revoke` and `/parley/consent` — is rate-limited per client
+address. With the proxy undeclared, that address is the proxy's, so every caller in the world
+shares one bucket: an anonymous attacker sending ~1 request per 90s keeps `/parley/consent` at
+HTTP 429 and locks *you* out of the only path that can authorize the bridge. Set it to
+`loopback` for the Caddy/nginx setup above (the proxy connects from 127.0.0.1), or to the number
+of proxy hops if the terminator is remote. Leave it **unset** when the process is exposed
+directly — then the socket peer really is the client, and trusting a caller-supplied
+`X-Forwarded-For` would let anyone mint a fresh quota per request.
+
+**Single process only, and a restart requires re-consent.** All OAuth state — the dynamic client
+registration Claude created, authorization codes, access tokens, refresh tokens and pending consents
+— lives in memory in this one process. Nothing is persisted, so a restart, crash or redeploy
+invalidates Claude's registration and both of its tokens: reconnect and enter your owner passphrase
+again. Nothing surfaces an error explaining why, so expect it. For the same reason the process
+**cannot be replicated** — pointing the reverse proxy at two instances gives a flow that fails at
+`/token` with `invalid_grant` roughly half the time, because the code was minted by one instance and
+redeemed against the other. Give the one process more room rather than adding replicas.
 
 The server exposes (all under your public origin):
 - `POST /mcp` — the MCP endpoint (Bearer-protected, Streamable HTTP, stateless).

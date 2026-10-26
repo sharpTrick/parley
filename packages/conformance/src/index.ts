@@ -1,157 +1,144 @@
-import { asHandle, type BackendPlugin, type Message, type Topic } from '@sharptrick/parley-core';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BackendFactory, ConformanceContext } from './factory.js';
+import { afterEach, beforeEach, describe, expect } from 'vitest';
+import { blockingCases } from './cases/blocking.js';
+import { catchUpCases } from './cases/catch-up.js';
+import { concurrencyCases } from './cases/concurrency.js';
+import { liveCases } from './cases/live.js';
+import { postCases } from './cases/post.js';
+import { toolSurfaceCases } from './cases/tool-surface.js';
+import {
+  type BackendFactory,
+  CAPABILITY_FIELDS,
+  type ConformanceContext,
+  openContext,
+} from './factory.js';
 
+export {
+  CALLER_BLOCK_FLOOR_FRACTION,
+  CALLER_BLOCK_RETURN_MS,
+  EARLY_RETURN_FRACTION,
+  IDLE_BLOCK_CEILING_MS,
+  IDLE_BLOCK_FLOOR_MS,
+  IDLE_BLOCK_MS,
+  OVERSHOOT_MULTIPLE,
+  PARK_FRACTION,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
+  SERVED_BLOCK_FLOOR_FRACTION,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+  STABILITY_CALLER_READS,
+  STABILITY_DEEP_TOPIC_ROWS,
+  STABILITY_LONG_BLOCK_MAX_MS,
+  STABILITY_LONG_BLOCK_MIN_MS,
+  STABILITY_LONG_READS,
+  STABILITY_READS_MAX,
+  STABILITY_READS_MIN,
+  STABILITY_SHORT_BLOCK_MAX_MS,
+  STABILITY_SHORT_BLOCK_MIN_MS,
+  STABILITY_SPAN_MS,
+  STABILITY_TOPICS,
+  TAIL_BLOCK_MS,
+} from './budgets.js';
+export { BLOCKING_POST_OFFSETS } from './cases/blocking.js';
+export { pageLimitsFor, PAGING_VOLUME } from './cases/catch-up.js';
+export {
+  carriesControlCharacter,
+  CONTENT_SHAPES,
+  isPlainAscii,
+  SHORT_PAYLOAD,
+} from './cases/content.js';
+export {
+  BURST_POSTS_MAX,
+  BURST_POSTS_MIN,
+  DELIVERY_MS,
+  FAULT_POSITIONS_PER_SHAPE,
+  livePayload,
+  LIVE_SUBSCRIPTIONS,
+  liveWriter,
+  QUIET_BACKLOG_ROWS,
+  QUIET_DELIVERY_MS,
+  QUIET_IDLE_MS,
+  QUIET_POSTS,
+  QUIET_POSTS_MIN,
+} from './cases/live.js';
+export { TOOL_BACKLOG_MIN, TOOL_PAGE } from './cases/tool-surface.js';
+export { ASSERTED_PROPERTIES, CLAUSES } from './clauses.js';
 export type { BackendFactory, ConformanceContext } from './factory.js';
-
-const SENDER = asHandle('writer');
-
-/** Fetch with a generous limit so we see every message in `topic`, ascending. */
-async function drainAll(plugin: BackendPlugin, topic: Topic, expectedAtMost = 10_000): Promise<Message[]> {
-  const { messages } = await plugin.fetchRecent({ topic, limit: expectedAtMost });
-  return messages;
-}
+export {
+  assertConformanceContext,
+  CAPABILITY_FIELDS,
+  CONTEXT_FIELDS,
+  openContext,
+} from './factory.js';
+export {
+  expectPoisonCostsOneMessage,
+  POISON_RECORD_CLAUSE,
+  type PoisonedBatch,
+} from './poison-record.js';
 
 /**
- * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend
- * conforms iff: stable-unique backendMsgId AND monotonic, in-order, exclusive-`since` cursor
- * delivery. Write once here; run against every backend via {@link BackendFactory}.
+ * The shared seam conformance suite (DESIGN §6; CLAUDE.md testing discipline). A backend conforms
+ * when it holds FOUR things: a stable-unique backendMsgId; monotonic, in-order, exclusive-`since`
+ * cursor delivery; a live path that delivers only a subset of the post-subscribe tail; and a live
+ * path that delivers at all. The first two alone are not conformance: stub `subscribe` out to
+ * register no listener and only the SUBSET clause still passes — the delivery floors, the
+ * quiet-topic floor, topic isolation, every handler-fault row and disconnect all red. Write once
+ * here; run against every backend via {@link BackendFactory}.
  */
 export function runConformanceSuite(name: string, factory: BackendFactory): void {
   describe(`seam conformance: ${name}`, () => {
     let ctx: ConformanceContext;
+    let live: ConformanceContext | undefined;
+    /**
+     * Assertions this case had made when it last read a capability field, or `undefined` if it read
+     * none. `expect.hasAssertions()` counts the WHOLE case, so a case that asserts, then branches on
+     * what the backend can represent and returns through that branch without grading anything has
+     * DELETED itself for every backend on that arm while reading in the report exactly like one that
+     * passed — and the whole-case count is satisfied by the assertions made before the branch.
+     */
+    let branchedAt: number | undefined;
     beforeEach(async () => {
-      ctx = await factory();
+      // Graded behaviourally rather than by walking the suite's own source for guard shapes: a
+      // source walk is satisfied by a comment that merely mentions the read, which is how four such
+      // checks in this package became decoration. This counts assertions that really ran.
+      expect.hasAssertions();
+      branchedAt = undefined;
+      live = undefined;
+      ctx = await openContext(name, factory);
+      live = ctx;
     });
     afterEach(async () => {
-      await ctx.cleanup();
-    });
-
-    it('post → fetchRecent returns messages in order, with unique ids and distinct cursors', async () => {
-      const t = ctx.freshTopic();
-      const ids = [];
-      for (const c of ['a', 'b', 'c']) ids.push(await ctx.plugin.post(t, SENDER, c));
-      expect(new Set(ids).size).toBe(3); // backendMsgId is unique
-
-      const { messages, nextCursor } = await ctx.plugin.fetchRecent({ topic: t });
-      expect(messages.map((m) => m.content)).toEqual(['a', 'b', 'c']);
-      expect(new Set(messages.map((m) => m.backendMsgId)).size).toBe(3);
-      expect(new Set(messages.map((m) => m.cursor)).size).toBe(3);
-      expect(messages.map((m) => m.backendMsgId)).toEqual(ids); // post() ids match read ids
-      expect(nextCursor).toBe(messages.at(-1)!.cursor);
-    });
-
-    it('catch-up since a cursor returns only newer messages (exclusive)', async () => {
-      const t = ctx.freshTopic();
-      await ctx.plugin.post(t, SENDER, 'a');
-      await ctx.plugin.post(t, SENDER, 'b');
-      const c1 = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
-      await ctx.plugin.post(t, SENDER, 'c');
-      await ctx.plugin.post(t, SENDER, 'd');
-
-      const after = await ctx.plugin.fetchRecent({ topic: t, since: c1 });
-      expect(after.messages.map((m) => m.content)).toEqual(['c', 'd']);
-      expect(after.nextCursor).toBe(after.messages.at(-1)!.cursor);
-    });
-
-    it('since at the tail returns empty and a stable cursor', async () => {
-      const t = ctx.freshTopic();
-      await ctx.plugin.post(t, SENDER, 'only');
-      const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
-      const drained = await ctx.plugin.fetchRecent({ topic: t, since: tail });
-      expect(drained.messages).toEqual([]);
-      expect(drained.nextCursor).toBe(tail);
-    });
-
-    it('fetchRecent on a never-posted topic returns an empty page with a replayable cursor', async () => {
-      const t = ctx.freshTopic(); // no posts
-      const first = await ctx.plugin.fetchRecent({ topic: t });
-      expect(first.messages).toEqual([]);
-      const again = await ctx.plugin.fetchRecent({ topic: t, since: first.nextCursor });
-      expect(again.messages).toEqual([]);
-      expect(again.nextCursor).toBe(first.nextCursor);
-    });
-
-    it('the same message has identical backendMsgId + cursor via live push and via catch-up', async () => {
-      const t = ctx.freshTopic();
-      const live: Message[] = [];
-      await ctx.plugin.subscribe(t, (m) => live.push(m));
-      const id = await ctx.plugin.post(t, SENDER, 'x');
-      await vi.waitFor(() => expect(live).toHaveLength(1), { timeout: 3000, interval: 10 });
-
-      const viaCatchUp = (await ctx.plugin.fetchRecent({ topic: t })).messages.find(
-        (m) => m.content === 'x',
-      );
-      expect(viaCatchUp).toBeDefined();
-      expect(live[0]!.backendMsgId).toBe(id);
-      expect(live[0]!.backendMsgId).toBe(viaCatchUp!.backendMsgId);
-      expect(live[0]!.cursor).toBe(viaCatchUp!.cursor);
-    });
-
-    it('topics are isolated', async () => {
-      const a = ctx.freshTopic();
-      const b = ctx.freshTopic();
-      await ctx.plugin.post(a, SENDER, 'in-a');
-      await ctx.plugin.post(b, SENDER, 'in-b');
-      expect((await ctx.plugin.fetchRecent({ topic: a })).messages.map((m) => m.content)).toEqual([
-        'in-a',
-      ]);
-      expect((await ctx.plugin.fetchRecent({ topic: b })).messages.map((m) => m.content)).toEqual([
-        'in-b',
-      ]);
-    });
-
-    it('blockMs long-poll: returns promptly after a concurrent post, empty at timeout', async (testCtx) => {
-      if (ctx.supportsBlockingFetch !== true) {
-        testCtx.skip(); // backend gets long-poll from core's generic wrapper, not the plugin
-        return;
+      const done = live;
+      live = undefined;
+      if (branchedAt !== undefined) {
+        expect(
+          expect.getState().assertionCalls,
+          'this case read a capability field and then finished without asserting anything after ' +
+            'it. The branch it took grades nothing for every backend on that arm, and the ' +
+            'whole-case assertion count cannot see it: the assertions made BEFORE the branch ' +
+            'satisfy that check on their own',
+        ).toBeGreaterThan(branchedAt);
       }
-      const t = ctx.freshTopic();
-      await ctx.plugin.post(t, SENDER, 'old');
-      const tail = (await ctx.plugin.fetchRecent({ topic: t })).nextCursor;
-
-      // (a) A blocked fetch at the tail wakes promptly when a message lands mid-wait.
-      const pending = ctx.plugin.fetchRecent({ topic: t, since: tail, blockMs: 5000 });
-      const posted = new Promise<void>((resolve) =>
-        setTimeout(() => {
-          void ctx.plugin.post(t, SENDER, 'fresh').then(() => resolve());
-        }, 50),
-      );
-      const [woke] = await Promise.all([pending, posted]);
-      expect(woke.messages.map((m) => m.content)).toEqual(['fresh']);
-      expect(woke.nextCursor).not.toBe(tail); // cursor advanced
-
-      // (b) With nothing new, a blocked fetch returns an empty page with a stable cursor at timeout.
-      const newTail = woke.nextCursor;
-      const started = Date.now();
-      const timedOut = await ctx.plugin.fetchRecent({ topic: t, since: newTail, blockMs: 300 });
-      expect(timedOut.messages).toEqual([]);
-      expect(timedOut.nextCursor).toBe(newTail);
-      // It actually waited (did not return instantly) — allow generous slack for slow CI.
-      expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+      await done?.cleanup();
     });
-
-    it('multi-process writes do not corrupt or error; cursor stays monotonic', async (testCtx) => {
-      if (ctx.concurrentPost === undefined) {
-        testCtx.skip();
-        return;
-      }
-      const t = ctx.freshTopic();
-      const writers = 4;
-      const perWriter = 25;
-      await ctx.concurrentPost(t, writers, perWriter);
-
-      const all = await drainAll(ctx.plugin, t);
-      expect(all).toHaveLength(writers * perWriter);
-      expect(new Set(all.map((m) => m.backendMsgId)).size).toBe(writers * perWriter);
-      expect(new Set(all.map((m) => m.cursor)).size).toBe(writers * perWriter);
-
-      // Cursor ordering is real: since the k-th message returns exactly the messages after it.
-      const k = Math.floor(all.length / 2);
-      const rest = await ctx.plugin.fetchRecent({ topic: t, since: all[k]!.cursor, limit: 10_000 });
-      expect(rest.messages.map((m) => m.backendMsgId)).toEqual(
-        all.slice(k + 1).map((m) => m.backendMsgId),
-      );
+    // Keep this a VIEW rather than the context itself, so that a case cannot capture the fixture
+    // that happened to be open when it was registered: registration runs once, `beforeEach` mints
+    // a fresh context per case, and a captured one would be another case's backend or undefined.
+    const current = new Proxy({} as ConformanceContext, {
+      get: (_, field) => {
+        if (CAPABILITY_FIELDS.includes(field as string)) {
+          branchedAt = expect.getState().assertionCalls ?? 0;
+        }
+        return ctx[field as keyof ConformanceContext];
+      },
     });
+    catchUpCases(current);
+    postCases(current);
+    toolSurfaceCases(current);
+    liveCases(current);
+    blockingCases(current);
+    concurrencyCases(current);
   });
 }

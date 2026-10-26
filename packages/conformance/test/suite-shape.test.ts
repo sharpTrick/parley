@@ -1,0 +1,741 @@
+import { readFileSync } from 'node:fs';
+import { codeOf, derivedRows } from '@sharptrick/parley-net-util/testing';
+import { describe, expect, it } from 'vitest';
+import { FAILURE_SHAPE_NAMES, FAILURE_SHAPES } from '@sharptrick/parley-core/testing';
+import {
+  ASSERTED_PROPERTIES,
+  BLOCKING_POST_OFFSETS,
+  CALLER_BLOCK_RETURN_MS,
+  CLAUSES,
+  CONTENT_SHAPES,
+  CONTEXT_FIELDS,
+  EARLY_RETURN_FRACTION,
+  FAULT_POSITIONS_PER_SHAPE,
+  IDLE_BLOCK_CEILING_MS,
+  IDLE_BLOCK_FLOOR_MS,
+  IDLE_BLOCK_MS,
+  PAGING_VOLUME,
+  pageLimitsFor,
+  PARK_FRACTION,
+  PROBE_MAX_BLOCK_MS,
+  QUIET_POSTS_MIN,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+  STABILITY_LONG_READS,
+  STABILITY_READS_MIN,
+  STABILITY_TOPICS,
+  TAIL_BLOCK_MS,
+} from '@sharptrick/parley-conformance';
+import {
+  budgetsIn,
+  cases,
+  casesIn,
+  deferredPromises,
+  diagnosedAssertions,
+  diagnosticSites,
+  promiseExecutors,
+  type SelfImposedBudget,
+  suiteSource as source,
+  suiteSources,
+} from './suite-source.js';
+
+const vitestConfig = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
+
+/** The harness's own per-case ceiling. Read, not restated: it is what pre-empts every budget below. */
+function testTimeoutMs(): number {
+  const found = /testTimeout:\s*([\d_]+)/.exec(vitestConfig)?.[1];
+  return Number((found ?? '').replaceAll('_', ''));
+}
+
+/** The budgets exported as figures, so a budget written as a name grades as the figure it holds. */
+const EXPORTED_BUDGETS: Record<string, number> = {
+  IDLE_BLOCK_CEILING_MS,
+  IDLE_BLOCK_FLOOR_MS,
+  IDLE_BLOCK_MS,
+  PROBE_MAX_BLOCK_MS,
+  RACE_BLOCK_MS,
+  RACE_RETURN_MS,
+  REFUSAL_RETURN_MS,
+  SINCELESS_BLOCK_MS,
+  SINCELESS_RETURN_MS,
+  TAIL_BLOCK_MS,
+};
+
+/**
+ * Every wall-clock budget the suite sets for itself. A WAIT above the harness's `testTimeout` can
+ * never be reached: vitest kills the case first, so the carefully-worded diagnostic the wait exists
+ * to produce is dead code and the operator gets a generic timeout.
+ *
+ * A `blockMs` is not a wait this suite takes — it is a figure handed to a plugin, and a suite that
+ * only ever hands out figures small enough to sit through is a suite whose reads a plugin can
+ * recognise by size, which is the switch `blocking-arm-is-stable` exists to forbid. So a budget the
+ * size a caller really sends is bounded by the race the suite runs it under rather than by the
+ * harness, and what has to stay under the harness is that race — graded below.
+ */
+const selfImposedBudgets = (): SelfImposedBudget[] => budgetsIn(source, EXPORTED_BUDGETS);
+
+/**
+ * A budget handed in from elsewhere — a parameter, graded where the figure is declared. A
+ * DECLARATION is never that: its initializer is the whole story, so one that names no figure is a
+ * budget nothing grades rather than one graded somewhere else.
+ */
+const isForwarded = (b: SelfImposedBudget): boolean =>
+  !b.declaration && /^[A-Za-z_$][\w$]*$/.test(b.initializer);
+
+const SKIP_SPELLINGS = [
+  /\btestCtx\.skip\(\)/,
+  /\bthis\.skip\(\)/,
+  /\bit\.skip\b/,
+  /\bdescribe\.skip\b/,
+  /\bit\.skipIf\b/,
+  /\bdescribe\.skipIf\b/,
+];
+
+/**
+ * The live floor writes one `CONTENT_SHAPES` row per iteration and draws its depth per run, so the
+ * shapes it REACHES are the first `depth` of them. A depth that could fall below the table's length
+ * would silently stop exercising the tail of it — the per-message delivery assertion stays green,
+ * because the shape is never sent — and the content axis would shrink with nothing turning red. A
+ * plugin cannot produce that, so no `BROKEN_VARIANTS` row can grade it; it is a fact about two
+ * constants and belongs here.
+ */
+it('the floor’s shallowest drawn depth still reaches every content shape', () => {
+  expect(
+    QUIET_POSTS_MIN,
+    'the live floor draws a depth that can be shorter than the content table, so on those runs ' +
+      'the last shapes are never sent and the axis they stand for is not graded at all',
+  ).toBeGreaterThanOrEqual(CONTENT_SHAPES.length);
+});
+
+describe('the suite grades every backend it certifies', () => {
+  // Without this the checks below read an empty list and pass having examined nothing.
+  it('parses the suite into its cases', () => {
+    expect(cases().length).toBeGreaterThan(10);
+    expect(cases().map((c) => c.title)).toContain('topics are isolated');
+  });
+
+  // Each formatting a case can take, because a case the parser cannot see is a case none of the
+  // checks below grade — which is how a multi-line `it.each` table slipped past all of them.
+  it.each([
+    ['a plain it', 'since at the tail'],
+    ['a single-line it.each', 'paging from a cursor with limit'],
+    ['a multi-line it.each table', 'either round-trips'],
+    ['an it whose callback takes the test context', 'multi-process writes'],
+  ])('parses %s', (_label, clause) => {
+    const found = cases().filter((c) => c.title.includes(clause));
+    expect(found, `no case titled like "${clause}"`).toHaveLength(1);
+    expect(found[0]!.body).toContain('expect(');
+  });
+
+  /**
+   * The parser against the shapes it has to see, which the rows above cannot grade: a case nested
+   * inside an inner `describe` does not exist in the suite today, and the day one does it must not
+   * be invisible — that is a case with no clause, no README bullet and no negative control, running
+   * against every certified backend and asserting whatever it likes.
+   */
+  const suiteAround = (body: string): string =>
+    `export function runConformanceSuite(name, factory) {\n  describe('x', () => {\n${body}\n  });\n}\n`;
+
+  it.each([
+    ['a case at the suite depth', "    it('at the suite depth', async () => { expect(1).toBe(1); });", ['at the suite depth']],
+    [
+      'a case nested inside an inner describe',
+      "    describe('a group', () => {\n      it('inside a describe', async () => { expect(1).toBe(1); });\n    });",
+      ['inside a describe'],
+    ],
+    [
+      'a case indented deeper for no reason',
+      "      it('deeper by accident', async () => { expect(1).toBe(1); });",
+      ['deeper by accident'],
+    ],
+    [
+      'an it.each whose table spans lines',
+      "    it.each([\n      ['a', 1],\n      ['b', 2],\n    ])('a table case %s', async (l, n) => { expect(n).toBe(n); });",
+      ['a table case %s'],
+    ],
+    [
+      'an it.each head wrapped onto several lines',
+      "    it.each(TABLE)(\n      'a wrapped case %s',\n      async (l) => {\n        expect(l).toBe(l);\n      },\n    );",
+      ['a wrapped case %s'],
+    ],
+    [
+      'a modifier the parser has not met',
+      "    it.concurrent('a concurrent case', async () => { expect(1).toBe(1); });",
+      ['a concurrent case'],
+    ],
+  ])('sees %s', (_label, body, titles) => {
+    expect(casesIn(suiteAround(body)).map((c) => c.title)).toEqual(titles);
+  });
+
+  // The other side of the same boundary: a helper OUTSIDE the suite function registers nothing
+  // against a backend, so counting it as a case would make the clause↔case count meaningless.
+  it('ignores an it() outside the suite function', () => {
+    const source = `it('a self-test of this package', () => {});\n${suiteAround("    it('graded', async () => { expect(1).toBe(1); });")}`;
+    expect(casesIn(source).map((c) => c.title)).toEqual(['graded']);
+  });
+
+  // A deleted or renamed clause used to cost nothing: the count was a `> 10` floor and one title was
+  // pinned by hand. Now every clause the README advertises must still own a case, and the case count
+  // must match the clause count — so a case cannot vanish, and a new one cannot go unregistered.
+  it.each(CLAUSES.map((c) => [c]))('still grades the clause %s', (clause) => {
+    expect(cases().filter((c) => c.title.includes(clause)).length).toBeGreaterThan(0);
+  });
+
+  it('registers exactly one case per clause and no unregistered case', () => {
+    const unclaimed = cases()
+      .map((c) => c.title)
+      .filter((title) => !CLAUSES.some((clause) => title.includes(clause)));
+    expect(unclaimed, 'a case no clause in CLAUSES names').toEqual([]);
+    expect(cases()).toHaveLength(CLAUSES.length);
+  });
+
+  // A capability flag whose false branch is a SKIP trades coverage for a boolean: the backend that
+  // declares it loses the only cases that would have caught the behaviour. The only legitimate skip
+  // is a capability the backend cannot represent AT ALL, which the context states as 'unsupported'.
+  it('only ever skips on a capability the backend cannot represent at all', () => {
+    const skipping = cases().filter((c) => SKIP_SPELLINGS.some((s) => s.test(c.body)));
+    expect(skipping.length).toBeGreaterThan(0); // the check is not vacuous
+    const unjustified = skipping.filter((c) => !c.body.includes("=== 'unsupported'"));
+    expect(unjustified.map((c) => c.title)).toEqual([]);
+  });
+
+  // The detector itself, against the shapes it has to recognize — so it cannot regress to knowing
+  // exactly one spelling, which is how it started.
+  it.each([
+    ['a testCtx.skip()', "it('x', async (testCtx) => { testCtx.skip(); });", true],
+    ['a this.skip()', "it('x', async function () { this.skip(); });", true],
+    ['an it.skip', "it.skip('x', async () => { expect(1).toBe(1); });", true],
+    ['a describe.skip', "describe.skip('x', () => {});", true],
+    ['an it.skipIf', "it.skipIf(true)('x', () => {});", true],
+    ['an ordinary case', "it('x', async () => { expect(1).toBe(1); });", false],
+  ])('recognizes %s as a skip: %s', (_label, snippet, isSkip) => {
+    expect(SKIP_SPELLINGS.some((s) => s.test(snippet))).toBe(isSkip);
+  });
+
+  /**
+   * A page-size row that pages IDENTICALLY to another row discriminates nothing and still costs a
+   * fresh connect/teardown on every backend. Three of the five rows used to be the same single-page
+   * case, and the uneven truncation — where a page-boundary off-by-one lives — was not a row at all.
+   * Graded as a property of the generator against the volume, so lowering the message list fails
+   * here instead of quietly collapsing the table again.
+   */
+  describe('the page-size table', () => {
+    const remaining = PAGING_VOLUME.length - 1;
+    const pageShape = (limit: number): string => {
+      const pages: number[] = [];
+      for (let left = remaining; left > 0; left -= limit) pages.push(Math.min(limit, left));
+      return pages.join('+');
+    };
+    const shapes = (): string[] => pageLimitsFor(remaining).map(pageShape);
+
+    it('pages differently on every row', () => {
+      expect(shapes().length).toBeGreaterThan(3);
+      expect(new Set(shapes()).size).toBe(shapes().length);
+    });
+
+    it('covers the shapes a page-boundary cursor bug needs', () => {
+      // One at a time, an exact division into several pages, an uneven final page, and one whole page.
+      expect(shapes()).toContain(Array.from({ length: remaining }, () => '1').join('+'));
+      expect(shapes().some((s) => s.split('+').length > 2 && new Set(s.split('+')).size === 1)).toBe(
+        true,
+      );
+      expect(
+        shapes().some((s) => {
+          const pages = s.split('+');
+          return pages.length > 1 && pages.at(-1) !== pages[0];
+        }),
+      ).toBe(true);
+      expect(shapes()).toContain(String(remaining));
+    });
+  });
+
+  /**
+   * A latency bound compared against the budget that produced it discriminates nothing: "the plugin
+   * returned inside the budget it was handed" is true of a plugin that parked for all but the last
+   * millisecond of it. The since-less blocking arm offered 19 000 ms and asserted `< 19_000`, so a
+   * plugin that parks on every cursor-less `parley_fetch_recent` was certified.
+   *
+   * The paired half is a BROKEN_VARIANTS control that parks for a FRACTION of the budget — this row
+   * forbids the degenerate bound, the control forbids a merely lenient one.
+   */
+  describe('no elapsed-time bound is the budget that produced it', () => {
+    const figure = (token: string): number =>
+      EXPORTED_BUDGETS[token] ?? Number(token.replaceAll('_', ''));
+
+    const budgetsOf = (body: string): string[] =>
+      [...body.matchAll(/blockMs:\s*([A-Za-z_][\w]*|[\d_]+)/g)].map((m) => m[1] as string);
+    const boundsOf = (body: string): string[] =>
+      [...body.matchAll(/toBeLessThan\(\s*([A-Za-z_][\w]*|[\d_]+)\s*\)/g)].map((m) => m[1] as string);
+
+    const blocking = (): { title: string; body: string }[] =>
+      cases().filter((c) => budgetsOf(c.body).length > 0);
+
+    it('finds cases that offer a blockMs budget, so the row below grades something', () => {
+      expect(blocking().length).toBeGreaterThan(0);
+      expect(blocking().flatMap((c) => boundsOf(c.body)).length).toBeGreaterThan(0);
+      expect(figure('SINCELESS_BLOCK_MS')).toBe(SINCELESS_BLOCK_MS);
+      expect(figure('5000')).toBe(5000);
+    });
+
+    it.each(blocking().map((c) => [c.title, c.body] as const))(
+      '"%s" bounds elapsed time strictly under every budget it hands out',
+      (_title, body) => {
+        const budgets = budgetsOf(body).map(figure);
+        for (const token of boundsOf(body)) {
+          expect(
+            budgets,
+            `the elapsed bound \`${token}\` is one of the blockMs budgets this case offers, so a ` +
+              `plugin that parks for the whole budget still satisfies it`,
+          ).not.toContain(figure(token));
+        }
+      },
+    );
+  });
+
+  /**
+   * The budget rows below grade a budget's SIZE; this grades whether it can be reported at all. The
+   * interleaved reader's 15 s give-up threw from a promise nothing had subscribed to yet, so on a
+   * backend whose 100 concurrent posts take longer than that, the run reports an unhandled rejection
+   * and loses every other case in the file — instead of the one red case naming the stuck topic.
+   */
+  describe('every eagerly-started promise can report its own failure', () => {
+    const deferred = (): [string, string, boolean][] =>
+      cases().flatMap((c) =>
+        deferredPromises(c.body).map(
+          ({ name, handled }) => [c.title, name, handled] as [string, string, boolean],
+        ),
+      );
+
+    it('finds eagerly-started promises, so the rows below are not an empty table', () => {
+      expect(deferred().length).toBeGreaterThan(1);
+    });
+
+    it.each(deferred())('"%s" handles `%s` at creation', (_title, name, handled) => {
+      expect(
+        handled,
+        `\`${name}\` is awaited only after another await, so a rejection in between has no handler ` +
+          `— attach one where it is created and rethrow after the await`,
+      ).toBe(true);
+    });
+
+    // The detector against the shapes it has to tell apart, so it cannot regress to finding nothing
+    // — which would make every row above pass by grading an empty list.
+    it.each([
+      [
+        'an eager promise awaited after another await',
+        'const p = go();\nawait other();\nawait p;',
+        ['p'],
+        false,
+      ],
+      [
+        'the same promise handled at creation',
+        'const p = go().catch((e) => { failure = e; });\nawait other();\nawait p;',
+        ['p'],
+        true,
+      ],
+      ['a promise awaited in the next statement', 'const p = go();\nawait Promise.all([p, q]);', [], true],
+      ['a promise awaited in the same statement', 'const p = await go();\nawait other();\np.x;', [], true],
+      ['a function definition awaited later', 'const p = () => go();\nawait other();\nawait p();', [], true],
+    ])('sees %s', (_label, snippet, names, allHandled) => {
+      expect(deferredPromises(snippet).map((d) => d.name)).toEqual(names);
+      expect(deferredPromises(snippet).every((d) => d.handled)).toBe(allHandled);
+    });
+  });
+
+  /**
+   * The same failure one layer out. The block above grades bindings inside a CASE; a suite helper
+   * lives above the first `it(` and is invisible to `casesIn`, so the suite's `postAfter` — a
+   * `new Promise` that resolved inside a `.then()` and bound no rejection path — turned a plugin's
+   * `post` rejection into a case that hung for its whole timeout AND an unhandled rejection
+   * attributed to some other case. Graded over the whole module, wherever the executor is written.
+   */
+  describe('every promise the suite builds by hand can settle on failure', () => {
+    const risky = (): [string, string][] =>
+      suiteSources.flatMap((module) =>
+        promiseExecutors(module)
+          .filter(({ drivesAPromise }) => drivesAPromise)
+          .map(
+            ({ executor, settlesOnRejection }) =>
+              [
+                executor.replaceAll(/\s+/g, ' ').slice(0, 90),
+                settlesOnRejection ? 'settles' : 'hangs',
+              ] as [string, string],
+          ),
+      );
+
+    it('finds a hand-built promise that drives another, so the row below is not an empty table', () => {
+      expect(risky().length).toBeGreaterThan(0);
+    });
+
+    it.each(risky())('`%s` %s on a rejection', (_executor, verdict) => {
+      expect(
+        verdict,
+        'this executor drives another promise and binds only `resolve`, so a rejection inside it ' +
+          'leaves the promise pending forever and reaches the process unhandled — bind `reject`',
+      ).toBe('settles');
+    });
+
+    // The detector against the shapes it has to tell apart, so it cannot regress to finding nothing.
+    it.each([
+      [
+        'a helper that resolves inside a then() with no rejection path',
+        'const h = (x) => new Promise((r) => { setTimeout(() => { void p(x).then(() => r()); }); });',
+        true,
+        false,
+      ],
+      [
+        'the same helper with both settle paths bound',
+        'const h = (x) => new Promise((r, bad) => { setTimeout(() => { void p(x).then(() => r(), bad); }); });',
+        true,
+        true,
+      ],
+      [
+        'a rejection path bound as a declared-but-unused parameter',
+        'const h = (x) => new Promise((r, bad) => { setTimeout(() => { void p(x).then(() => r()); }); });',
+        true,
+        false,
+      ],
+      [
+        'a catch that routes to the rejection path',
+        'new Promise((r, bad) => { void p().then(r).catch(bad); })',
+        true,
+        true,
+      ],
+      ['a bare timer that drives no promise', 'await new Promise((r) => setTimeout(r, 5));', false, false],
+      [
+        'an executor written as a function expression',
+        'new Promise(function (r) { void p().then(() => r()); })',
+        true,
+        false,
+      ],
+      [
+        'an executor whose promise type is written out',
+        'new Promise<void>((r) => { void p().then(() => r()); })',
+        true,
+        false,
+      ],
+    ])('sees %s', (_label, snippet, drives, settles) => {
+      const found = promiseExecutors(snippet);
+      expect(found).toHaveLength(1);
+      expect(found[0]!.drivesAPromise).toBe(drives);
+      expect(found[0]!.settlesOnRejection).toBe(settles);
+    });
+
+    // The hole this block exists to close: the case parser starts at the first `it(`, so a helper
+    // above it is in no case body at all. Pinned as the reason the scan is over the MODULE.
+    it('grades a helper the case parser cannot see', () => {
+      const module =
+        "export function someCases(ctx) {\n" +
+        "  const h = (x) => new Promise((r) => { void ctx.post(x).then(() => r()); });\n" +
+        "  it('a case', async () => { await h(1); });\n" +
+        '}\n';
+      expect(cases().length).toBeGreaterThan(0);
+      expect(casesIn(module).flatMap((c) => promiseExecutors(c.body))).toEqual([]);
+      expect(promiseExecutors(module)).toHaveLength(1);
+    });
+  });
+
+  /**
+   * The scan behind the negative control's assertion-level registry, self-tested over synthetic
+   * snippets. Kept here rather than there: that file grades what the scan FINDS, so a scan that
+   * found nothing would satisfy it by having nothing left to require. Both verdicts, so it cannot
+   * pass by matching everything or by matching nothing.
+   */
+  /**
+   * The scan behind the negative control's assertion-level registry, self-tested over synthetic
+   * snippets. Kept here rather than there: that file grades what the scan FINDS, so a scan that
+   * found nothing would satisfy it by having nothing left to require. Both verdicts, so it cannot
+   * pass by matching everything or by matching nothing.
+   */
+  describe('the diagnostic scan reads an assertion the way the runner prints it', () => {
+    it.each([
+      [
+        'a diagnosed assertion',
+        "expect(seen, 'the reader saw a row twice').toEqual(stored);",
+        ['the reader saw a row twice'],
+      ],
+      [
+        'a diagnostic assembled from several literals',
+        "expect(x, 'first half ' + 'second half').toBe(1);",
+        ['first half '],
+      ],
+      [
+        'a diagnosed assertion whose subject carries commas and parens',
+        "expect(new Set(all.map((m) => m.cursor)).size, 'two rows share a cursor').toBe(4);",
+        ['two rows share a cursor'],
+      ],
+      ['an assertion with no diagnostic', 'expect(messages).toHaveLength(3);', []],
+      ['an assertion whose second argument is not a message', 'expect(a, b).toBe(1);', []],
+      [
+        'a diagnostic carrying an escaped quote',
+        "expect(x, 'the topic\\'s cursor moved').toBe(1);",
+        ["the topic's cursor moved"],
+      ],
+      // The three forms this scan was blind to at once. Each was an assertion the negative control
+      // never asked for a control for, and none of them left a trace: the table simply got shorter.
+      [
+        'a diagnostic template OPENING with an interpolation',
+        'expect(got, `${depth} deep: the reader fell behind`).toEqual(sent);',
+        ['deep: the reader fell behind'],
+      ],
+      [
+        'a diagnostic bound to a const',
+        "const WHY = 'the cursor stood still';\nexpect(got, WHY).toEqual(sent);",
+        ['the cursor stood still'],
+      ],
+      [
+        'a first argument holding a comma inside a string',
+        "expect(render('a, b'), 'the payload was rewritten').toBe('a, b');",
+        ['the payload was rewritten'],
+      ],
+    ])('reads %s', (_label, snippet, found) => {
+      expect(diagnosedAssertions(snippet)).toEqual(found);
+    });
+
+    /**
+     * The scan's COMPLETENESS over the real suite, which no synthetic row can grade. Every
+     * `expect(actual, …)` the suite writes carries a message, so a form this cannot read shows up
+     * here as a site with none — rather than as a shorter table in the negative control, which is
+     * how three forms went missing at once with nothing turning red.
+     */
+    it('recovers a message from every diagnosed assertion the suite actually writes', () => {
+      const sites = diagnosticSites(source);
+      expect(sites.length, 'the scan found no diagnosed assertions at all').toBeGreaterThan(
+        CLAUSES.length,
+      );
+      expect(
+        sites.filter((site) => site.message === undefined).map((site) => site.argument),
+        'this scan cannot read the message of an `expect(actual, …)` the suite writes, so the ' +
+          'negative control never asks for a control for it — and an assertion nothing can make ' +
+          'fail is indistinguishable from a deleted one',
+      ).toEqual([]);
+    });
+  });
+
+  /**
+   * A bound on ELAPSED TIME is the one kind of assertion neither registry above can name: it is not a
+   * `Message` field and not a seam call, so `BROKEN_VARIANTS` had no way to be required to cover one.
+   * The idle arm's floor arrived that way and could be deleted — with the negative control included —
+   * while a plugin that returns instantly on a native `blockMs` kept being certified. Each timing
+   * bound now names a property in `ASSERTED_PROPERTIES`, which the negative control does require a
+   * variant for, so the next one cannot arrive uncontrolled.
+   */
+  describe('every elapsed-time bound names a property the negative control covers', () => {
+    const timingBounds = (body: string): number =>
+      [...body.matchAll(/expect\(\s*Date\.now\(\) - \w+/g)].length;
+    const namedProperties = (body: string): string[] =>
+      ASSERTED_PROPERTIES.filter((property) => body.includes(property));
+    const timed = (): { title: string; body: string }[] =>
+      cases().filter((c) => timingBounds(c.body) > 0);
+
+    it('finds elapsed-time bounds, so the rows below are not an empty table', () => {
+      expect(timed().reduce((n, c) => n + timingBounds(c.body), 0)).toBeGreaterThan(3);
+    });
+
+    it.each(timed().map((c) => [c.title, c.body] as const))(
+      '"%s" names one property per elapsed-time bound it asserts',
+      (title, body) => {
+        expect(
+          namedProperties(body).length,
+          `"${title}" asserts on elapsed time ${timingBounds(body)} time(s) but names ` +
+            `${namedProperties(body).length} of ASSERTED_PROPERTIES — a timing bound no property ` +
+            `names is one no BROKEN_VARIANTS entry has to fail`,
+        ).toBeGreaterThanOrEqual(timingBounds(body));
+      },
+    );
+
+    // The two parking controls exist to fail a bound each; a fraction drifting to the wrong side of
+    // one turns the control into a plugin that passes, which reads in the report as coverage.
+    it('each control still lands on the failing side of the bound it exists to fail', () => {
+      expect(SINCELESS_BLOCK_MS * PARK_FRACTION).toBeGreaterThan(SINCELESS_RETURN_MS);
+      expect(IDLE_BLOCK_MS * EARLY_RETURN_FRACTION).toBeLessThan(IDLE_BLOCK_FLOOR_MS);
+      expect(EARLY_RETURN_FRACTION).toBeGreaterThan(0);
+    });
+
+    /**
+     * The arm-stability run's reach, graded against its own budgets rather than against a clock —
+     * every switch predicate `BROKEN_VARIANTS` stands up is a figure set against ONE of these, and a
+     * run that stopped covering the window, the count or the topics would turn each of those
+     * controls into a plugin that passes.
+     */
+    it('the stability run is built to reach every switch a control can hide behind', () => {
+      expect(STABILITY_READS_MIN).toBeGreaterThan(STABILITY_LONG_READS);
+      expect(STABILITY_TOPICS).toBeGreaterThan(1);
+    });
+  });
+
+  it('reads a testTimeout out of the harness config, so the budget rows below grade something', () => {
+    expect(testTimeoutMs()).toBeGreaterThan(0);
+    expect(selfImposedBudgets().length).toBeGreaterThan(3);
+    expect(
+      selfImposedBudgets()
+        .filter((b) => b.ms === null && !isForwarded(b))
+        .map((b) => b.what),
+      'a budget whose initializer resolves to no figure is graded by no row below',
+    ).toEqual([]);
+  });
+
+  /**
+   * The scanner's own figures, against the spellings a budget can take. Reading only the leading
+   * literal of an initializer graded `90 * 1000` as 90 — under the 20 s timeout, so a budget 4.5x
+   * it passed the row that exists to forbid exactly that — and made a budget written as a name no
+   * row at all. Each row asserts the FIGURE, so a scanner that reports *something* is not enough.
+   */
+  it.each([
+    ['a bare literal', 'const A_MS = 15_000;', [15_000]],
+    ['a literal without separators', 'const A_MS = 90000;', [90_000]],
+    ['a product', 'const A_MS = 90 * 1000;', [90_000]],
+    ['a sum', 'const A_MS = 20_000 + 500;', [20_500]],
+    [
+      'a fraction of an exported budget',
+      'const A_MS = SINCELESS_BLOCK_MS * (2 / 3);',
+      [SINCELESS_BLOCK_MS * (2 / 3)],
+    ],
+    ['a budget defined from its neighbour', 'const A_MS = 4_000;\nconst B_MS = A_MS * 3;', [4_000, 12_000]],
+    ['an inline literal budget', 'p.fetchRecent({ topic: t, blockMs: 5_000 });', [5_000]],
+    ['an inline budget written as a name', 'p.fetchRecent({ topic: t, blockMs: IDLE_BLOCK_MS });', [IDLE_BLOCK_MS]],
+    ['a deadline computed from a budget', 'const end = Date.now() + SINCELESS_BLOCK_MS;', [SINCELESS_BLOCK_MS]],
+    ['a budget it cannot resolve, as no figure rather than a prefix', 'const A_MS = fromEnv() * 1000;', [null]],
+  ])('reads %s', (_label, planted, figures) => {
+    expect(budgetsIn(planted, EXPORTED_BUDGETS).map((b) => b.ms)).toEqual(figures);
+  });
+
+  // A declaration naming no figure must not borrow the exemption a handed-in one has.
+  it('exempts a budget handed in from elsewhere, never a declaration that names no figure', () => {
+    const [handedIn] = budgetsIn('p.fetchRecent({ topic: t, blockMs: within });');
+    const [declared] = budgetsIn('const A_MS = whateverTheEnvSays;');
+    expect([(handedIn as SelfImposedBudget).ms, (declared as SelfImposedBudget).ms]).toEqual([null, null]);
+    expect(isForwarded(handedIn as SelfImposedBudget)).toBe(true);
+    expect(isForwarded(declared as SelfImposedBudget)).toBe(false);
+  });
+
+  /**
+   * The bound that makes a budget above the harness ceiling safe. Without it, "the suite races that
+   * read" is a claim about code rather than a figure anyone has checked, and a race set past the
+   * harness ceiling is no race at all: the case is killed first and reports a bare timeout naming no
+   * clause — exactly the outcome the budget rows exist to prevent.
+   */
+  it('never waits longer for one read than the harness will let the case run', () => {
+    expect(CALLER_BLOCK_RETURN_MS).toBeLessThan(testTimeoutMs());
+    expect(SINCELESS_RETURN_MS).toBeLessThan(testTimeoutMs());
+  });
+
+  it.each(
+    selfImposedBudgets()
+      .filter((b) => b.ms !== null || !isForwarded(b))
+      .map((b) => [b.what, b.ms] as const),
+  )(
+    'keeps the budget `%s` under the harness timeout',
+    (_what, ms) => {
+      expect(ms ?? Number.POSITIVE_INFINITY).toBeLessThan(testTimeoutMs());
+    },
+  );
+
+  // The teardown must not dereference the binding the CASES use: that binding is assigned only
+  // after validation, so an `await ctx.cleanup()` in `afterEach` throws a TypeError on exactly the
+  // fixture whose live connection most needs closing. Behaviour is graded against `openContext` in
+  // context-validation.test.ts; this is the wiring that has to keep reaching it.
+  it('tears the fixture down through a binding a rejected fixture cannot leave unassigned', () => {
+    const setup = /beforeEach\(async \(\) => \{[\s\S]*?\n {4}\}\);/.exec(source)?.[0];
+    const teardown = /afterEach\(async \(\) => \{[\s\S]*?\n {4}\}\);/.exec(source)?.[0];
+    expect(setup, 'no beforeEach found').toBeDefined();
+    expect(teardown, 'no afterEach found').toBeDefined();
+    expect(setup as string).toContain('openContext');
+    expect(teardown as string).not.toMatch(/\bctx\b/);
+  });
+
+  /**
+   * A required context field nobody reads is a field a fixture author must supply for nothing —
+   * and, worse, looks like coverage.
+   *
+   * Matched as a property READ rather than as `ctx.<field>`: the teardown deliberately does not go
+   * through `ctx`, and pinning that one spelling would force it back onto the binding a rejected
+   * fixture leaves unassigned.
+   *
+   * Graded over COMMENT-STRIPPED code. `absentTopicBehaviour` has exactly one reader, and replacing
+   * it with a hardcoded branch plus a comment naming the field left this row green while the whole
+   * absent-topic capability arm went dead and every fixture author kept supplying the field.
+   */
+  const SUITE_CODE = codeOf(source);
+
+  it.each(
+    derivedRows('the required context fields', () => Object.keys(CONTEXT_FIELDS), {
+      floor: 4,
+      witness: ['absentTopicBehaviour', 'concurrentPost'],
+    }),
+  )('reads the required field `%s`', (field) => {
+    expect(SUITE_CODE, `nothing in the suite reads \`${field}\``).toMatch(
+      new RegExp(`\\.${field}\\b`),
+    );
+  });
+});
+
+/**
+ * The tables the shared suite fans an `it.each` out over, held to the members they exist to cover.
+ *
+ * Every other count in this package is derived FROM these tables, so a table that loses rows at its
+ * source shrinks the observed suite and the predicted suite by the same amount and nothing reddens.
+ * Deleting two rows from CONTENT_SHAPES took the negative control's graded universe from 4,560 rows
+ * to 4,400 and its real failures from 281 to 276 with this package green. A member named here
+ * cannot go that way.
+ */
+describe('the tables the suite fans out on still cover what they were written for', () => {
+  it.each(
+    derivedRows('the content shapes', () => CONTENT_SHAPES.map(([label]) => label), {
+      floor: 6,
+      witness: [
+        'a newline',
+        'leading and trailing spaces',
+        'an astral emoji',
+        'a combining sequence',
+        'a tab',
+        'a sentence longer than any token this suite draws',
+      ],
+    }),
+  )('sends %s', (label) => {
+    expect(CONTENT_SHAPES.filter(([name]) => name === label)).toHaveLength(1);
+  });
+
+  it.each(
+    derivedRows('the handler faults', () => [...FAILURE_SHAPE_NAMES], {
+      floor: 7,
+      // Named one at a time, so the witnesses cannot narrow in lockstep with the table: spreading
+      // FAILURE_SHAPE_NAMES over its own derivation made this row satisfied by construction.
+      witness: [
+        'rejects with a non-Error',
+        'rejects a turn later',
+        'rejects as a non-native thenable',
+        'never settles',
+        'rejects synchronously',
+        'throws a non-Error synchronously',
+      ],
+    }),
+  )('faults a live handler by %s', (shape) => {
+    expect(FAILURE_SHAPES[shape]).toBeTypeOf('function');
+  });
+
+  it('grades every fault shape at every position in a run', () => {
+    expect(FAULT_POSITIONS_PER_SHAPE).toBeGreaterThanOrEqual(3);
+  });
+
+  it.each(
+    derivedRows('the page limits', () => pageLimitsFor(PAGING_VOLUME.length - 1), {
+      floor: 5,
+      witness: ['1', '2', '3', '5', '6'],
+    }),
+  )('pages the backlog %i at a time', (limit) => {
+    expect(limit).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each(
+    derivedRows('the blocking post offsets', () => [...BLOCKING_POST_OFFSETS], {
+      floor: 4,
+      witness: ['0', '1', '2', '3'],
+    }),
+  )('races a post landing %ims in', (offset) => {
+    expect(offset).toBeLessThan(5);
+  });
+});

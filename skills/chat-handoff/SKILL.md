@@ -22,10 +22,14 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
 
 ## Tools
 
-- **`parley_fetch_recent { topic, since?, limit?, block_ms? }`** — read recent messages on a topic.
-  Returns `{ messages, nextCursor }`. Call it first to catch up; pass the previous `nextCursor` as
-  `since` to page forward. Ordering/dedup use `cursor`, never timestamps. Pass `block_ms` to
-  **long-poll** — see "Waiting efficiently" below.
+- **`parley_fetch_recent { topic, since?, limit? }`** — read recent messages on a topic.
+  Returns `{ messages, nextCursor }`. Call it first to catch up, then pass the `nextCursor` you were
+  handed back as `since`: keep calling with the `nextCursor` you are handed until it STOPS
+  ADVANCING — the same cursor twice, or none handed back at all. An EMPTY page does not mean you are
+  done: a backend whose history read is coarser than one topic hands back a page of other topics'
+  messages, which reaches you as an empty page whose cursor moved on, and stopping there leaves
+  everything behind it unread. Ordering/dedup use `cursor`, never timestamps. Some deployments also
+  offer `block_ms` to **long-poll** — see "Waiting efficiently" below.
 - **`parley_post { topic, content, in_reply_to? }`** — publish a message (a handoff or a note) so
   the Code session and humans see it durably.
 
@@ -55,20 +59,25 @@ Acceptance: <how we'll know it's done>
 ## Reading replies
 
 The Code session writes its output and replies back to the same topic durably (replies always
-write to the backend, not just the live channel — so they survive a restart). To see them, call
-`parley_fetch_recent` again with the last `since` cursor you held.
+write to the backend, not just the live channel — so they survive a restart). To see them, run the
+same page loop again from the last `nextCursor` you were handed.
 
 ## Waiting efficiently (resident / epoch agents)
 
 An agent that cannot receive live `<channel>` push — a Claude Code **subagent** (push lands at the
-session level), a headless `claude -p` worker, or the chat front door — would otherwise have to
-poll `parley_fetch_recent` in a loop, spending one model turn per empty tick. Pass **`block_ms`**
-to fold that wait into a single call: if nothing is newer than `since`, the tool **holds** up to
-`block_ms` (capped server-side, default 60s) until a message arrives or the timeout elapses, then
-returns whatever landed (possibly empty). Token cost then scales with **messages, not wall-clock
-time**.
+session level), a headless `claude -p` worker, or the chat front door — has to poll
+`parley_fetch_recent` in a loop, spending one model turn per empty tick.
 
-The resident loop is: catch up once, then re-call with the held cursor and a block:
+`block_ms` is on `parley_fetch_recent`'s schema everywhere, but only some backends can serve it —
+the ones whose own read primitive takes a caller's wait. **Try it once and read what comes back.**
+A backend that cannot park on a budget **refuses** the call with an error naming itself; that is
+not a failure of your request, it is the answer. Drop `block_ms` and use the paced loop below.
+
+**Where `block_ms` IS served**, it folds the wait into a single call: if nothing is newer than
+`since`, the tool **holds** up to `block_ms` (capped server-side, default 60s) until a message
+arrives or the timeout elapses, then returns whatever landed (possibly empty). Token cost then
+scales with **messages, not wall-clock time**. The resident loop is: catch up once, then re-call
+with the held cursor and a block:
 
 ```
 { messages, nextCursor } = parley_fetch_recent { topic, since: <held cursor>, block_ms: 55000 }
@@ -77,8 +86,20 @@ The resident loop is: catch up once, then re-call with the held cursor and a blo
 ```
 
 Keep `block_ms` a little under any surrounding tool/hook timeout. A returned empty page is normal —
-just loop again with the same cursor. Every backend honors `block_ms` (natively where the backend
-has a blocking primitive; via a core poll fallback otherwise), so the idiom is identical everywhere.
+loop again from the `nextCursor` that page handed you, which is not always the one you sent.
+
+**Where it is refused**, the same loop without it returns at once, every time — so pace it
+yourself and expect to pay a turn per tick:
+
+```
+{ messages, nextCursor } = parley_fetch_recent { topic, since: <held cursor> }
+# → returns at once. An EMPTY page is not the end of the backlog — only a cursor that stopped
+#   advancing is, so page on while it moves and WAIT only once it has stopped.
+# persist nextCursor, act on any messages, sleep, repeat
+```
+
+A tight loop against a cursor that has stopped advancing is a request flood against the backend for
+no new information.
 
 ## Safety
 

@@ -1,18 +1,216 @@
 # @sharptrick/parley-net-util
 
-A tiny internal HTTP helper shared by Parley's HTTP chat backends (Zulip, Matrix, Discord,
-Telegram, Slack). It exports exactly two things:
+A tiny HTTP helper: one `fetch` + 429-retry loop, plus the `delay` any backend that waits needs.
+It is published to npm, so **everything below is public API** — a change to any of these names is
+a breaking change.
+
+- **Consumed by:** Discord, Matrix, NATS, Postgres, Redis, Slack, Telegram, XMPP, Zulip.
+- **Not consumed by:** SQLite.
+
+Both lines are re-derived from the workspace manifests by this package's own tests, so a backend
+that gains or drops the dependency moves them.
+
+## The loop
 
 - **`fetchWithRetry(url, init, opts)`** — the one `fetch` + 429-retry loop. The caller passes a
   fully-formed `init` (auth headers + encoded body + optional `signal`); the helper retries `429`
-  by honoring the caller's `retryAfterOf(res)` parser, stops the moment `isStopped()` is true,
-  returns the `Response` on `ok`/`allowStatuses`, and otherwise throws `<label> → <status>: <text>`.
-- **`delay(ms)`** — a `setTimeout` promise (the single copy that replaces the per-plugin duplicates).
+  by honoring the caller's `retryAfterOf(res)` parser, abandons a backoff within `STOP_POLL_MS` of
+  `isStopped()` turning true, returns the `Response` on `ok`/`allowStatuses`, and otherwise throws
+  `<label> → <status>: <text>`. The `Response` you get back is already buffered, so your own
+  `res.json()` can never be aborted by the helper's deadline.
+- **`FetchWithRetryOptions`** — `label`, `isStopped`, and the optional `retryAfterOf`,
+  `allowStatuses`, `maxAttempts`, `deadlineMs`, `maxBodyBytes`, `now`.
+- **`HttpStatusError`** — what an unallowed non-2xx throws. Its `message` is exactly
+  `` `${label} → ${status}: ${body}` `` — a pinned contract, since several backends' tests read it —
+  and it also carries `label`, `status` and `body` as fields.
+- **`statusOf(err)`** — the status behind a rejection, or `undefined` when no response was received.
+  Branch on this instead of re-parsing the message; it reads the `status` field rather than the
+  class, so a duplicated copy of this package still works — and every rejection raised *after* a
+  status arrived reports it, including the ones that fail while reading the body (`→ body:`,
+  `→ transport:`, `→ deadline:`), not only the `<label> → <status>: <body>` one.
+
+Four bounds are worth knowing before you call it:
+
+- `deadlineMs` (default `DEFAULT_DEADLINE_MS`) is a ceiling on the **whole call including the time
+  one request spends in flight** — the helper aborts a request that outlives it. A caller whose
+  request legitimately blocks longer (a long-poll) must raise `deadlineMs` past its own timeout.
+- A wait the server states — via `Retry-After` or the caller's `retryAfterOf` — is honoured in
+  **full**, however long; it is refused, **ending the call**, only when it would not fit inside
+  this call's `deadlineMs`. The only backoff the helper invents for itself is the fixed
+  `DEFAULT_BACKOFF_MS`, used when a 429 carries no usable hint at all. Nothing here clamps a wait,
+  a plugin's own reconnect ladder included — every plugin with one states its own bounds, and none
+  of the six wanted the same pair.
+- The one exception is a figure your `retryAfterOf` read out of a **body**: past
+  `MAX_BODY_WAIT_MS` it is dropped, exactly as an unreadable body is. The header is
+  RFC 9110's own field and is never bounded, but a body field and its unit are per-vendor, so an
+  unbounded one lets a single JSON number state a wait past any `deadlineMs` and **refuse every
+  call** the loop makes. Above the ceiling the call does what the header alone says.
+- `maxBodyBytes` (default `MAX_RESPONSE_BYTES`) is a ceiling on the bytes **one response** puts in
+  memory, applied while reading rather than after: a response over it fails with
+  `<label> → body: …` instead of handing back a body your `res.json()` would misparse. It applies
+  only to a response you are HANDED (a 2xx, or an `allowStatuses` one). A response you never see —
+  an error body, and a 429 the loop only retries on — is read to a few kilobytes and the rest
+  dropped, so a hostile upstream cannot spend your RSS producing a 2 KB message however many times
+  it repeats the status. A 429 body is bounded by that same few kilobytes when your `retryAfterOf`
+  reads it, which is ample for a JSON rate-limit envelope.
+- A numeric option that is **not finite** is refused, not obeyed. `NaN` loses every comparison and
+  `Infinity` wins them all, so `maxBodyBytes: NaN` (what `Number(cfg.max_body_bytes)` yields for an
+  absent key) or `maxAttempts: Infinity` would not fail — it would silently switch the bound off.
+  Each is refused before the first request, as `<label> → body: …` / `<label> → attempts: …`;
+  `deadlineMs` and `now` are screened together as the budget they assemble.
+
+The `Retry-After` header is a **floor**, and `retryAfterOf` is a source of an *additional* hint,
+never a ceiling: whichever is longer wins. Do not clamp what your parser returns — retrying
+sooner than the vendor asked is what escalates a rate limit into a global ban, and this loop will
+not let a parser do it. A parser that throws or rejects — `res.clone().json()` against a CDN's HTML
+429 page — counts as no hint rather than failing the call, and the header floor still applies. A
+header set twice (a gateway plus the origin) reads as the longest wait either value states, not as
+no hint at all. An HTTP-date is read against the response's own `Date` header where there is one, so
+a skewed client clock cannot turn a stated wait into no hint.
+
+Errors never carry the request URL: several backends (Telegram) put a credential in the path, and
+a thrown message becomes an MCP `isError` result, i.e. model context. `label` identifies the call.
+Redaction covers the URL byte-for-byte, any `scheme://…` spelling of it, and every component that
+can carry a credential on its own — the whole path, every path segment **and every query value**
+that is `:`-bearing or long and not spelled like a method name (Telegram's `bot<id>:<token>` and
+Discord's punctuation-free webhook token are both covered; `getUpdates` and `chat.postMessage` are
+left in the body's prose, where an API's own error text uses them), and the userinfo, each in both
+its encoded and decoded spelling — so a proxy or a hostile body that echoes one fragment alone is
+covered too. Long means **longer than 8 characters**: at or under that lies the routing vocabulary a
+backend puts in a query string — Matrix's `timeout=30000`, Zulip's `dont_block=false` and
+`anchor=newest` — and striking those out would gut the body that explains itself with them.
+Userinfo takes neither exemption: it is credential-by-construction, so a short password is redacted
+too — a one-character password strikes that character out of the body wherever it appears, which is
+the trade a credential that short buys. A query value is also read in the spelling that is on the
+**wire**, not only the one the URL parser hands back: `URLSearchParams` decodes `+` to a space and
+`%2F` to `/`, so a standard-base64 key is redacted in its raw form as well as its decoded one.
+The method-name exemption is bounded at **24 characters**: a longer run of letters and
+dots is a JWT or an alphabetic token, not a word, and is redacted like any other opaque segment.
+A bare `host/path` with no scheme is not treated as a URL, so keep credentials out of the host, out
+of a path segment or query value short enough to pass for `api` or `v1`, and out of one
+**24 characters or shorter** spelled with letters and dots alone — `postMessage` is
+indistinguishable from an 11-letter secret.
+
+A rejection is labelled and redacted whatever the caller's own `signal` is doing. Only an abort
+that IS the caller's own comes back raw — tearing a plugin down mid-request cannot turn a DNS or
+TLS failure into an unenveloped one just by racing it.
+
+## Helpers
+
+- **`delay(ms)`** — a `setTimeout` promise: the copy the backends that wait are meant to share. A
+  consumer that still defines its own duplicate instead of importing this one is recorded by name in
+  this package's tests, so no *new* copy of any export here can appear unrecorded.
+- **`retryAfterFromHeader(res)`** — milliseconds from `Retry-After`, in **both** RFC 9110 forms
+  (`delay-seconds`, decimal only, plus the de-facto fraction; and HTTP-date), or `undefined` when
+  the header carries no usable hint. A multi-valued header yields the **longest** wait any of its
+  field-values states.
+- **`bodyRetryAfter(hintOf, unitMs?)`** — build the `retryAfterOf` hook for a vendor that also
+  states the wait in the 429 BODY (`retry_after`, `retry_after_ms`, `retry-after`,
+  `parameters.retry_after` — four vendors, four fields, two units). The LONGER of header and body
+  wins, so neither can shorten the other: a body cannot undercut the standard header, and a CDN's
+  short header cannot undercut the vendor's own figure. A body no parser can read means "no usable
+  hint" rather than an error out of the retry loop, and the result is returned UNCLAMPED so nothing
+  retries sooner than the vendor asked.
+- **`sanitizeBody(text)`** — bound and flatten an untrusted response body before it goes in an
+  Error: truncates at `MAX_ERROR_BODY` (never between the halves of an astral character) and strips
+  every Unicode control (`Cc`, i.e. C0, C1 and DEL) and format (`Cf`, i.e. bidi overrides,
+  isolates, joiners, BOM) character, plus U+2028/U+2029, replacing unpaired surrogates. It bounds
+  and flattens only — the body's words still reach the reader.
+
+## Rejected config values
+
+A backend refuses a `backend_config` value on its SHAPE, and the refusal names the value. Rendering
+it is where five plugins each grew a copy, and where a caller's value gets to fight back: a
+null-prototype object, a bigint, a circular structure the YAML parser builds from an anchor, or a
+`toJSON` that raises all break a naive `String(v)` — the plugin's labelled load error becomes a bare
+`TypeError`, or the caller's own text, in the operator's log and in the model context core renders a
+seam error into.
+
+- **`describeConfigValue(key, value)`** — the value as one bounded, flattened line, whatever it is.
+  Never throws, and never carries text the value's own rendering raised. `NaN` and `Infinity` stay
+  readable, which `JSON.stringify` alone does not manage. A container is DESCRIBED (`an object`,
+  `an array`), never enumerated, and a `key` naming a credential carrier — `password`, `token`,
+  `url`, `cert`, … — is described by shape whatever type it arrives as, so a secret nested anywhere
+  inside a mistyped value never reaches a log line.
+
+## Testing subpath
+
+`@sharptrick/parley-net-util/testing` carries the corpora and the harness a BACKEND crosses over its
+own `backend_config` validator. Kept off the production entry point, so the shipped module stays
+dependency-free; `vitest` is an optional peer, needed only by whoever imports this subpath.
+
+- **`expectLabelledRefusal(plugin, spec)`** — the whole class in one call. A backend states its own
+  label, keys and entry point; the harness crosses `NEVER_RENDERABLE`, `WRAPPING_A_SECRET` and
+  `UNSAFE_TEXT` over them and asserts what is the same everywhere: the refusal is still the PLUGIN's
+  labelled load error, it names the key, it is one bounded line, and it carries neither the caller's
+  own text nor anything a container held.
+- **`NEVER_RENDERABLE`** / **`RENDER_LEAK_SENTINEL`** — the values that break a naive renderer
+  (circular, bigint, null-prototype, no JSON form and no string form, a `toJSON` that raises
+  `RENDER_LEAK_SENTINEL`).
+- **`WRAPPING_A_SECRET`** / **`PLANTED_SECRET`** — containers holding a secret, for the branch that
+  admits every non-string.
+- **`UNSAFE_TEXT`** / **`FORBIDDEN_IN_RENDER`** — the text corpus and the code-point class no
+  rendered value may carry: a line or paragraph separator, a bidi override, or 4KiB of one
+  character. Every entry survives `JSON.stringify` intact, so these are the rows that actually reach
+  `sanitizeBody` — a hostile OBJECT never does, because it is described rather than rendered.
+
+## Plaintext-credential classification
+
+- `isLoopbackHost(hostname)` — loopback iff the host is exactly `localhost` or a literal
+  `127.0.0.0/8` / `::1` address. A parse, not a prefix match, so a resolvable DNS name shaped like an
+  address (`127.0.0.1.example.com`, `localhost.example.com`) is classified by what it *is* and still
+  gets warned about. Anything unproven — including an IPv4-mapped spelling of a loopback address —
+  counts as remote: the safe direction is to warn.
+- `isBaseUrl(value)` — true for a BASE URL a plugin may concatenate request paths onto: an absolute
+  `http:`/`https:` URL carrying no userinfo, query or fragment. A parse, so a bare host or a
+  relative path answers false rather than being dialled. Userinfo is **refused, never stripped**: a
+  credential written into a base URL is one the operator believes is authenticating the link, while
+  every plugin here authenticates from its own config keys — so stripping it silently leaves a
+  deployment that reads as configured and connects as anonymous. It is also disclosed by every
+  diagnostic that names the base URL, which no response-body redaction reaches.
+- `plaintextRemoteOrigin(url)` — the ORIGIN to name when the URL would put a credential on the wire
+  in the clear, else `undefined`. Naming the origin rather than the whole configured URL keeps a
+  secret smuggled into a path out of stderr, and out of the tool result core hands the model. The
+  cleartext side is everything that is **not** a known-secure scheme (`https:`, `wss:`), so `ws:` —
+  how a gateway handshake carries a bot token — warns, and so does a scheme this classifier has
+  never met: `undefined` reads as "no plaintext-credential risk", which is not an answer to give
+  about an unproven scheme. A URL with no host (`file:`, `mailto:`) names no remote endpoint and
+  answers `undefined`.
+
+- `PlaintextCredentialRisk` — `{ key, origin, exposes }`: the `backend_config` key whose value
+  opens the boundary, the endpoint it names (no userinfo, path or query), and the keys holding the
+  secrets that endpoint receives. Every backend's plaintext-credential warning is computed as one of
+  these and rendered from it only where it is written to stderr, so a test asserts the risk rather
+  than the sentence: a warning reworded to deny the risk still names the same words, and a
+  substring check cannot tell it from the truth. There is no shared renderer — what to do instead
+  (`rediss://`, `sslmode=require`, `backend_config.tls`, `xmpps://`) and how the secret travels (a
+  URL path, a Basic header, a CONNECT frame) are each backend's own, and are not fields.
+
+These live here so the backends that warn about the same thing share one classifier: a security
+predicate copied per backend is a predicate fixed in one place and left wrong in the others. One
+fork is outstanding rather than hypothetical: `bridge-discord` needs the scheme to recommend as
+well as the origin to name, which a `string | undefined` return cannot carry, so it classifies with
+a local copy that fails the other way (it warns only about schemes it knows). Widening the return
+here is what retires that copy; until it lands, this package's tests fail on the day a *second*
+fork appears — by name where one collides with an export here, and by BEHAVIOUR otherwise: a
+module-level function that decides something about a loopback address without asking this package
+is a fork whatever it is called.
+
+## Constants
+
+Every figure below is exported, and the export is where it is written down.
+
+`DEFAULT_BACKOFF_MS`, `DEFAULT_MAX_ATTEMPTS`, `DEFAULT_DEADLINE_MS`, `MAX_ERROR_BODY`,
+`MAX_RESPONSE_BYTES` (the default `maxBodyBytes`), `MAX_BODY_WAIT_MS` (past which a wait read out
+of a 429 body is dropped rather than adopted), `STOP_POLL_MS` (how often a backoff re-reads
+`isStopped()`, i.e. the longest a disconnect waits on one).
 
 ## Why this is not `bridge-core`
 
-`bridge-core` is a dependency-free seam that the non-HTTP backends (SQLite, Redis, NATS, Postgres)
-consume without any HTTP concerns. The retry loop lives here instead so core stays HTTP-free.
+`bridge-core` is a dependency-free seam, and several backends consume it without any HTTP concerns
+at all. The retry loop lives here instead so core stays HTTP-free. Note that "not an HTTP backend"
+and "not a consumer of this package" are different claims: Postgres and XMPP speak their own wire
+protocols and still depend on this package for `delay`.
 Per-backend specifics that genuinely differ — auth-header building, body encoding, the
 `Retry-After` **parser**, and transport response *shapes* (Slack's `ok:false` envelope, XMPP IQ) —
 stay in each plugin. Only the loop/guard/cap/default/`stopped` semantics are shared.

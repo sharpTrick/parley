@@ -1,0 +1,200 @@
+[
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "concurrency-and-failure",
+  "theme": "unbounded-retry",
+  "class": "no-attempt-or-deadline-cap-on-429-loop",
+  "file": "packages/bridge-net-util/src/index.ts",
+  "line": 43,
+  "summary": "429 loop has no attempt cap, deadline or escalation; a permanently-429 backend hangs the MCP call forever, bypassing catchup.block_max_ms."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "unenforced-delegated-contract",
+  "class": "backoff-clamp-documented-but-not-applied",
+  "file": "packages/bridge-net-util/src/index.ts",
+  "line": 47,
+  "summary": "The 'MUST cap at 5000, default 500' backoff contract is JSDoc delegated to five plugin parsers; fetchWithRetry clamps nothing, so retryAfterOf()=>0 gives ~850 req/s against the operator's own account."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "security",
+  "theme": "untrusted-inbound-into-agent-context",
+  "class": "unbounded-unsanitized-error-body-in-thrown-message",
+  "file": "packages/bridge-net-util/src/index.ts",
+  "line": 51,
+  "summary": "Non-2xx path reads the whole body and embeds it verbatim in the Error, which becomes an isError tool result: 5MB body -> 5,000,009-char message, and a prompt-injection path that bypasses the untrusted-message framing."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "protocol-conformance",
+  "theme": "cursor-contract-unfrozen",
+  "class": "pagination-nextcursor-never-exercised",
+  "file": "packages/conformance/src/index.ts",
+  "line": 36,
+  "summary": "Suite never passes a truncating limit, so nextCursor=topic-tail passes. 250 messages + limit 100 silently loses 150."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "conformance-coverage-gap",
+  "class": "normalized-message-fields-unasserted",
+  "file": "packages/conformance/src/index.ts",
+  "line": 30,
+  "summary": "Only content/backendMsgId/cursor asserted; constant senderHandle and constant topic both pass. Constant topic collapses the dedup namespace across topics."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "protocol-conformance",
+  "theme": "conformance-coverage-gap",
+  "class": "subscribe-ordering-and-no-history-replay-unverified",
+  "file": "packages/conformance/src/index.ts",
+  "line": 75,
+  "summary": "Live case posts one message to a fresh topic, so neither ascending-cursor order nor no-history-replay is testable. Reversed delivery passes; replay-from-0 (BUG-11) passes."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "stale-package-claims",
+  "class": "documented-consumer-set-contradicts-dependency-graph",
+  "file": "packages/bridge-net-util/README.md",
+  "line": 14,
+  "summary": "README/JSDoc/npm description say HTTP backends only; redis, postgres and xmpp all import delay from it. 8 of 10 backends depend on it."
+ },
+ {
+  "target": "shared",
+  "severity": "blocking",
+  "verdict": "CONFIRMED",
+  "lens": "truth-in-docs",
+  "theme": "stale-package-claims",
+  "class": "verified-backend-list-half-missing",
+  "file": "packages/conformance/README.md",
+  "line": 5,
+  "summary": "Claims five backends are verified; ten are. Its copied ConformanceContext omits supportsBlockingFetch, so a new author silently loses the blocking-fetch case."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "design-principles",
+  "theme": "silent-opt-out",
+  "class": "optional-capability-flag-defaults-to-lost-coverage",
+  "file": "packages/conformance/src/factory.ts",
+  "line": 28,
+  "summary": "supportsBlockingFetch/concurrentPost are opt-in, so forgetting them silently reduces coverage instead of failing."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "correctness",
+  "theme": "conformance-coverage-gap",
+  "class": "seam-method-never-exercised",
+  "file": "packages/conformance/src/index.ts",
+  "line": 20,
+  "summary": "resolveIdentity, one of the six seam methods, is never called by the suite."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "protocol-conformance",
+  "theme": "contract-branch-with-no-implementation",
+  "class": "documented-alternative-forbidden-by-the-suite",
+  "file": "packages/conformance/src/index.ts",
+  "line": 66,
+  "summary": "seam.ts permits NoSuchTopicError for an absent topic; the suite hard-requires an empty page, so the documented alternative fails conformance. No plugin implements it."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "concurrency-and-failure",
+  "theme": "shutdown-semantics",
+  "class": "stop-checked-only-after-the-next-request",
+  "file": "packages/bridge-net-util/src/index.ts",
+  "line": 46,
+  "summary": "isStopped is checked only after a response, so a disconnect during backoff still costs one more request with torn-down credentials; delay is not abortable or unref'd."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "assertion-does-not-match-name",
+  "class": "test-name-claims-timing-it-never-measures",
+  "file": "packages/bridge-net-util/test/fetch-with-retry.test.ts",
+  "line": 151,
+  "summary": "'waits precisely the caller-supplied backoff' measures no time; it certifies the hot-loop behaviour of the clamp finding."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "maintainability",
+  "theme": "unenforced-delegated-contract",
+  "class": "five-way-duplication-behind-a-shared-module",
+  "file": "packages/bridge-net-util/src/index.ts",
+  "line": 22,
+  "summary": "All five readRetryAfter implementations share a byte-identical header/clamp/default prologue; only the body field differs. BUG-41 had to be fixed five times."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "operability-and-release",
+  "theme": "build-gate-blind-spot",
+  "class": "test-directory-excluded-from-typecheck",
+  "file": "packages/bridge-net-util/tsconfig.json",
+  "line": 6,
+  "summary": "include is src/** only, so the package's only test file is never typechecked by npm run build."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "operability-and-release",
+  "theme": "npm-metadata-gap",
+  "class": "published-package-missing-discoverability-metadata",
+  "file": "packages/conformance/package.json",
+  "line": 5,
+  "summary": "The only published package with no keywords at all, and its exports omit ./package.json."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "test-integrity",
+  "theme": "conformance-coverage-gap",
+  "class": "test-harness-itself-untested",
+  "file": "packages/conformance/src/index.ts",
+  "line": 20,
+  "summary": "The conformance package ships zero tests of its own; vitest exits 1 with 'No test files found'."
+ },
+ {
+  "target": "shared",
+  "severity": "suggestion",
+  "verdict": "CONFIRMED",
+  "lens": "maintainability",
+  "theme": "misleading-names",
+  "class": "parameter-named-for-an-expectation-but-used-as-a-limit",
+  "file": "packages/conformance/src/index.ts",
+  "line": 10,
+  "summary": "drainAll(.., expectedAtMost) passes straight through as fetchRecent's limit and reads exactly one page; it does not drain."
+ }
+]

@@ -32,3 +32,16 @@ read-state.json
 
 # Local project tooling metadata (not part of the repo)
 .project.yml
+
+# Throwaway probe scripts written at the repo root while investigating a backend by hand.
+# They import from dist/ and are never part of a package; a real test lives under a package's
+# test/ directory instead.
+/probe*.mjs
+/probe*.ts
+/scratch*.mjs
+/.*-smoke.mjs
+
+# `zz-` is the reserved prefix for a throwaway probe written INSIDE a package while investigating
+# it. Vitest collects `*.test.ts`, so an un-ignored probe would silently join the real suite —
+# keep the prefix, so that a scratch file cannot become a test nobody meant to ship.
+**/zz-*.test.ts

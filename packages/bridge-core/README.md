@@ -23,14 +23,57 @@ interface BackendPlugin {
 }
 ```
 
-A conforming backend guarantees two things (checked by `@sharptrick/parley-conformance`):
+A conforming backend guarantees four things (checked by `@sharptrick/parley-conformance`):
 
 1. a **stable, unique `backendMsgId`** per message — the dedup key;
 2. **monotonic, in-order, exclusive-`since` cursor delivery** — `fetchRecent` returns messages
-   pre-sorted ascending and `subscribe`'s handler fires in ascending order per topic.
+   pre-sorted ascending and `subscribe`'s handler fires in ascending order per topic;
+3. `subscribe` delivers a **subset** of the post-subscribe tail and no more — never a message from
+   before the subscription, never one twice. It is not required to deliver all of it: a delivery
+   window that cannot cover a burst is conformant, and what push left out comes back from the next
+   `fetchRecent`;
+4. …but it is required to deliver. A live subscriber does not fall behind a **quiet** topic — one
+   written a message at a time, each delivered before the next is sent.
 
-`cursor` and `backendMsgId` are opaque strings — core never parses or compares them. `timestamp`
-is informational only; ordering and dedup never use it.
+The suite also grades one thing that is not a backend guarantee at all: that core's own
+`parley_fetch_recent`, driven over the plugin, hands a resuming session everything it missed. That
+clause is a property of the tool rather than of any plugin, which is why it is not a fifth item
+here — but it is the half of the lossy-push bargain an agent actually calls, and it belongs to the
+same contract.
+
+It too has a REACH, and it is a DEPTH: the session it strands is behind by a backlog drawn per run
+from 12–16 messages, paged five at a time. A read that serves an honest page until the caller is
+further behind than that, and loses rows only past it, is outside the clause. Measured while the
+backlog was the fixed 12: a plugin that dropped half of every resumed page once the reader was more
+than N behind was certified 36 of 36 at N = 12, 13, 20, 50 and 200, and was caught only at N = 5 —
+a reach of eleven messages behind. Drawing the backlog and placing a control at the far edge is
+what closes the constant, not the class: a loss that begins at 17 rows behind is still outside it.
+
+The suite grades (4) to a stated REACH, not in general, and the difference matters to anyone
+reading this as a promise. It holds a live path over a drawn depth of 10–13 messages ON ONE
+SUBSCRIPTION, written one at a time (12–15 deliveries wherever the fixture can supply a second
+writer), the ~1 s it holds that subscription idle mid-run, a BACKLOG of 10 rows already on the
+topic when the subscription opens (the topic reaches 22–25 rows by the end of the case, or 20–23
+where `concurrentPost` is `'unsupported'` — but what the live path is held over is the backlog it
+subscribed across), three concurrent subscriptions on one connection, a burst of five to eight in
+flight (five on every run), payloads and writer handles drawn per run, and the payload SHAPES a
+real message carries — longer than a token, non-ASCII, a newline or a tab. A backend may refuse a
+shape, and then it is graded on neither path — but it must DECLARE the refusal
+(`refusesContentShapes`) and the write clause holds it to that refusal being real, so the shape
+axis reaches exactly the shapes each backend did not withdraw, in the open. Today that is all six
+everywhere but Zulip, which refuses the surrounding-spaces row because its server strips trailing
+whitespace on send: five there. Plus one fixed
+per-message bound (2.5 s). A path that
+only fails past those figures — one that dies at 3 s of age, or above 40 rows, or that caps
+deliveries per CONNECTION rather than per subscription (nothing here offers one connection twenty),
+or whose delay GROWS per message until it is minutes late — is **not conforming** and is **not
+caught here**. Reaching further costs wall clock on every backend's run, which is the trade this
+figure records.
+
+`cursor` and `backendMsgId` are opaque strings — core never parses one and never orders by one. It
+does compare two for byte equality: `backendMsgId` is the dedup key, and two cursors are compared
+as the no-progress brake in `catchUpTopic`. A cursor naming a position must therefore be
+byte-stable across calls. `timestamp` is informational only; ordering and dedup never use it.
 
 ## What this package builds
 
@@ -40,7 +83,7 @@ is informational only; ordering and dedup never use it.
 | Config | `ConfigSchema`, `parseConfig`, `loadConfig`, `instanceIdOf` | Validates `parley.config.yaml`. |
 | Allowlist | `Allowlist`, `TopicNotAllowedError` | `config.topics` **is** the allowlist — no wildcard default. |
 | Engine | `SeenSet`, `ReadStateStore`, `catchUpTopic` / `catchUpAll` | Dedup set, per-instance read-cursor persistence, catch-up orchestration. |
-| Reactive tools | `registerTools` | `parley_fetch_recent` / `parley_post` / `parley_reply` MCP tools. |
+| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_live_status` MCP tools. |
 | Live push | `emitChannel`, `channelMeta`, `startPushLoop` | Emits `claude/channel` `<channel>` notifications to already-running Code sessions. |
 | Local bridge | `buildBridge`, `createStdioBridge` | Composes plugin + tools + push loop into one stdio MCP server. |
 | Remote bridge (v0.2) | `buildReactiveServer`, `createRemoteHttpApp`, `createOAuthRemoteApp` | Streamable-HTTP transport + single-tenant OAuth 2.1 + PKCE front door. |
@@ -50,31 +93,49 @@ is informational only; ordering and dedup never use it.
 ## Config (`parley.config.yaml`)
 
 ```yaml
-backend: local-sqlite          # which plugin to load
-instance_id: agent-main        # read-state namespace; DISTINCT per concurrent session sharing a handle
+# No `backend:` key — the backend is whichever parley-<name> binary you run
+# (parley-sqlite here). A config carrying one is rejected at load.
+instance_id: agent-main         # read-state namespace; DISTINCT per concurrent session sharing a handle
 identity: { handle: "agent" }
 topics: ["ctx-demo"]            # THE allowlist — no wildcard default
-catchup: { on_start: true, limit: 100 }
+post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching topics of at most `MAX_MATCH_INPUT` characters
+                                # (`MAX_MATCH_INPUT`); not subscribed. A longer topic must be
+                                # listed in `topics`.
+catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
-permissions: { skip_permissions: false }   # sandbox-only; default OFF, never flip on as convenience
 backend_config:                 # opaque to core; passed verbatim to the plugin's connect()
   db_path: "./parley.db"
 ```
 
 `backend_config` is the only backend-specific part of this file — see the plugin's own README for
 its shape. Two concurrent sessions must never share an `instance_id` (or default handle) — each
-owns its own read-state file, and a clash silently clobbers the other's catch-up position.
+owns its own read-state file. A clash is a PER-TOPIC race, not a lost session: every flush re-reads
+the file and writes back only the topics that session advanced, so the loser re-reads or skips
+messages on the contended topic only, positions on topics it advanced alone survive, and the file
+is never left half-written. Cursors are backend-specific too, so an instance repointed at a
+different backend needs a fresh `instance_id` (or its old read-state deleted); catch-up fails with
+a message saying exactly that.
+
+`permissions.skip_permissions` is parsed but unimplemented; setting it to `true` is a load error
+rather than a silent no-op.
 
 ## MCP tools exposed
 
 | Tool | Role | Effect |
 |---|---|---|
-| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit? }` → `{ messages, nextCursor }`. Marks returned ids seen so the push loop won't re-deliver them. |
+| `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms?, from? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. With NO `since` it resumes from this instance's persisted read position, so a session that was down comes back to the oldest message it has not seen and pages forward from there; `from: "recent"` asks for the backend's newest page instead of resuming — what is happening now rather than a month of paging forward to reach it — and leaves the stored position alone, so the backlog it skipped is still reachable; with no position to resume from — the remote HTTP root keeps none, and a first-ever read of a topic has none yet — it answers with the backend's recent window, and nothing older than that window is reachable from it. The position advances only on a read that actually resumed from it, so a `since` the caller chose is read from but never drags the position over messages the agent was not handed. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is advertised on every deployment; a backend with no read primitive to park on rejects a **positive** `block_ms` with `BlockingFetchUnsupportedError` rather than answering with a page. `block_ms: 0` asks for no wait and is the ordinary catch-up read every backend serves, so it is answered with a page rather than refused. Marks returned ids seen so the push loop won't re-deliver them. |
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
-| `parley_reply` | write (channel) | Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
+| `parley_live_status` | liveness (reactive) | `{}` → `{ decided, topics }` or `{ decided, blockedBy }`. Whether the live push path is actually DELIVERING, per subscribed topic: `delivering` once a message has reached the agent through push, `not-delivering` when messages that arrived on that topic since the bridge armed reached the agent only through `parley_fetch_recent`, `no-traffic` before either — the backlog from before the bridge armed counts toward neither. A bridge configured so the two cannot be compared — push disabled, no dedup window (the remote HTTP root), or no start catch-up — answers `decided: false` with the reasons rather than reporting a health it did not observe. Two known limits: once the agent reads from a position the bridge cannot place relative to where it armed — after a restart on a backend whose empty page mints a new cursor, after a `from: "recent"` read, or past a boundary message that was deleted — a dead path reads `no-traffic` rather than `not-delivering`; and a message posted between start catch-up and the subscription arming counts as live-era, so a healthy path can read `not-delivering` until its next push. |
+| `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
 
-All three go through the topic `Allowlist` — any topic outside `config.topics` throws
-`TopicNotAllowedError`.
+Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in
+`config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely
+widens the read/write surface beyond `topics`. Anything else throws `TopicNotAllowedError`.
+
+That widening stops at a length: a pattern is matched only against topics of at most `MAX_MATCH_INPUT` characters
+(`MAX_MATCH_INPUT`, exported), because the count cap and the backtracking screen bound the matching
+work only while the input is bounded too. A longer topic is refused however well a pattern matches
+it — `config.topics` accepts one up to `MAX_TOPIC_LEN` characters, so list it there instead.
 
 ## Local (stdio) bridge
 

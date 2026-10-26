@@ -19,6 +19,12 @@ export interface FakeOidcClaims {
   issuerOverride?: string;
   /** Sign with a keypair NOT in the published JWKS (bad-signature case). */
   signWithRogueKey?: boolean;
+  /**
+   * Registered claims to leave OFF the token entirely. A claim a verifier only checks WHEN PRESENT
+   * is a check that does not run at all for a token that omits it, and no other knob here can mint
+   * that token.
+   */
+  omit?: readonly ('iss' | 'sub' | 'aud' | 'exp' | 'nbf' | 'iat')[];
 }
 
 export interface FakeOidc {
@@ -45,17 +51,30 @@ export async function startFakeOidc(): Promise<FakeOidc> {
 
   const app = express();
   let issuer = ''; // known once listening
+  // The stock-Keycloak field set, not the minimum the SDK schema demands: the AS-metadata mirror
+  // Parley republishes is only as good as what survives parsing, and a document carrying nothing
+  // beyond the required fields cannot show a field being dropped.
   app.get('/.well-known/openid-configuration', (_req, res) => {
     res.json({
       issuer,
       authorization_endpoint: `${issuer}/authorize`,
       token_endpoint: `${issuer}/token`,
       jwks_uri: `${issuer}/jwks`,
+      userinfo_endpoint: `${issuer}/userinfo`,
+      registration_endpoint: `${issuer}/clients-registrations/openid-connect`,
+      revocation_endpoint: `${issuer}/revoke`,
+      revocation_endpoint_auth_methods_supported: ['client_secret_basic', 'none'],
+      introspection_endpoint: `${issuer}/token/introspect`,
+      introspection_endpoint_auth_methods_supported: ['client_secret_basic'],
+      end_session_endpoint: `${issuer}/logout`,
       response_types_supported: ['code'],
+      response_modes_supported: ['query', 'fragment'],
       subject_types_supported: ['public'],
       id_token_signing_alg_values_supported: ['RS256'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic', 'none'],
       code_challenge_methods_supported: ['S256'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
+      scopes_supported: ['openid', 'profile', 'email', 'mcp'],
     });
   });
   app.get('/jwks', (_req, res) => {
@@ -75,6 +94,7 @@ export async function startFakeOidc(): Promise<FakeOidc> {
     async mint(claims: FakeOidcClaims = {}): Promise<string> {
       const nowS = Math.floor(Date.now() / 1000);
       const key = claims.signWithRogueKey === true ? rogue.privateKey : signing.privateKey;
+      const omitted = new Set<string>(claims.omit ?? []);
       const jwt = new SignJWT({
         ...(claims.scope !== undefined ? { scope: claims.scope } : {}),
         ...(claims.preferred_username !== undefined
@@ -82,14 +102,15 @@ export async function startFakeOidc(): Promise<FakeOidc> {
           : {}),
         ...(claims.realm_access !== undefined ? { realm_access: claims.realm_access } : {}),
         azp: claims.azp ?? 'fake-client',
-      })
-        .setProtectedHeader({ alg: 'RS256', kid })
-        .setIssuer(claims.issuerOverride ?? issuer)
-        .setSubject(claims.sub ?? 'owner-sub')
-        .setAudience(claims.aud ?? 'parley-mcp')
-        .setIssuedAt(nowS)
-        .setExpirationTime(nowS + (claims.expiresInS ?? 300));
-      if (claims.notBeforeInS !== undefined) jwt.setNotBefore(nowS + claims.notBeforeInS);
+      }).setProtectedHeader({ alg: 'RS256', kid });
+      if (!omitted.has('iss')) jwt.setIssuer(claims.issuerOverride ?? issuer);
+      if (!omitted.has('sub')) jwt.setSubject(claims.sub ?? 'owner-sub');
+      if (!omitted.has('aud')) jwt.setAudience(claims.aud ?? 'parley-mcp');
+      if (!omitted.has('iat')) jwt.setIssuedAt(nowS);
+      if (!omitted.has('exp')) jwt.setExpirationTime(nowS + (claims.expiresInS ?? 300));
+      if (claims.notBeforeInS !== undefined && !omitted.has('nbf')) {
+        jwt.setNotBefore(nowS + claims.notBeforeInS);
+      }
       return jwt.sign(key);
     },
     close(): Promise<void> {

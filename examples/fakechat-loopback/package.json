@@ -13,5 +13,8 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1"
+  },
+  "scripts": {
+    "typecheck:test": "tsc -p tsconfig.test.json"
   }
 }

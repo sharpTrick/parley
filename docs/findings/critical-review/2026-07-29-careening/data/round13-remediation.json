@@ -1,0 +1,80 @@
+{
+  "round": 13,
+  "phase": "remediation",
+  "base": "def8d75",
+  "blockingFindings": 33,
+  "closed": 33,
+  "waves": [
+    { "wave": 1, "targets": ["core", "postgres", "redis", "telegram"], "findings": 19 },
+    { "wave": 2, "targets": ["shared", "matrix", "nats", "sqlite"], "findings": 10 },
+    { "wave": 3, "targets": ["xmpp", "zulip", "slack", "discord"], "findings": 4 }
+  ],
+
+  "criticRemediationsCorrected": {
+    "count": 8,
+    "note": "Findings were reliably real — all 33 reproduced, none spurious. The REMEDIATIONS were not. This is now the single most consistent measurement of the run: critics locate defects well and prescribe fixes badly, and separating review from remediation is what keeps the prescriptions from landing.",
+    "cases": [
+      "telegram lock: the proposed re-read-after-claim is ITSELF a TOCTOU — A unlinks, claims, re-reads, then B unlinks A's fresh claim and both proceed. There is no POSIX unlink-if-this-inode.",
+      "redis credentials: calling plaintextRemoteOrigin as prescribed would warn on EVERY correctly-configured TLS deployment, because its SECURE_SCHEMES lacks rediss: — the fastest way to teach an operator to ignore warnings.",
+      "core reach budget: 'separate deadlines' does not work; two deadlines armed at the same instant share one clock. The budget has to charge for its own work. The agent found this by watching its own starvation row fail.",
+      "core OAuth shed: the obvious tie-break protects the owner but turns the store first-come-wins and broke an existing behavioural test driving 200 client ids.",
+      "net-util HTTP-date: 'build the instant with Date.UTC' LOOSENS the parser — V8 returns NaN for Nov 32 and 25:49:37 where Date.UTC rolls them into a plausible instant hours away.",
+      "net-util TZ: pinning TZ in CI would convert 'red for every non-UTC user' into 'green for everyone including the broken' — hiding the finding rather than fixing it.",
+      "conformance detector: widening deferredPromises would conflate two properties and widening casesIn would break the clause-count invariant the same file grades.",
+      "matrix alias: the prescribed reserved prefix buys nothing above the 64-bit digest floor core already sets; widening the suffix achieves the same disjointness with no new machinery."
+    ]
+  },
+
+  "findingsLargerThanFiled": [
+    "postgres: the critic reported topic collapse; the same transcoding also merges IDENTITIES — the second handle's backendRef comes back as the first handle's stored value, colliding on the _senders primary key.",
+    "redis: the read loop's catch-and-continue does not see a REJECTED promise, and MessageHandler returns void, so an async handler is legal — three posts produced three unhandled rejections, which on Node's default flags ends the bridge process.",
+    "sqlite: TWO of three class members were ungraded, not one. Recording the topic tail leaves the old suite fully green, and so does recording the caller's `since`.",
+    "slack: the finding named the splice trim, but the early break at collected.length >= limit is an INDEPENDENT second reader of position-as-age and misreads at any depth.",
+    "discord: the ratchet surfaced a sibling — subscribe() destructured a channel `type` that crashes on null and accepts the string '0', silently unwiring a good channel forever.",
+    "zulip: grading the class over every round trip found two more instances beyond the register window — readWindow guarding only after its request, and detached deletes running on the replacement transport."
+  ],
+
+  "testsThatGradedNothing": {
+    "note": "The round's dominant theme. Not missing tests — tests that existed, passed, and could not fail.",
+    "cases": [
+      "postgres hostile-input is wholly vi.mock('pg'); a fake that never encodes a bind parameter cannot decide a storage property. Binding content.normalize('NFC') in post leaves it 134/134 green.",
+      "core's ReDoS screen was never exercised at its boundary — no corpus row used {2}, the smallest was {8}.",
+      "core's e2e skip guard only required the substring 'process.env.' somewhere in the file, so a probe-gated skip passed.",
+      "core's presence CPU-budget table passed canPostTo: () => false with one topic per record, structurally stubbing out the dominant cost term it exists to bound.",
+      "nats' completeness gate derived its primitive list from the fake's own object keys, so a primitive the fake does not model could not be missing a row.",
+      "net-util's fork registry walked each consumer with a non-recursive readdirSync; three planted forks under a nested src/ left all 83 tests green.",
+      "the typecheck guard keyed on the PRESENCE of a tsconfig.test.json, so 23,572 lines of test source were never compiled while CI claimed otherwise."
+    ]
+  },
+
+  "selfCaughtByAgents": [
+    "core: an anti-stub ratchet written as expect(calls()).toBeGreaterThan(0) PASSED under a stub that still increments the counter. Replaced with an assertion about the returned value. A counter pins invocation, not semantics.",
+    "core: a scripted edit silently truncated 28 tests from presence.test.ts; caught by diffing describe lists against HEAD and restored verbatim.",
+    "core: source-hygiene.test.ts caught the agent using a NUL byte as a regex sentinel — the exact class that guard exists for, third occurrence in this repo.",
+    "xmpp: the first live test asserted the socket was closed on return, which grades UPSTREAM (stop() takes ~4s and leaves it open). Its replacement, counting redials, was a TAUTOLOGY — destroying the socket is what makes start() reject, so the unfixed code's own failure path passed the test.",
+    "zulip: the wake-path ratchet is honestly reported as non-deterministic (fails ~2 runs in 3); the fix was kept because its failure mode is one-sided."
+  ],
+
+  "orchestratorErrors": [
+    "TWICE a mutation regex silently failed to match, so the suite passed against UNMUTATED code and I nearly accepted that as proof — once on slack's ordering guard, once on zulip's register throw. Both were caught by checking that the mutation actually applied. This is the same failure the round kept finding in tests, committed by the operator verifying them.",
+    "The node_modules symlink optimisation made worktrees non-hermetic: npm workspaces use absolute symlinks, so a worktree resolved every sibling package to the MAIN checkout. A postgres agent reported a phantom repo-wide typecheck failure because of it. Replaced with a hard-link + re-point script, same zero disk cost.",
+    "A `git checkout --` during a mutation restore silently discarded an uncommitted 792->353 split; recovered from the worktree's index.",
+    "Piping vitest through `head` closed the pipe before the summary printed, so a full-suite run reported nothing and had to be repeated."
+  ],
+
+  "appealsGranted": [
+    { "target": "postgres", "netNonImport": 47, "reason": "all of it src/args.ts, the first tenth of a de-duplication that removes ~490 lines once the shared module lands" },
+    { "target": "redis", "netNonImport": 61, "reason": "the non-forgeable mint must exist for labelled() to have anything trustworthy to test" },
+    { "target": "telegram", "netNonImport": 99, "reason": "the sidecar is the only place a boundary-aligned rollback is detectable; the breaker is the smallest correct replacement for an unlink that deletes whatever it finds" },
+    { "target": "core", "netNonImport": 55, "reason": "30 lines are the two-direction CPU allowance closing a 49-second event-loop freeze; 14 the shed tier" }
+  ],
+
+  "openForRound14": [
+    "bridge-postgres has xmpp's teardown-races-setup defect unclosed: this.pool is published only after the awaited bootstrap, so disconnect() returns while a live pool holds connections and an advisory lock. Its own comment at index.ts:112-116 names the window.",
+    "The handler-contract row (a misbehaving handler must not disable live push) is graded in bridge-redis only; bridge-matrix carries the identical comment and the same void-returning seam type, so it likely has the same process-killing hole.",
+    "The served-vs-tail catch-up distinction is ungraded in packages/conformance, so NO backend is held to it.",
+    "Vendor-response ordering is graded in bridge-slack only; discord, telegram, zulip, matrix and postgres all page vendor-controlled history and none of their fakes can serve a mis-ordered response.",
+    "Unifying the cleartext-credential warning is blocked on plaintextRemoteOrigin being unable to classify a non-HTTP scheme at all.",
+    "Eight packages still declare MIT and ship no LICENSE text; pinned by exact equality so closing one forces its removal from the list."
+  ]
+}

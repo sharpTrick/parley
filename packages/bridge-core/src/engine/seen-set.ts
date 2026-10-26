@@ -1,20 +1,53 @@
 import type { BackendMsgId, Topic } from '../message.js';
 
 /**
+ * The dedup window every composition root gets: `new SeenSet()` takes no arguments, so these two
+ * numbers ARE the production capacity. Exported so the suite can grade the default-constructed
+ * instance against them instead of only against injected test values.
+ */
+export const SEEN_MAX_PER_TOPIC = 4096;
+export const SEEN_MAX_TOPICS = 256;
+
+function requirePositiveInt(name: string, value: number): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new RangeError(`SeenSet ${name} must be a positive integer (got ${value})`);
+  }
+}
+
+/**
  * Per-topic dedup set keyed on `backendMsgId` (DESIGN §6 — NEVER on timestamp).
  *
- * The same logical message can arrive twice: once via live push, once via `fetchRecent`
- * (a session that briefly dropped and reconnected). Core dedups on the stable backend id.
+ * The same logical message can arrive twice: once via live push, once via `fetchRecent`. That
+ * overlap is the NORMAL path, not an exception — push delivers a subset of the post-subscribe tail
+ * (seam.ts, clause 3) and a reconciling read is what covers the rest, so it routinely re-reads a
+ * region push has already served. Core dedups on the stable backend id.
  *
- * Bounded FIFO per topic so memory stays flat. The window only needs to cover the overlap
- * between a catch-up pull and the live poll — cursor monotonicity prevents re-fetching
- * ancient ids — so a few thousand ids per topic is ample.
+ * Bounded FIFO per topic so memory stays flat. What the window has to cover is one reconciling
+ * READ against the push traffic concurrent with it — the server-side page cap on
+ * `parley_fetch_recent` is the figure it is a budget against, and `seen-set.test.ts` grades the two
+ * together rather than restating either here. Cursor monotonicity keeps ancient ids from coming
+ * back at all.
+ *
+ * The NUMBER of topics is bounded too, LRU. A `post_topics` pattern leaves the topic space open and
+ * `fetch_recent` warms a bucket for whatever topic it is handed, so an agent reading ad-hoc topics
+ * would otherwise grow this map for the process lifetime. Eviction costs at most a duplicate
+ * `<channel>` emit on a topic that has gone cold — the push loop's own topics stay hot.
  */
 export class SeenSet {
   private readonly sets = new Map<Topic, Set<BackendMsgId>>();
   private readonly queues = new Map<Topic, BackendMsgId[]>();
 
-  constructor(private readonly maxPerTopic = 4096) {}
+  constructor(
+    private readonly maxPerTopic = SEEN_MAX_PER_TOPIC,
+    private readonly maxTopics = SEEN_MAX_TOPICS,
+  ) {
+    // Keep these refused rather than clamped, so that a degenerate cap cannot silently DELETE the
+    // window instead of shrinking it: the LRU sweep evicts the very bucket `record` is about to
+    // write into, `firstSeen` then answers true forever, and every message is re-emitted as a
+    // `<channel>` event with no error and no log.
+    requirePositiveInt('maxPerTopic', maxPerTopic);
+    requirePositiveInt('maxTopics', maxTopics);
+  }
 
   private bucket(topic: Topic): { set: Set<BackendMsgId>; queue: BackendMsgId[] } {
     let set = this.sets.get(topic);
@@ -22,8 +55,16 @@ export class SeenSet {
     if (set === undefined || queue === undefined) {
       set = new Set<BackendMsgId>();
       queue = [];
-      this.sets.set(topic, set);
-      this.queues.set(topic, queue);
+    } else {
+      this.sets.delete(topic);
+      this.queues.delete(topic);
+    }
+    this.sets.set(topic, set);
+    this.queues.set(topic, queue);
+    for (const stale of this.sets.keys()) {
+      if (this.sets.size <= this.maxTopics) break;
+      this.sets.delete(stale);
+      this.queues.delete(stale);
     }
     return { set, queue };
   }

@@ -27,13 +27,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "parley-discord": "./dist/cli.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },

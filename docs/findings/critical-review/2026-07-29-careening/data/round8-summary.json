@@ -1,0 +1,94 @@
+{
+  "round": 8,
+  "base": "d77ff75",
+  "wakeAll": true,
+  "protocolVersion": "v2, preflight-verified",
+  "targets": 14,
+  "errored": 0,
+  "counts": {
+    "confirmed": 71,
+    "blocking": 25,
+    "plausible": 2,
+    "total": 73
+  },
+  "byLens": {
+    "protocol-conformance": {
+      "total": 3,
+      "confirmed": 3,
+      "blocking": 1
+    },
+    "truth-in-docs": {
+      "total": 11,
+      "confirmed": 11,
+      "blocking": 1
+    },
+    "correctness": {
+      "total": 11,
+      "confirmed": 10,
+      "blocking": 5
+    },
+    "security": {
+      "total": 9,
+      "confirmed": 9,
+      "blocking": 6
+    },
+    "test-integrity": {
+      "total": 15,
+      "confirmed": 15,
+      "blocking": 7
+    },
+    "concurrency-and-failure": {
+      "total": 10,
+      "confirmed": 9,
+      "blocking": 4
+    },
+    "design-principles": {
+      "total": 5,
+      "confirmed": 5,
+      "blocking": 0
+    },
+    "seam-integrity": {
+      "total": 1,
+      "confirmed": 1,
+      "blocking": 1
+    },
+    "operability-and-release": {
+      "total": 4,
+      "confirmed": 4,
+      "blocking": 0
+    },
+    "maintainability": {
+      "total": 3,
+      "confirmed": 3,
+      "blocking": 0
+    },
+    "test-hygiene": {
+      "total": 1,
+      "confirmed": 1,
+      "blocking": 0
+    }
+  },
+  "byTarget": {
+    "core-seam": 5,
+    "core-engine": 6,
+    "core-auth": 5,
+    "sqlite": 5,
+    "redis": 5,
+    "postgres": 4,
+    "matrix": 6,
+    "xmpp": 6,
+    "nats": 4,
+    "zulip": 4,
+    "discord": 5,
+    "slack": 7,
+    "telegram": 6,
+    "shared": 5
+  },
+  "converged": false,
+  "blockingClean": false,
+  "quiescedTargets": [],
+  "nextQuiesced": [],
+  "tokens": 2653472,
+  "toolCalls": 701,
+  "wallMs": 8080503
+}

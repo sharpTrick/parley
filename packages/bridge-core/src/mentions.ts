@@ -1,10 +1,23 @@
 import { asHandle, type Handle } from './message.js';
 
-// `@` preceded by start-of-string or a non-handle char, then an alnum-led, alnum-ended token.
-// Handles may contain interior `-`, `_`, `.` (e.g. @ctx-payments) but not a trailing one, so
-// sentence punctuation ("ping @bob.") isn't absorbed into the handle. The leading guard stops
-// us matching emails like alice@example.com mid-token.
-const MENTION_RE = /(?:^|[^A-Za-z0-9_.@-])@([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)/g;
+// An alnum-led, alnum-ended token; interior `-`, `_`, `.` are allowed (e.g. @ctx-payments) but a
+// trailing one is not, so sentence punctuation ("ping @bob.") isn't absorbed into the handle.
+const HANDLE_BODY = '[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?';
+
+// `@` preceded by start-of-string or a non-handle char — the leading guard stops us matching
+// emails like alice@example.com mid-token.
+const MENTION_RE = new RegExp(`(?:^|[^A-Za-z0-9_.@-])@(${HANDLE_BODY})`, 'g');
+
+const HANDLE_RE = new RegExp(`^(?:${HANDLE_BODY})$`);
+
+/**
+ * True if `handle` is one {@link parseMentions} can produce — i.e. `@<handle>` in message content
+ * yields exactly `handle`. The mention-filter compares parsed mentions against a configured handle,
+ * so a handle failing this can never match anything.
+ */
+export function isMentionableHandle(handle: string): boolean {
+  return HANDLE_RE.test(handle);
+}
 
 /**
  * Parse @mentions from message content. SHARED by every backend so mention semantics

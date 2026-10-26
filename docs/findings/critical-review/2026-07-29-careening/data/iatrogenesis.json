@@ -1,0 +1,407 @@
+{
+ "method": "git blame at each round's BASE commit, at the finding's file:line, asking whether that line was last touched by a commit authored inside the experiment (round-1 base .. that round's base). Deterministic; no hand-coding.",
+ "caveats": [
+  "Line-granularity blame attributes the LAST touch. A round that reformats or moves a line without introducing the defect is credited with it, so this over-attributes.",
+  "A finding whose file:line points at a test rather than the defect it guards is attributed to the test's author, which is usually the previous round.",
+  "Round 1 is not gradeable: there was no prior experiment commit for a line to be attributed to.",
+  "Rounds 11, 12 and 14 were decomposition rounds that MOVED large amounts of code without changing it. Blame reports the last touch, so a line merely relocated by a split is charged to the experiment. Rounds 13 and 15 are therefore inflated on the self-induced side by an unknown amount, and their pre-existing counts are floors."
+ ],
+ "rounds": [
+  {
+   "round": 2,
+   "base": "4bc04e3",
+   "findings": 136,
+   "graded": 136,
+   "selfInduced": 36,
+   "preExisting": 100,
+   "unresolvable": 0,
+   "selfInducedPct": 26
+  },
+  {
+   "round": 3,
+   "base": "ddbeca9",
+   "findings": 119,
+   "graded": 119,
+   "selfInduced": 46,
+   "preExisting": 73,
+   "unresolvable": 0,
+   "selfInducedPct": 39
+  },
+  {
+   "round": 4,
+   "base": "7fb4c17",
+   "findings": 120,
+   "graded": 120,
+   "selfInduced": 68,
+   "preExisting": 52,
+   "unresolvable": 0,
+   "selfInducedPct": 57
+  },
+  {
+   "round": 5,
+   "base": "c9a6a2d",
+   "findings": 129,
+   "graded": 128,
+   "selfInduced": 77,
+   "preExisting": 51,
+   "unresolvable": 1,
+   "selfInducedPct": 60,
+   "note": "Round 5 reviewed with no docker daemon for its six service-backed targets, so its pre-existing count is a FLOOR: live-only defects could not surface."
+  },
+  {
+   "round": 6,
+   "base": "c0c229e",
+   "findings": 90,
+   "graded": 90,
+   "selfInduced": 72,
+   "preExisting": 18,
+   "unresolvable": 0,
+   "selfInducedPct": 80
+  },
+  {
+   "round": 7,
+   "base": "51d2c56",
+   "findings": 79,
+   "graded": 79,
+   "selfInduced": 52,
+   "preExisting": 27,
+   "unresolvable": 0,
+   "selfInducedPct": 66,
+   "note": "First fall in the series (80 -> 66). Pre-existing findings ROSE 18 -> 27. Verified by re-running the same oracle over rounds 5 and 6, which reproduced their recorded 60/72 and 80/81 exactly."
+  },
+  {
+   "round": 8,
+   "base": "d77ff75",
+   "findings": 73,
+   "graded": 72,
+   "selfInduced": 40,
+   "preExisting": 32,
+   "unresolvable": 1,
+   "selfInducedPct": 56,
+   "note": "Second consecutive fall (80 -> 66 -> 56). Pre-existing findings rose again, 18 -> 27 -> 32."
+  },
+  {
+   "round": 9,
+   "base": "8115eb3",
+   "findings": 71,
+   "graded": 71,
+   "selfInduced": 45,
+   "preExisting": 26,
+   "unresolvable": 0,
+   "selfInducedPct": 63
+  },
+  {
+   "round": 10,
+   "base": "ee7f157",
+   "findings": 75,
+   "graded": 75,
+   "selfInduced": 56,
+   "preExisting": 19,
+   "unresolvable": 0,
+   "selfInducedPct": 75
+  },
+  {
+   "round": 13,
+   "base": "def8d75",
+   "findings": 84,
+   "graded": 83,
+   "selfInduced": 69,
+   "preExisting": 14,
+   "unresolvable": 1,
+   "selfInducedPct": 83,
+   "note": "First round after the decomposition rounds 11-12. Inflated by relocation blame; see caveats."
+  },
+  {
+   "round": 15,
+   "base": "68960a7",
+   "findings": 111,
+   "graded": 106,
+   "selfInduced": 86,
+   "preExisting": 20,
+   "unresolvable": 5,
+   "selfInducedPct": 81,
+   "note": "First round under staged review. Findings rose 84 -> 111 while pre-existing rose only 14 -> 20, i.e. the extra thoroughness mostly surfaced more of the experiment's own output."
+  },
+  {
+   "round": 16,
+   "base": "a540855",
+   "findings": 103,
+   "graded": 103,
+   "selfInduced": 76,
+   "preExisting": 27,
+   "unresolvable": 0,
+   "selfInducedPct": 74,
+   "note": "The first scored round against a tree nobody restructured, and the test named in round 15's entry. Pre-existing findings 20 -> 27 and pre-existing BLOCKING 6 -> 10, back into the rounds 7-10 band."
+  },
+  {
+   "round": 17,
+   "base": "8e8d22e",
+   "findings": 89,
+   "graded": 87,
+   "selfInduced": 75,
+   "preExisting": 12,
+   "unresolvable": 2,
+   "selfInducedPct": 86,
+   "note": "Run in three batches of five targets after twelve container reprovisions killed three all-or-nothing attempts. Same base for all three."
+  },
+  {
+   "round": 18,
+   "base": "e54346b",
+   "findings": 103,
+   "graded": 97,
+   "selfInduced": 86,
+   "preExisting": 11,
+   "unresolvable": 6,
+   "selfInducedPct": 89,
+   "note": "First round after a remediation that was fixes rather than decomposition, so blame inflation is far smaller than rounds 13/15/17 carried."
+  },
+  {
+   "round": 19,
+   "base": "27ab24e",
+   "findings": 89,
+   "graded": 89,
+   "selfInduced": 75,
+   "preExisting": 14,
+   "unresolvable": 0,
+   "selfInducedPct": 84,
+   "note": "The decisive point for the pre-registered exhaustion threshold."
+  },
+  {
+   "round": 20,
+   "base": "c34eab5",
+   "findings": 101,
+   "graded": 95,
+   "selfInduced": 79,
+   "preExisting": 16,
+   "unresolvable": 6,
+   "selfInducedPct": 83,
+   "note": "First round with unresolvable entries (6): findings anchored at line numbers past the end of the file at the round's base — a critic citing a line in a file it had mutated, or a stale anchor. Recorded rather than silently dropped; they are excluded from the graded denominator."
+  },
+  {
+   "round": 21,
+   "base": "88f0daf",
+   "findings": 188,
+   "graded": 171,
+   "selfInduced": 155,
+   "preExisting": 16,
+   "unresolvable": 17,
+   "selfInducedPct": 91,
+   "blocking": 23,
+   "blockingSelfInduced": 21,
+   "blockingPreExisting": 2,
+   "note": "Base carries the Sept 2-9 simplification (removals, decompositions, test deletions), so blame charges moved lines to the experiment and this is a ceiling. 17 unresolvable anchors excluded. The blocking denominator (23) is the oracle's graded subset of the round's 28 confirmed blocking findings."
+  }
+ ],
+ "comparison": {
+  "ouroboros": {
+   "value": 66.7,
+   "method": "post-hoc hand-label by the same agent that authored the fixes being judged",
+   "note": "ouroboros's own corrections section flagged this as its weakest number"
+  }
+ },
+ "blockingOnly": {
+  "method": "Same git-blame oracle, restricted to CONFIRMED findings of severity=blocking — the ones that gate the stop rule and represent real risk.",
+  "why": "Overall iatrogenesis mixes suggestions and blocking findings. The blocking split is what says whether the loop is still finding things that MATTER in the original codebase, or is now mostly finding and fixing its own.",
+  "rounds": [
+   {
+    "round": 2,
+    "blocking": 49,
+    "selfInduced": 13,
+    "preExisting": 36,
+    "selfInducedPct": 27
+   },
+   {
+    "round": 3,
+    "blocking": 38,
+    "selfInduced": 13,
+    "preExisting": 25,
+    "selfInducedPct": 34
+   },
+   {
+    "round": 4,
+    "blocking": 45,
+    "selfInduced": 25,
+    "preExisting": 20,
+    "selfInducedPct": 56
+   },
+   {
+    "round": 5,
+    "blocking": 39,
+    "selfInduced": 28,
+    "preExisting": 11,
+    "selfInducedPct": 72
+   },
+   {
+    "round": 6,
+    "blocking": 26,
+    "selfInduced": 21,
+    "preExisting": 5,
+    "selfInducedPct": 81
+   },
+   {
+    "round": 7,
+    "blocking": 23,
+    "selfInduced": 13,
+    "preExisting": 10,
+    "selfInducedPct": 57
+   },
+   {
+    "round": 8,
+    "blocking": 25,
+    "selfInduced": 15,
+    "preExisting": 9,
+    "selfInducedPct": 62
+   },
+   {
+    "round": 9,
+    "blocking": 28,
+    "selfInduced": 17,
+    "preExisting": 11,
+    "selfInducedPct": 61
+   },
+   {
+    "round": 10,
+    "blocking": 29,
+    "selfInduced": 21,
+    "preExisting": 8,
+    "selfInducedPct": 72
+   },
+   {
+    "round": 13,
+    "blocking": 33,
+    "selfInduced": 27,
+    "preExisting": 6,
+    "selfInducedPct": 82
+   },
+   {
+    "round": 15,
+    "blocking": 34,
+    "selfInduced": 28,
+    "preExisting": 6,
+    "selfInducedPct": 82
+   },
+   {
+    "round": 16,
+    "blocking": 39,
+    "selfInduced": 29,
+    "preExisting": 10,
+    "selfInducedPct": 74
+   },
+   {
+    "round": 17,
+    "blocking": 30,
+    "selfInduced": 26,
+    "preExisting": 4,
+    "selfInducedPct": 87
+   },
+   {
+    "round": 18,
+    "blocking": 29,
+    "selfInduced": 28,
+    "preExisting": 1,
+    "selfInducedPct": 97
+   },
+   {
+    "round": 19,
+    "blocking": 32,
+    "selfInduced": 24,
+    "preExisting": 8,
+    "selfInducedPct": 75
+   },
+   {
+    "round": 20,
+    "blocking": 25,
+    "selfInduced": 19,
+    "preExisting": 6,
+    "selfInducedPct": 76
+   }
+  ],
+  "reading": "Pre-existing blocking, rounds 2-20: 36, 25, 20, 11, 5, 10, 9, 11, 8, 6, 6, 10, 4, 1, 8, 6. Round 19 refuted the pre-registered exhaustion threshold (three consecutive below 8 against an unrestructured tree) by returning 8 after 4 and 1. Round 20 returns 6 — below 8 again, but the series as a whole is now the result: across the sixteen gradeable rounds (17 scored; round 1 is not gradeable) the count OSCILLATES IN A BAND rather than decaying toward zero. Since round 6 it has never left 1-11, and every excursion to the bottom of that band has been followed by a return. The instrument is not converging; it is in a steady state where each round's remediation creates roughly as much new surface as it closes.",
+  "whatWouldChangeThis": "Three or more consecutive scored rounds below 8 against a tree that is not being restructured. One round below the band is not enough; that is the error this entry corrects.",
+  "whyTheRefutationIsStrongerThanItLooks": "Blame inflation biases this number DOWNWARD, not upward. When remediation rewrites or moves a line, git blame attributes it to the experiment, so a finding on that line counts as self-induced and the pre-existing count falls. Round 18's remediation was the largest of the run -- 31 blocking findings across eleven packages plus the repo-wide layer -- so round 19 read a tree carrying maximum inflation against it. It still surfaced 8. The true pre-existing rate is therefore AT LEAST 8 and plausibly higher.",
+  "whatThisSaysAboutTheDips": "Every dip (13, 15, 17, 18, 20) followed a large remediation, and blame charges the mover. The dip tracks HOW MUCH THE PREVIOUS ROUND REWROTE, not how much of the original codebase remains. Round 20 followed the largest remediation of the run — 32 blocking findings across 18 commits touching every package — so its 6 is a floor by the same argument that made rounds 13 and 15 floors. The pre-registered threshold cannot be evaluated against a tree the experiment keeps rewriting, which is itself the finding: the stop rule was designed for a codebase under review, and what was actually built was a codebase under continuous reconstruction."
+ },
+ "inertRemediations": {
+  "method": "Observed during a later round's remediation when a fix from an earlier round was shown, by direct probe against the real server, never to execute on the path it was written for.",
+  "why": "Distinct from iatrogenesis. Iatrogenesis counts defects the experiment INTRODUCED. This counts fixes the experiment believed it had landed that were inert from the day they shipped - a failure mode a git-blame oracle cannot see, because the line exists and blames to the experiment either way.",
+  "instances": [
+   {
+    "introducedRound": 5,
+    "foundRound": 6,
+    "package": "bridge-nats",
+    "what": "The tailSequence repair keyed on getMessage(stream, {last_by_subj}), which NATS 2.10 answers 'no message found' whenever that subject's newest message has been deleted.",
+    "evidence": "Direct probe against nats:2.10-alpine: deletes of {12}, {11,12} and {5..12} all yield 'no message found'; deleting {1,2} still returns seq 12.",
+    "concealedBy": "The fake answered last_by_subj from surviving records, giving the repair a code path the real server does not offer.",
+    "consequence": "The widening loop had carried the case all along. Making the fake faithful turned three existing window rows from vacuous into real."
+   }
+  ]
+ },
+ "fixtureFidelity": {
+  "why": "Round 6's dominant theme, and the one an automated loop is structurally worst at: a fake that cannot express the failure makes the guard unfalsifiable, so the defect is invisible to every round that came before.",
+  "round6": [
+   {
+    "package": "bridge-postgres",
+    "what": "Eleven vi.mock('pg') Pool fakes stubbed on: vi.fn(), so the unhandled 'error' event that kills the process could not be raised by any test."
+   },
+   {
+    "package": "bridge-xmpp",
+    "what": "FakeXmpp carried one connection-wide nick; with fake and plugin both reverted, all three conflict-revert rows pass vacuously."
+   },
+   {
+    "package": "bridge-slack",
+    "what": "FakeSlack broadcast each Socket Mode envelope to every socket. Slack's docs: a payload 'may be sent to any of the connections'. The README's fanout claim was true in test, false in production."
+   },
+   {
+    "package": "bridge-zulip",
+    "what": "injectRaw's doc claims a record reaches both the history read and the queue; for non-comparable ids the fake's own id filter excludes it, so drop assertions pass whether the plugin drops it or never sees it."
+   },
+   {
+    "package": "bridge-nats",
+    "what": "See inertRemediations: last_by_subj answered from surviving records, a semantics NATS does not have."
+   }
+  ]
+ },
+ "mutationSaturation": {
+  "why": "The clearest saturation signal this experiment has produced is not the finding count - it is what a full-surface mutation sweep catches. A package whose suite kills every mutation has no vacuous tests left to find, which is the test-integrity and test-hygiene lenses running dry.",
+  "observations": [
+   {
+    "round": 8,
+    "target": "core-auth",
+    "mutations": 27,
+    "caught": 27,
+    "note": "Filed no test-integrity and no test-hygiene finding at all."
+   },
+   {
+    "round": 9,
+    "target": "core-engine",
+    "mutations": 52,
+    "caught": 48,
+    "note": "4 survived and were reported as findings."
+   },
+   {
+    "round": 9,
+    "target": "core-auth",
+    "mutations": 52,
+    "caught": 48,
+    "note": "2 of the 4 survivors were semantically equivalent mutations (no behaviour change to detect); 2 real."
+   }
+  ],
+  "reading": "Both core targets now need ~50 mutations to surface a handful of survivors, where earlier rounds found vacuous guards by inspection. The instrument's cost per finding is rising on the packages that have been worked hardest, which is the ouroboros knee arriving per-package rather than run-wide."
+ },
+ "halfwayReading": {
+  "atRound": 10,
+  "totals": {
+   "findings": 941,
+   "confirmed": 899,
+   "blocking": 353,
+   "suiteTests": 10968,
+   "suiteAtStart": 460
+  },
+  "whatReplicated": "Ouroboros's finding that a full-surface adversarial loop keeps producing indefinitely. Ten rounds, zero converged, no target has ever quiesced.",
+  "whatDidNot": "Ouroboros's two-regime split with a knee after which the loop reviews only its own output. Careening shows no knee at the run level. Pre-existing blocking findings fell 36 -> 5 through round 6 and then RECOVERED to a stable 8-11 band for four rounds.",
+  "whyPlausibly": "The per-package partition means a target that runs dry is one of fourteen, not one of four; and a deep surface (eleven network backends, OAuth, concurrency) keeps offering new ground. Saturation, where it appears, is package-local: core-auth needed 27 mutations in round 8 to establish it had no vacuous tests and 52 in round 9 to surface two survivors.",
+  "theInstrumentResult": "Round 9 measured a sharp asymmetry: critics are reliable at FINDING (68/71 confirmed) and unreliable at PRESCRIBING - five remediations that round would have introduced or blessed a defect if implemented as written. Separating review from remediation, each with its own verification, is what caught them.",
+  "supersededBy": "Round 16 restores this section rather than superseding it: the run-level knee it reported as absent at round 10 is still absent at round 16."
+ },
+ "oracle": "scripts/iatrogenesis.mjs — committed at round 16. It reproduces the rounds 2-10 numbers below exactly, which were computed ad hoc before it existed; that reproduction is the only reason they and the new rows can sit in one table."
+}

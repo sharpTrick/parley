@@ -1,4 +1,9 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+  type JWTHeaderParameters,
+  type JWTPayload,
+} from 'jose';
 import {
   InsufficientScopeError,
   InvalidTokenError,
@@ -23,11 +28,59 @@ export interface OidcVerifierOptions {
   requiredRole?: string;
   /** exp/nbf tolerance in seconds. Default 30. */
   clockSkewS?: number;
-  /** Accepted signing algorithms. Asymmetric only — never allow HS* on a public IdP. */
-  algorithms?: string[];
   /** Injectable clock for tests (ms epoch). */
   now?: () => number;
 }
+
+/**
+ * Every asymmetric JWS algorithm, and only those. Keep HS* out, so that anyone who learns the
+ * client secret an IdP shares with its clients cannot forge a token this server accepts.
+ */
+export const ACCEPTED_SIGNING_ALGORITHMS = [
+  'RS256',
+  'RS384',
+  'RS512',
+  'PS256',
+  'PS384',
+  'PS512',
+  'ES256',
+  'ES384',
+  'ES512',
+  'EdDSA',
+];
+
+/**
+ * `typ` values an IdP stamps on credentials that are not bearer access tokens (Keycloak: `ID`,
+ * `Refresh`, `Logout`). An ID token is a client-side login receipt, so accepting one here would
+ * let any client replay its own receipt as authorization for this resource. Keycloak puts this in
+ * the CLAIMS, not the JOSE header (where it writes a generic `JWT`) — check both.
+ */
+const NON_ACCESS_TOKEN_TYPES = new Set(['id', 'refresh', 'logout', 'serialized-id']);
+
+/**
+ * `typ` values that positively identify a bearer access token: Keycloak's `Bearer` claim and
+ * RFC 9068's media type. A token that declares one of these is not an ID token whatever else it
+ * carries, so the claim-shape heuristic below must not overrule it.
+ */
+const ACCESS_TOKEN_TYPES = new Set(['bearer', 'at+jwt', 'application/at+jwt']);
+
+/**
+ * Claims OIDC Core defines only for an ID token: `nonce` is echoed from the authentication request,
+ * and `at_hash`/`c_hash` are digests of the access token and code the ID token was issued beside.
+ * They are how a `typ`-less IdP still gives an ID token away.
+ */
+const ID_TOKEN_ONLY_CLAIMS = ['nonce', 'at_hash', 'c_hash'];
+
+const DEFAULT_CLOCK_SKEW_S = 30;
+
+/**
+ * Keep every 401 on this ONE string, so that a caller cannot tell which check refused it: the SDK
+ * echoes it verbatim into `WWW-Authenticate: error_description` and the JSON body, and a distinct
+ * message for the identity gate tells any realm user that their signature, `iss`, `aud` and `exp`
+ * all passed and only the gate policy stopped them. Keep it ASCII, so that it survives the Latin1-
+ * only WWW-Authenticate header.
+ */
+const REJECTION_MESSAGE = 'invalid or expired access token';
 
 /** Keycloak-style realm-roles claim. */
 interface RealmAccessClaim {
@@ -36,11 +89,12 @@ interface RealmAccessClaim {
 
 /**
  * Resource-server token verification against an external OIDC IdP (DESIGN §10, delegated
- * variant): JWKS signature, `iss`, `exp`/`nbf` ± skew, and `aud` are always enforced; scope and
- * identity gates apply on top when configured. Plugs into the SDK's `requireBearerAuth`, so it
- * must only ever throw the SDK's OAuth error classes: `InvalidTokenError` → 401 (+ discovery
- * challenge), `InsufficientScopeError` → 403. Identity-gate failures are deliberately 401, not
- * 403, so the gate policy itself is not leaked to unauthorized callers.
+ * variant): JWKS signature, `iss`, `aud` and an `exp` in the future ± skew are always enforced, and
+ * `nbf` ± skew when the token carries one; scope and identity gates apply on top when configured.
+ * Plugs into the SDK's `requireBearerAuth`, so it must only ever throw the SDK's OAuth error
+ * classes: `InvalidTokenError` → 401 (+ discovery challenge), `InsufficientScopeError` → 403.
+ * Identity-gate failures are deliberately 401, not 403, so the gate policy itself is not leaked to
+ * unauthorized callers.
  */
 export class OidcTokenVerifier implements OAuthTokenVerifier {
   private readonly opts: OidcVerifierOptions;
@@ -53,20 +107,32 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const { opts } = this;
+    const skewS = opts.clockSkewS ?? DEFAULT_CLOCK_SKEW_S;
     let payload: JWTPayload;
+    let header: JWTHeaderParameters;
     try {
       // One call covers signature (kid-selected key, auto-refetch on unknown kid), iss, exp,
-      // nbf (± clockTolerance), and aud-contains-audience.
-      ({ payload } = await jwtVerify(token, this.jwks, {
+      // nbf (± clockTolerance), and aud-contains-audience. Keep `exp` in requiredClaims — jose
+      // validates a claim only when it is PRESENT — so that an exp-less token is refused HERE and
+      // not downstream by requireBearerAuth, whose own wording says which check let it get that far.
+      ({ payload, protectedHeader: header } = await jwtVerify(token, this.jwks, {
         issuer: opts.issuer,
         audience: opts.audience,
-        algorithms: opts.algorithms ?? ['RS256', 'PS256', 'ES256'],
-        clockTolerance: opts.clockSkewS ?? 30,
+        algorithms: ACCEPTED_SIGNING_ALGORITHMS,
+        requiredClaims: ['exp'],
+        clockTolerance: skewS,
         ...(opts.now !== undefined ? { currentDate: new Date(opts.now()) } : {}),
       }));
     } catch {
-      // Never leak which check failed (sig vs iss vs exp vs aud).
-      throw new InvalidTokenError('invalid or expired access token');
+      throw new InvalidTokenError(REJECTION_MESSAGE);
+    }
+
+    if (typeof payload.exp !== 'number') {
+      throw new InvalidTokenError(REJECTION_MESSAGE);
+    }
+
+    if (!isAccessToken(header, payload)) {
+      throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
     const scopes = typeof payload.scope === 'string' ? payload.scope.split(' ').filter(Boolean) : [];
@@ -75,8 +141,7 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     }
 
     if (!this.passesIdentityGates(payload)) {
-      // ASCII only: the message ends up in the WWW-Authenticate header, which rejects non-Latin1.
-      throw new InvalidTokenError('token does not satisfy this server access policy');
+      throw new InvalidTokenError(REJECTION_MESSAGE);
     }
 
     const clientId =
@@ -88,7 +153,10 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
       token,
       clientId,
       scopes,
-      ...(typeof payload.exp === 'number' ? { expiresAt: payload.exp } : {}),
+      // Report the expiry INCLUDING the tolerance, so that requireBearerAuth — which re-checks this
+      // field against wall-clock with no tolerance of its own — cannot 401 a token this verifier
+      // just accepted, silently undoing the configured skew.
+      expiresAt: payload.exp + skewS,
       // AuthInfo.resource must be a URL; with a fixed-string Keycloak audience (e.g.
       // "parley-mcp") there is no URL to report, so it is set only when the audience parses.
       ...(asUrl(opts.audience) !== undefined ? { resource: asUrl(opts.audience) } : {}),
@@ -118,6 +186,15 @@ export class OidcTokenVerifier implements OAuthTokenVerifier {
     }
     return true;
   }
+}
+
+function isAccessToken(header: JWTHeaderParameters, payload: JWTPayload): boolean {
+  const declared = [header.typ, payload.typ]
+    .filter((typ): typ is string => typeof typ === 'string')
+    .map((typ) => typ.toLowerCase());
+  if (declared.some((typ) => NON_ACCESS_TOKEN_TYPES.has(typ))) return false;
+  if (declared.some((typ) => ACCESS_TOKEN_TYPES.has(typ))) return true;
+  return ID_TOKEN_ONLY_CLAIMS.every((claim) => payload[claim] === undefined);
 }
 
 function asUrl(s: string): URL | undefined {

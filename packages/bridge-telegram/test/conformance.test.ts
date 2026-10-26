@@ -1,41 +1,23 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
 import { asTopic, type Topic } from '@sharptrick/parley-core';
-import { TelegramPlugin } from '../src/index.js';
-import { startFakeTelegram } from './fake-telegram.js';
+import { openRig } from './rig.js';
 
 let seq = 0;
-const rand = () => Math.random().toString(36).slice(2, 8);
 
 async function makeContext() {
-  const fake = await startFakeTelegram();
-  const dir = mkdtempSync(join(tmpdir(), 'parley-tg-'));
-  const plugin = new TelegramPlugin();
-  await plugin.connect({
-    token: 'test-token',
-    api_url: fake.url,
-    store_path: join(dir, 'store.jsonl'),
-    poll_timeout_s: 1,
-  });
+  const rig = await openRig();
   return {
-    plugin,
-    // fetchRecent honors `blockMs` NATIVELY (issue #20): a parked fetch is woken by the SHARED
-    // ingest path (the one getUpdates loop, or an own post) through ingest() — no second
-    // getUpdates consumer. Run the shared blocking-fetch case directly against the plugin.
-    supportsBlockingFetch: true,
-    // An unmapped topic is used as the chat id literal — a fresh chat per test.
-    freshTopic: (): Topic => asTopic(`chat-${++seq}-${rand()}`),
-    cleanup: async () => {
-      await plugin.disconnect();
-      await fake.close();
-      rmSync(dir, { recursive: true, force: true });
-    },
-    // NO concurrentPost, deliberately: Telegram allows exactly ONE getUpdates consumer per
-    // bot token (a second poller gets HTTP 409) and the observed-message store is one file
-    // per process — multi-instance writers are structurally unrepresentable on this backend,
-    // so conformance case 6 skips. Run exactly one telegram bridge per bot token (README).
+    plugin: rig.plugin,
+    // Supergroup-shaped chat ids, one fresh chat per test: the fake rejects anything real
+    // Telegram would 400 on, and an unmapped topic is used as the chat id literal.
+    freshTopic: (): Topic => asTopic(String(-1_002_000_000_000 - ++seq)),
+    carriesSenderIdentity: false, // posts as the bot account; `identity` is informational
+    refusesContentShapes: [],
+    cleanup: rig.close,
+    // Keep concurrentPost 'unsupported', so that the multi-writer case does not open a second
+    // getUpdates consumer on a token Telegram allows exactly one on (HTTP 409), or a second writer
+    // on the one-process observed-message store. One telegram bridge per bot token (README).
+    concurrentPost: 'unsupported' as const,
   };
 }
 

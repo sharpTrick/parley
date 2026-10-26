@@ -28,6 +28,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -35,11 +39,13 @@
   ],
   "scripts": {
     "build": "tsc -b",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "clean": "tsc -b --clean",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1",
+    "@types/express": "^5.0.6",
     "express": "^5.2.1",
     "express-rate-limit": "^8",
     "jose": "^6.1.3",
@@ -68,6 +74,16 @@
     "transport-agnostic",
     "pluggable-backend",
     "backend-agnostic",
+    "sqlite",
+    "postgres",
+    "redis",
+    "matrix",
+    "xmpp",
+    "nats",
+    "zulip",
+    "discord",
+    "telegram",
+    "slack",
     "self-hosted",
     "chat-to-code",
     "human-in-the-loop",
@@ -75,6 +91,6 @@
     "agent-bus"
   ],
   "devDependencies": {
-    "@types/express": "^5.0.6"
+    "@sharptrick/parley-net-util": "^0.1.0"
   }
 }

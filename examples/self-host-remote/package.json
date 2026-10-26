@@ -10,5 +10,8 @@
   "dependencies": {
     "@sharptrick/parley-core": "*",
     "@sharptrick/parley-sqlite": "*"
+  },
+  "scripts": {
+    "typecheck:test": "tsc -p tsconfig.test.json"
   }
 }

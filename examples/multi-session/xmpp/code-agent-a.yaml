@@ -1,6 +1,6 @@
 instance_id: "code-agent-a"
 identity:
-  handle: "agent-a"                       # NOTE: XMPP's post() ignores this too — see backend_config below.
+  handle: "agent-a"                       # On XMPP this IS the sender: it becomes the MUC nick.
 topics:
   - "ctx-payments"
   - "ctx-infra"
@@ -13,21 +13,26 @@ live_push:
 permissions:
   skip_permissions: false
 
-backend: local-xmpp
+# Run with: parley-xmpp --config <this file>   (the binary selects the backend)
 backend_config:
   # ── Must be IDENTICAL across every config on this server. ──
-  service: "xmpp://xmpp.internal:5222"
+  # `xmpps://` (TLS from the first byte) — `xmpp://` is cleartext SASL PLAIN and is for a
+  # loopback dev server only; off localhost the plugin warns about it at every start.
+  service: "xmpps://xmpp.internal:5223"
   domain: "parley.local"
   muc_service: "muc.parley.local"
   # ── Same account as code-agent-b.yaml/remote-chat.yaml is FINE here (unlike Matrix) — see
   #    the `nick` note below for why. ──
   username: "parley"
   password: "change-me"
-  # ── `nick` is intentionally left UNSET. Like Matrix, XMPP's post() ignores the seam's
-  #    `identity` — the real sender is the MUC nick, not `identity.handle` above. But unlike
-  #    Matrix, leaving `nick` unset is safe to share across sessions: the plugin auto-generates
-  #    a random one per connection (`${username}-${rand()}`), so each session still gets its
-  #    own distinct (if randomly-labeled) sender for free. Only pin `nick` to a fixed value if
-  #    you want a stable, readable name — and if you do, it MUST be unique per concurrent
-  #    session (MUC requires unique nicknames per room; reusing one across sessions makes the
-  #    second session's join fail outright, not silently misattribute).
+  # ── `nick` is intentionally left UNSET. Unlike Matrix, XMPP's post() DOES use the seam's
+  #    `identity`: the sender is the MUC nick, and with `nick` unset the first post takes
+  #    `identity.handle` above as that nick — so the sender is stable across restarts. The field
+  #    that must be unique per concurrent session is therefore `identity.handle`, NOT this account.
+  #    Pin `nick` only to override that, and if you do it MUST be unique per session. Do NOT
+  #    expect a duplicate to be caught for you, either way: MUC's unique-nickname rule is per
+  #    bare JID, so two sessions sharing THIS account occupy the same room under one nick with no
+  #    error at all — whether they got there by copying a pinned `nick` or by sharing an
+  #    `identity.handle` — and every message from both is attributed to that one nick.
+  #    (A `conflict` error only happens between different accounts, and there the loser falls
+  #    back to a random per-connection nick and keeps posting.)

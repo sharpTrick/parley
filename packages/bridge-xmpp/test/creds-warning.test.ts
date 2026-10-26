@@ -1,43 +1,263 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { XmppPlugin } from '../src/index.js';
 
-// SEC-06 — XMPP must not silently authenticate with the repo-public default password. connect()
-// performs a SASL handshake via @xmpp/client, so mock the client to a no-op transport (vi.mock is
-// hoisted above the import above, so the plugin binds the mock); the warning fires before
-// client()/xmpp.start(). The mock lets the whole connect() resolve so the gate sits on the happy path.
-vi.mock('@xmpp/client', () => ({
-  client: vi.fn(() => ({
-    on: vi.fn(),
-    start: vi.fn(async () => undefined),
-    stop: vi.fn(async () => undefined),
-  })),
-}));
+// Class: a credential this backend puts on the network with no diagnostic. Two independent ways
+// that happens here — the repo-public default password, and a `service` that can terminate on a
+// cleartext socket at a non-loopback host, where @xmpp/starttls only upgrades a stream the PEER
+// offers to upgrade while @xmpp/client always registers SASL PLAIN. Neither is refused (a loopback
+// dev server legitimately runs unencrypted, and the README's own Prosody snippet sets
+// allow_unencrypted_plain_auth), so the contract is that no cell is SILENT.
+//
+// The transport table crosses the URI FORM with the host class and both password kinds. Form is
+// its own axis because the guard used to key on the scheme alone: a service with no scheme — the
+// standard DNS-SRV form — matched nothing in the plaintext set and went silent, while
+// @xmpp/resolve routes exactly that form through SRV and falls back to cleartext xmpp://…:5222.
+// Only an explicitly encrypted scheme is safe; every other form is a way to reach a plain socket.
+//
+// Each risk is graded as the VALUE `configRisks` returns — which key, which host, which secret —
+// never as words of the sentence: a warning reworded to say the password never goes on the network
+// in the clear still says "in the clear". Of the sentence, only DELIVERY is graded.
+
+const mockState = vi.hoisted(() => ({ client: undefined as unknown }));
+vi.mock('@xmpp/client', async () => {
+  const actual = await vi.importActual<typeof import('@xmpp/client')>('@xmpp/client');
+  return { ...actual, client: () => mockState.client };
+});
+
+import { isLoopbackHost, MAX_ERROR_BODY } from '@sharptrick/parley-net-util';
+import {
+  FORBIDDEN_IN_RENDER,
+  PLANTED_SECRET,
+  UNSAFE_TEXT,
+} from '@sharptrick/parley-net-util/testing';
+import {
+  type ConfigRisk,
+  configRisks,
+  DEFAULT_PASSWORD,
+  DEFAULT_SERVICE,
+  describeRisk,
+  warnInsecureConfig,
+} from '../src/config.js';
+import { isPlaintextRemote, XmppPlugin } from '../src/index.js';
+import { FakeXmpp } from './fake-xmpp.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
+  mockState.client = undefined;
 });
 
-const spyWarn = () => vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+const spyWarn = (): ReturnType<typeof vi.spyOn> =>
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-describe('XMPP default-credential warning (SEC-06)', () => {
+const DEFAULT_PASSWORD_RISK: ConfigRisk = { key: 'password', sharedDefault: DEFAULT_PASSWORD };
+const transportRisk = (host: string): ConfigRisk => ({
+  key: 'service',
+  origin: host,
+  exposes: ['password'],
+});
+
+/** The host a service names, as an operator reads it: no port, no IPv6 brackets. */
+const bareHost = (host: string): string =>
+  host
+    .replace(/^(\[[^\]]*]):\d+$/, '$1')
+    .replace(/^\[(.*)]$/, '$1')
+    .replace(/^([^:]*):\d+$/, '$1');
+
+/** The warnings are exactly these risks — as values, then as lines rendered from each. */
+const expectRisks = (
+  config: { service?: string; password?: string },
+  warned: readonly string[],
+  expected: ConfigRisk[],
+): void => {
+  expect(configRisks(config.service ?? DEFAULT_SERVICE, config.password)).toEqual(expected);
+  expect(warned).toHaveLength(expected.length);
+  for (const risk of expected) {
+    const shown = warned.filter((l) => l.includes(describeRisk(risk)));
+    expect(shown, `no warning renders the ${risk.key} risk`).toHaveLength(1);
+    expect(shown[0]).toContain('[parley-xmpp] SECURITY');
+    for (const part of Object.values(risk).flatMap((v: unknown) => (Array.isArray(v) ? v : [v]))) {
+      expect(shown[0], `never names ${String(part)}`).toContain(String(part));
+    }
+  }
+};
+
+const connect = async (config: Record<string, unknown>): Promise<string[]> => {
+  const warn = spyWarn();
+  mockState.client = new FakeXmpp();
+  const plugin = new XmppPlugin();
+  await plugin.connect(config);
+  await plugin.disconnect();
+  return warn.mock.calls.map((c) => String(c[0]));
+};
+
+describe('XMPP default-credential warning', () => {
   it('warns once, naming the backend and the key to set, when password is omitted', async () => {
-    const warn = spyWarn();
-    await new XmppPlugin().connect({ service: 'xmpp://127.0.0.1:5222', username: 'parley' });
-    expect(warn).toHaveBeenCalledTimes(1);
-    const msg = String(warn.mock.calls[0]?.[0]);
-    expect(msg).toContain('parley-xmpp');
-    expect(msg).toContain('password');
+    const config = { service: 'xmpp://127.0.0.1:5222', username: 'parley' };
+    expectRisks(config, await connect(config), [DEFAULT_PASSWORD_RISK]);
   });
 
   it('warns when password is set literally to the well-known default', async () => {
-    const warn = spyWarn();
-    await new XmppPlugin().connect({ password: 'parleypass' });
-    expect(warn).toHaveBeenCalledTimes(1);
+    const config = { password: 'parleypass' };
+    expectRisks(config, await connect(config), [DEFAULT_PASSWORD_RISK]);
   });
 
-  it('does NOT warn when a real password is supplied', async () => {
+  it('does NOT warn when a real password is supplied to a loopback service', async () => {
+    const config = { password: 's3cret-real-pw', username: 'parley' };
+    expectRisks(config, await connect(config), []);
+  });
+});
+
+// The transport half. `forms` is pinned by VALUE as well as driven into the table: a form dropped
+// from it would otherwise silently delete its own rows.
+interface Form {
+  name: string;
+  service(host: string): string;
+  /** Whether this form's stream is encrypted before SASL runs — the only reason to stay silent. */
+  encrypted: boolean;
+}
+const forms: Form[] = [
+  { name: 'xmpp://', service: (h) => `xmpp://${h}`, encrypted: false },
+  { name: 'ws://', service: (h) => `ws://${h}`, encrypted: false },
+  { name: 'xmpps://', service: (h) => `xmpps://${h}`, encrypted: true },
+  { name: 'wss://', service: (h) => `wss://${h}`, encrypted: true },
+  { name: 'no scheme (DNS-SRV)', service: (h) => h, encrypted: false },
+  { name: 'scheme-relative', service: (h) => `//${h}`, encrypted: false },
+];
+const LOOPBACK = [
+  '127.0.0.1:5222',
+  'localhost:5222',
+  '[::1]:5222',
+  '::1',
+  '127.0.0.44',
+  // The fully-written spelling of ::1. A second classifier in this package read it as remote and
+  // warned about a dev homeserver, while every other backend stayed silent on the same address.
+  '[0:0:0:0:0:0:0:1]:5222',
+  '0:0:0:0:0:0:0:1',
+];
+// Hosts that read as loopback to a PREFIX or substring match but are ordinary registrable names
+// their owner points wherever they like, plus two integer spellings of 127.0.0.1 that are not
+// dotted quads. Every LOOPBACK entry is also probed with a domain suffixed onto it, so a loopback
+// form added above brings its own lookalike with it instead of waiting to be enumerated.
+const LOOKALIKE = [
+  ...LOOPBACK.map((host) => `${host}.evil.example`),
+  '127.evil.com',
+  '127.0.0.1.evil.com',
+  'localhost.evil.com',
+  '0177.0.0.1',
+  '2130706433',
+  // Legal registrable DNS names — all-numeric labels are permitted, and neither is a valid IPv4
+  // literal. A dotted-quad REGEX read both as loopback and silenced the transport warning here.
+  '127.999.999.999',
+  '127.00.0.1',
+];
+const REMOTE = [
+  'xmpp.example.com:5222',
+  'xmpp.example.com',
+  '203.0.113.9:5222',
+  '[2001:db8::1]:5222',
+  ...LOOKALIKE,
+];
+
+interface Cell {
+  service: string;
+  host: string;
+  password: string | undefined;
+  /** How many warnings this configuration must produce: the credential one, the transport one. */
+  expected: { credential: boolean; transport: boolean };
+}
+
+const cells: Cell[] = [];
+for (const form of forms) {
+  for (const [hosts, loopback] of [
+    [LOOPBACK, true],
+    [REMOTE, false],
+  ] as const) {
+    for (const host of hosts) {
+      for (const password of ['a-real-secret', undefined]) {
+        cells.push({
+          service: form.service(host),
+          host,
+          password,
+          expected: {
+            credential: password === undefined,
+            transport: !form.encrypted && !loopback,
+          },
+        });
+      }
+    }
+  }
+}
+
+describe('XMPP transport safety', () => {
+  it('only an explicitly encrypted scheme is classified safe', () => {
+    for (const form of forms) {
+      expect(isPlaintextRemote(form.service('remote.example'))).toBe(!form.encrypted);
+    }
+  });
+
+  it.each(LOOKALIKE)('%s is classified remote, not loopback', (host) => {
+    for (const form of forms.filter((f) => !f.encrypted)) {
+      expect(isPlaintextRemote(form.service(host))).toBe(true);
+    }
+  });
+
+  /**
+   * The loopback half of this backend's answer is the SHARED one, asserted as agreement rather than
+   * as a second table of expectations: a predicate copied per backend is a predicate fixed once and
+   * left wrong everywhere else, and this package's copy disagreed with the shared one in both
+   * directions on hosts no table here listed.
+   */
+  it.each([...LOOPBACK, ...REMOTE].map((host) => [host] as const))(
+    '%s is classified exactly as the shared predicate classifies it',
+    (host) => {
+      const bare = bareHost(host);
+      for (const form of forms.filter((f) => !f.encrypted)) {
+        expect(isPlaintextRemote(form.service(host))).toBe(!isLoopbackHost(bare));
+      }
+    },
+  );
+
+  it.each(cells)('$service (password $password) warns as documented', async (cell) => {
+    const config = {
+      service: cell.service,
+      ...(cell.password === undefined ? {} : { password: cell.password }),
+    };
+    expectRisks(config, await connect(config), [
+      ...(cell.expected.credential ? [DEFAULT_PASSWORD_RISK] : []),
+      ...(cell.expected.transport ? [transportRisk(bareHost(cell.host))] : []),
+    ]);
+  });
+});
+
+/**
+ * CLASS: the diagnostic above is an OPERATOR CHANNEL that carries a `backend_config` value, and it
+ * is not a thrown message — so none of the refusal-rendering guards this repo grades reaches it.
+ * `service` is caller-authored: it may carry a password in its userinfo, and its text may forge
+ * line structure or run unbounded, which turns an operator's log into a place an attacker can
+ * write a forged `[parley-xmpp] SECURITY:` line of their own choosing.
+ */
+describe('the transport warning names a host and nothing else the caller wrote', () => {
+  const lines = (service: string): string[] => {
     const warn = spyWarn();
-    await new XmppPlugin().connect({ password: 's3cret-real-pw', username: 'parley' });
-    expect(warn).not.toHaveBeenCalled();
+    warnInsecureConfig(service, 'a-real-password');
+    return warn.mock.calls.map((c) => String(c[0]));
+  };
+
+  it('never carries a password written into the address', () => {
+    const service = `xmpp://bot:${PLANTED_SECRET}@evil.example.com:5222`;
+    const warned = lines(service);
+    expectRisks({ service, password: 'a-real-password' }, warned, [
+      transportRisk('evil.example.com'),
+    ]);
+    expect(warned[0]).not.toContain(PLANTED_SECRET);
+  });
+
+  it.each(UNSAFE_TEXT)('%s in the host is one bounded, harmless line', (_label, text) => {
+    const warned = lines(`xmpp://bot:${PLANTED_SECRET}@${text}`);
+    expect(warned).toHaveLength(1);
+    const line = warned[0] ?? '';
+    expect(line).not.toContain(PLANTED_SECRET);
+    expect(line).not.toMatch(FORBIDDEN_IN_RENDER);
+    expect(line).not.toMatch(/[\n\r]/);
+    expect(line.length).toBeLessThanOrEqual(MAX_ERROR_BODY);
   });
 });

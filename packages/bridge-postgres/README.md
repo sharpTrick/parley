@@ -17,26 +17,78 @@ required **zero** `@sharptrick/parley-core` changes.
 | `subscribe` | **`LISTEN`** on channel `parley_<md5(topic)>`, rung by an `AFTER INSERT` trigger; each notification drains `seq > lastSeen` |
 | `resolveIdentity` | `<table>_senders` registry; unknown handles register on first sight with `backendRef = handle` |
 
+Both registration paths (`post` and `resolveIdentity`) insert `ON CONFLICT (handle) DO NOTHING`, so
+a row already in `<table>_senders` wins: an operator may pre-register a handle with a `backend_ref`
+of their own and `resolveIdentity` returns that instead of echoing the handle.
+
 The NOTIFY payload (the new `seq`) is a **hint only** — payloads are size-limited and delivery is
 best-effort across reconnects, so subscribers always re-query from their last-seen cursor. A
-coalesced or dropped notification costs latency, never a message. The channel name is
-`'parley_' || md5(topic)`: fixed length, so any topic string stays under PostgreSQL's 63-byte
-identifier limit with no injection surface.
+coalesced or dropped notification costs latency, never a message. NOTIFY is edge-triggered, so a
+drain that *fails* (a killed backend, a `statement_timeout`, a pooler hiccup) is retried on a
+doubling backoff rather than waiting for the next write to the topic: nothing is skipped, and a
+quiet topic converges without needing a doorbell that may never ring again. The channel name is
+`'parley_' || md5(convert_to(topic, 'UTF8'))`: fixed length, so any topic string stays under
+PostgreSQL's identifier limit (`MAX_IDENTIFIER_BYTES`) with no injection surface. The `convert_to` cast is
+load-bearing and not decorative — Node hashes UTF-8 bytes, so the trigger must too, or on a
+database whose `server_encoding` is not UTF8 the two digests diverge and the whole live path goes
+silently dead. Any off-Parley `NOTIFY` producer or hand-written `LISTEN` client must use the same
+spelling.
 
-**`fetch_recent` long-poll (`block_ms`).** `fetchRecent` accepts an optional `block_ms`: when
-nothing is newer than `since`, the call holds up to `block_ms` for a new message before returning
-(possibly empty), so a polling agent's token cost scales with messages, not wall-clock time.
-Postgres serves this natively via `LISTEN`/`NOTIFY` on the topic channel. Core caps the wait at
-`catchup.block_max_ms` (default 60s); `0`/omit preserves the immediate-return catch-up semantics.
+**No `block_ms` here.** `fetchRecent` reads the messages table and has no wait to spend a caller's
+budget on, so it REFUSES one: a `parley_fetch_recent` carrying a POSITIVE `block_ms` rejects with
+`BlockingFetchUnsupportedError` naming this plugin, rather than answering with a page an agent
+cannot tell from a long-poll that timed out. Retry without it. Live delivery is `subscribe`, over
+`LISTEN`/`NOTIFY`.
 
 ## Config (`backend_config`)
 
 ```yaml
 backend_config:
   url: "postgres://parley:parley@127.0.0.1:5432/parley"   # default
-  table_name: "parley_messages"   # default; [A-Za-z0-9_] only — senders live in <table_name>_senders
-  pool_size: 5                     # default; max pooled query connections (LISTEN uses one extra)
+  table_name: "parley_messages"   # default; [A-Za-z0-9_] only, byte budget below
+  pool_size: 5                     # example; `DEFAULT_POOL_SIZE` pooled query connections (LISTEN uses one extra)
+  retention_days: 30               # optional; omit it (or set null) to keep every message forever
 ```
+
+`table_name` is capped at `MAX_TABLE_NAME_BYTES` because every other relation is derived from it by suffixing
+(`<table_name>_senders`, `_topic_seq`, `_created_at`, `_notify`, `_notify_trg`) and PostgreSQL truncates
+identifiers at `MAX_IDENTIFIER_BYTES` — a longer stem would silently make two of those the same relation. The
+name is lower-cased and double-quoted everywhere it reaches SQL, so a reserved word (`user`,
+`order`, `table`) is a working table name rather than a bare PostgreSQL parse error. Every
+`table_name` rejection is formatted like the other knobs': `parley-postgres: invalid
+backend_config.table_name — …`.
+
+`retention_days` (no narrower than `MIN_RETENTION_DAYS`, no wider than `MAX_RETENTION_DAYS`)
+deletes rows older than
+the window on connect and hourly thereafter, in batches of `PRUNE_BATCH` rows per statement: the first prune after
+enabling retention on a large table is many short transactions rather than one whose WAL volume,
+and whose vacuum-blocking snapshot, grow with the whole backlog. It does not hold `post()` up
+either way — deleting old rows never blocks inserting new ones. `seq` is a `BIGSERIAL` and is
+never reused, so a cursor minted before a prune stays valid: a stale reader just gets fewer rows
+back, never a wrong or duplicate one. The sender registry is not pruned — it is bounded by the
+number of distinct handles, not by message volume.
+
+**Which rows go is decided by the database, not by any bridge's clock.** Every row carries a
+`created_at TIMESTAMPTZ` the server stamps at insert, and the cutoff is subtracted from the
+server's own `now()`, so the answer is the same whichever process prunes and whatever its host
+clock says. The `ts` column is the poster's wall clock and is informational only — a bridge running
+ten days slow does not lose the messages it just wrote, and one running ten days fast does not
+accumulate rows retention can never remove. A table bootstrapped by an older version gains the
+column on the next `connect()`; rows already in it are stamped at that moment, so the first window
+after the upgrade keeps them slightly longer rather than removing them early.
+
+`connect()` rejects if the plugin is already connected: call `disconnect()` first. A second
+`connect()` would otherwise strand the previous pool and prune timer with no way to reclaim them.
+
+Every key is validated before the pool is opened, and `connect()` rejects — naming the key — on an
+unrecognised key (a typo would otherwise silently disable the feature), a `pool_size` that is not
+an integer in `[MIN_POOL_SIZE, MAX_POOL_SIZE]`, or a `retention_days` that is not a finite number
+in `[MIN_RETENTION_DAYS, MAX_RETENTION_DAYS]`.
+Both ends of that range are refused rather than clamped: a window under `MIN_RETENTION_DAYS` — `0`, a
+negative, `1e-9`, or a unit slip that meant milliseconds — empties the entire shared table on the
+prune `connect()` runs immediately, and a
+window past `MAX_RETENTION_DAYS` puts the cutoff before any message this backend could have written, which
+would leave pruning silently never running while this page says rows are removed hourly.
 
 Secrets belong in the config/`.env`, never committed (CLAUDE.md conventions).
 
@@ -50,28 +102,122 @@ config:
 - **`table_name`** — the hidden one. Topic `"ctx-payments"` in table `parley_messages` is a
   completely different table than in `app_messages`; every other field can look consistent while
   history silently splits in two.
-- **`pool_size`** is safe to vary per session — it's per-instance capacity, not shared state.
+- **`pool_size`** may differ per session — it is per-instance capacity, not shared state. It is a
+  head-of-line budget for *writes* as well as reads, though: a `post()` holds a pooled connection
+  while it waits for its per-topic lock, so `pool_size` posts contending one topic will delay that
+  instance's reads until those waits end. They always do end — see below.
+
+`connect()`'s bootstrap is idempotent and, on a table that is already bootstrapped, takes no
+table-level lock: the `CREATE TRIGGER` runs only when the trigger is missing. A rolling restart
+therefore does not stall the other processes' `post()`s.
+
+Nor does it need DDL privileges on such a table. Every statement in the bootstrap runs only when
+there is something to create or replace, so the bridges can run as a role holding just `SELECT` and
+`INSERT` on `<table_name>` and `<table_name>_senders`, `USAGE` on `<table_name>_seq_seq`, and
+`DELETE` on `<table_name>` if `retention_days` is set. Two starts are the exception, and need the
+role that owns the tables and their trigger function (or, for the first, any role with `CREATE` on
+the schema): the first one against a table that does not exist yet, and the first one after an
+upgrade that changes the trigger function. Run under the narrower role, those fail with
+`parley-postgres: the bootstrap of table '…' needs a privilege this role lacks (42501: …)` and
+create nothing.
 
 Cross-process write safety is structural, not configured: `post` wraps every insert in a
 transaction that takes `pg_advisory_xact_lock(hashtext(topic))` first. `BIGSERIAL` assigns `seq`
 at INSERT time, not COMMIT time, so without the lock a larger `seq` could become visible before
 a smaller one commits and a catch-up reader would skip the late row forever. The per-topic lock
 serializes same-topic commits into `seq` order (distinct topics don't contend), which is what
-keeps the cursor monotonic and lossless under genuinely concurrent writers — the conformance
-suite's `concurrentPost` check drives N independent plugin instances against one table to prove
-it.
+keeps the cursor monotonic and lossless under genuinely concurrent writers.
+
+Every wait on that lock is bounded: `post()` and `connect()`'s bootstrap both run under `SET LOCAL
+lock_timeout` = `LOCK_WAIT_MS`, so a session sitting on the key (an abandoned transaction, a `psql`
+holding `pg_advisory_lock`) makes them fail with a `parley-postgres: gave up after …ms waiting
+for …` naming the topic or the table, and nothing is written. An unbounded wait
+would instead hold a pooled connection forever and take the instance's reads down with it.
+
+A lock is not the only thing that can wait forever. A peer that completes the TCP handshake and
+then never speaks — a firewalled port, a stalled pooler, a primary mid-failover — looks to the
+driver exactly like a server that is merely slow, and pg's default is to wait indefinitely. So
+every socket this backend opens carries a client-side ceiling instead:
+
+- the first connection gives up after `DIAL_WAIT_MS`, with a `parley-postgres: gave up on …` naming what
+  to check rather than a bare driver string;
+- a pooled checkout after `CONNECT_WAIT_MS` — deliberately wider than the lock wait, because pg applies
+  that ceiling to the queue behind a busy pool as well as to the dial, and a reader waiting its
+  turn behind a contended `post()` must wait rather than fail;
+- any single statement after `QUERY_WAIT_MS`, client-side, because what goes missing is the server's
+  reply and no `statement_timeout` can notice that;
+- `disconnect()` returns within `TEARDOWN_WAIT_MS` whatever the socket does, destroying a connection that
+  will not close rather than waiting on a FIN that is not coming — so a bridge whose database has
+  gone quiet still exits on SIGTERM instead of needing SIGKILL.
+
+## Cursors
+
+A cursor from this backend is a decimal `seq` — the `BIGSERIAL` primary key rendered as text — and
+`fetchRecent` accepts only that. A `since` that is anything else is refused with a
+`parley-postgres: invalid cursor …` error naming the value, before any SQL is issued: a cursor
+minted by a different backend, or invented by an agent, is a bad request rather than a query, and
+the caller gets a message it can act on instead of a PostgreSQL one.
+
+A `topic`, `content`, handle or `in_reply_to` carrying a NUL byte (`U+0000`) is refused the same
+way, before any SQL is issued: `parley-postgres: invalid content — a NUL byte (U+0000) at index
+5 …`. A NUL is a legal JSON string character, so an agent can send one, and PostgreSQL's `TEXT`
+cannot hold it; left to the server, the caller would get `invalid byte sequence for encoding
+"UTF8": 0x00`, which names neither this plugin, nor the field, nor the fact that nothing was
+written.
+
+An unpaired surrogate — a `U+D800`–`U+DFFF` code unit with no partner, which is what a `slice()`
+through an emoji leaves behind — is refused the same way, and for a worse reason: nothing fails
+without the check. The value has no UTF-8 encoding, so the driver sends `U+FFFD` instead, and the
+row is stored under a value that is not the one posted. Two topics an anchored `post_topics`
+pattern admits as distinct would silently share one history, two handles would collapse onto one
+`_senders` row, and `content` would read back altered.
+
+A `topic` or a handle over `MAX_INDEXED_BYTES` of UTF-8 is refused the same way. Those two are the only
+fields this backend puts into a btree index key — `content` and `in_reply_to` are indexed by nothing
+and hold megabytes — and PostgreSQL will not take an index row past `BTREE_MAX_ITEM_BYTES`. Left to the server,
+`post()` comes back with `index row size 3024 exceeds btree version 4 maximum 2704 for index
+"<your table>_topic_seq"`, which names your deployment's relations rather than this plugin, while
+`subscribe()` on the same topic succeeds and registers a live path no `post()` can ever land in. The
+screen is blind to compression, so a long repetitive topic the server would have squeezed into an
+index is refused too: whether a topic is usable should not depend on how well it compresses.
+
+A refusal this backend does not anticipate — a permission the role lost, a filled disk, a relation
+dropped out from under a live pool — comes back as `parley-postgres: the write to topic 'x' failed
+— the database refused it (42P01). …`: the operation, the server's own code for the condition, and
+nothing else the server wrote. PostgreSQL's message quotes your deployment — its relation names,
+and for a dial failure the host and port it could not reach — and a rejected seam call is rendered
+into the model's context, so the driver's full text goes to stderr for the operator instead.
 
 ## Run Postgres
 
 Use the **official `postgres` Docker image** (not authored here):
 
 ```bash
-docker run -d --name parley-postgres -p 5432:5432 \
-  -e POSTGRES_USER=parley -e POSTGRES_PASSWORD=parley -e POSTGRES_DB=parley \
+docker run -d --name parley-postgres -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_USER=parley -e POSTGRES_PASSWORD="$(openssl rand -hex 16)" -e POSTGRES_DB=parley \
   postgres:16-alpine
 ```
 
+Do not provision `parley`/`parley` outside a throwaway local box: that pair is published in this
+repo, and the plugin warns at `connect()` whenever the DSN carries it, whatever host it points at.
+
 (or the maintainer dev harness: `examples/dev-compose/`.)
+
+## Run it (CLI)
+
+```bash
+npm install && npm run build
+parley-postgres --config parley.config.yaml
+# or: node packages/bridge-postgres/dist/cli.js --config parley.config.yaml
+# or: PARLEY_CONFIG=parley.config.yaml parley-postgres
+parley-postgres --help      # also --version
+```
+
+`--config` (or `-c`, or `--config=<path>`) is the only argument. Anything else — a typo, a
+`--config` whose value the shell ate — **exits 2 with a usage message** on stderr instead of falling
+back to the default `parley.config.yaml`, since that default names a different deployment's another database url, table, handle and topic allowlist.
+`--help`/`--version` answer on **stdout** and exit 0; both exit before any connection is opened.
+Once it is serving, stdout is the JSON-RPC channel and every diagnostic goes to stderr.
 
 ## Conformance
 

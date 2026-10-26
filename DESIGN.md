@@ -37,15 +37,18 @@ them.
 
 1. **Two delivery paths, by design.**
    - *Live push* uses Claude Code's native **`claude/channel`** capability (`--channels`).
-     It only reaches **already-running** sessions and retains **no history** — anything
-     sent while a session is down is not delivered by this path.
+     It only reaches **already-running** sessions, retains **no history**, and is **lossy by
+     contract** (§6) — anything sent while a session is down is not delivered by this path, and
+     neither is anything a backend's delivery window could not cover while it was up.
    - *Catch-up* uses **standard MCP tools** backed by the messaging backend's own
      persistence. This is the durable path.
    - The backend — not the channel — is the source of truth and memory.
 
-2. **Auth: claude.ai subscription only.** Channels requires a claude.ai login
-   (Pro/Max/Team/Enterprise). API-key / Console auth is **not** supported for the channel
-   path. Free tier is out of scope.
+2. **Auth: claude.ai *or* a Console API key.** Channels requires Anthropic authentication —
+   a claude.ai login (Pro/Max/Team/Enterprise) **or** a Console API key; not Bedrock/Vertex/
+   Foundry. Free tier is out of scope.
+   *(Corrected at the P-1 gate: this section previously said Console auth was unsupported. The
+   live docs say otherwise and, per CLAUDE.md, the docs win — see PROGRESS.md.)*
 
 3. **Custom-channel preview gating.** Loading a self-built channel currently requires the
    `--dangerously-load-development-channels` flag (official channels are allowlisted during
@@ -112,9 +115,10 @@ interface BackendPlugin {
   connect(config: BackendConfig): Promise<void>;
   disconnect(): Promise<void>;
 
-  // 2. Register interest in a topic; handler fires per inbound message (live path).
-  //    The plugin decides HOW handler is driven (poll loop / blocking event source);
-  //    core decides WHAT happens (emit <channel> event). See §9.
+  // 2. Register interest in a topic; handler fires at most once per inbound message that
+  //    arrives after the call, for a SUBSET of them (live path — see §6). The plugin decides
+  //    HOW handler is driven (poll loop / blocking event source); core decides WHAT happens
+  //    (emit <channel> event). See §9.
   subscribe(topic: Topic, handler: (msg: Message) => void): Promise<void>;
 
   // 3. Write a message to a topic as a given identity. Single centralized write path.
@@ -127,11 +131,15 @@ interface BackendPlugin {
     topic: Topic;
     since?: Cursor;     // monotonic position (§6); omit = backend default window
     limit?: number;
-    blockMs?: number;   // long-poll HINT: if empty past `since`, a plugin MAY block up to blockMs
-                        // for a new message before returning (possibly empty). Only a hint — core
-                        // wraps this with a generic poll fallback on the fetch_recent tool, so every
-                        // backend long-polls with or without native support; value is capped
-                        // server-side (catchup.block_max_ms, default 60s). 0/omit = return at once.
+    blockMs?: number;   // long-poll budget: if empty past `since`, the plugin blocks up to blockMs
+                        // for a new message before returning (possibly empty). A backend with no
+                        // read primitive to park on REFUSES it instead — it rejects with
+                        // BlockingFetchUnsupportedError naming itself, and core propagates that to
+                        // the caller. Never silently ignored: an empty page is indistinguishable
+                        // from a long-poll that timed out. Today Redis and NATS serve it; the other
+                        // eight refuse. `block_ms` is on the fetch_recent tool schema on every
+                        // deployment. Value is capped server-side (catchup.block_max_ms, default
+                        // 60s). 0/omit = return at once.
   }): Promise<{ messages: Message[]; nextCursor: Cursor }>;
 
   // 5. Map a logical handle to a backend identity. Best-effort: a real account lookup where
@@ -148,7 +156,8 @@ interface BackendPlugin {
   as their own `Topic` where a backend supports them — that is the plugin's business.
 - A **handle does not imply an account.** Matrix/XMPP back it with a provisioned user/JID;
   NATS/local treat it as a name convention. The plugin decides.
-- `subscribe` drives the live path (push). `fetchRecent` drives catch-up. `post` serves
+- `subscribe` drives the live path (push). `fetchRecent` drives catch-up — and is the path that
+  RECONCILES what push left out (§6), not merely the one that covers downtime. `post` serves
   replies/output for both, and is the single place write-notifications are emitted.
 
 ---
@@ -177,21 +186,66 @@ timestamp** (clock skew and equal-timestamp ties make timestamps unsafe).
 
 ## 6. Cursor: dedup & ordering (baked into the seam)
 
-The same logical message can arrive twice — once via live push, once via `fetchRecent`
-(e.g. a session that briefly dropped and reconnected). To make this deterministic:
+The two paths carry different obligations. `fetchRecent` is **complete**: every message above
+`since` comes back, page by page. `subscribe` is **lossy**: what it delivers is a **subset** of the
+post-subscribe tail — in cursor order, never twice, never anything from before the subscribe — and
+what it leaves out is returned by the next `fetchRecent`. A backend whose delivery window cannot
+cover a burst is conformant; one whose live path delivers nothing at all is not, and the shared
+suite grades both bounds (`only the post-subscribe tail`, and `does not fall behind a quiet topic`).
+
+Consequences a deployment feels. Documented, not closed: each is a window a particular backend's
+live path cannot cover — the last one catch-up cannot cover either — and the list holds the ones
+that have been written down.
+
+- **SQLite.** `subscribe` starts at the topic's tail as it stands when it is called. Core runs
+  catch-up to completion and arms the live loop afterwards, so in a **multi-writer** deployment a
+  row a peer commits in that start-up window is delivered by neither path until the next
+  `parley_fetch_recent`. That call closes it without the agent doing any bookkeeping: the tool
+  resumes from the position this instance last read and persists the one it hands back.
+- **Matrix.** The plugin asks each incremental `/sync` for at most `INCREMENTAL_TIMELINE_LIMIT`
+  (100) timeline events per room — its own filter value, sent by the client, not a homeserver
+  ceiling — so a burst wider than that arrives with its older events missing, and they stay dark
+  until the next catch-up. Reached through this package's fake; on live Synapse neither shape tried
+  (a burst of 130 while a long-poll was parked, and the same burst at an idle subscriber) lost
+  anything — both delivered 130 of 130.
+- **Zulip.** An event queue idle-GCs after ~10 minutes and is re-registered empty, and a message
+  that reaches the server while no queue of ours exists reaches no queue at all. That window is
+  left to the next `parley_fetch_recent` (bridge-zulip/README.md). Not measured: this repo has no
+  live Zulip, and the only oracle is the package's own fake.
+- **Zulip, catch-up too.** Zulip allocates a message id at INSERT inside `do_send_messages`'
+  transaction and commits later, so two sends in flight at once can commit in reverse id order. A
+  `since` read landing between the two commits returns the higher id and a cursor past the lower
+  one: no later `since` read returns the lower one, and live push, in cursor order, drops it too.
+  This breaks `fetchRecent`'s completeness, not just the live path's, and the plugin cannot close
+  it — Zulip exposes no commit-ordered position (bridge-zulip/README.md). Read from Zulip's server
+  source, not measured.
+
+The same logical message can still arrive twice — once via live push, once via `fetchRecent`, which
+is now the ORDINARY path rather than a reconnect edge case. To make this deterministic:
 
 - Every backend MUST expose a **monotonic position per topic**, surfaced as `cursor` on each
   Message and as `nextCursor` from `fetchRecent`.
   - SQLite → `INTEGER PRIMARY KEY AUTOINCREMENT` / rowid (free monotonic sequence).
   - Redis → stream entry ID (`XADD` IDs are monotonic).
-  - Matrix → per-room stream/sync token.
+  - Matrix → `event_id` (globally unique; "strictly after" resolved server-side via
+    `/context/<event_id>` → a forward pagination token). A window that held no message of the topic
+    has no `event_id` to name, so it mints the second form `@parley-stream:<pagination token>` —
+    the timeline position that window was read AT, replayed as the forward `/messages` start. The
+    `/sync` token drives the LIVE loop only — it is never a cursor.
   - XMPP → MAM archive id.
   - NATS → JetStream sequence number.
   - Postgres → `BIGSERIAL` seq (per-topic advisory lock keeps seq order == commit order).
-  - Zulip → message id (globally monotonic integer).
+  - Zulip → message id (a global integer allocated in increasing order, but not committed in that
+    order — see the window above).
   - Discord → message snowflake (per-channel strictly increasing).
-  - Telegram → per-chat `message_id`, replayed from a **local observed-message store** (the
-    Bot API exposes no history endpoint — no pre-join backfill; see §12 v0.6 caveat).
+  - Telegram → the **local observation sequence** stamped by the observed-message store, NOT
+    Telegram's per-chat `message_id` (which is minted when the sender's message is accepted, so
+    one minted before our own post can be delivered after it and would sit below a cursor already
+    issued). `message_id` rides in the composite dedup key `<chat_id>:<message_id>` instead. That
+    sequence is per store FILE and restarts at 1, so the cursor is written `<store identity>.<seq>`
+    — a cursor minted by a store file this one did not inherit is refused rather than answered out
+    of an unrelated sequence space. The Bot API exposes no history endpoint — no pre-join backfill;
+    see §12 v0.6 caveat.
   - Slack → per-channel message `ts` (compared integer-wise, never as float/lexical).
 - The cursor is **opaque to core** and **keyed by `topic`**. The plugin decides the real
   granularity.
@@ -199,8 +253,10 @@ The same logical message can arrive twice — once via live push, once via `fetc
 - Catch-up is **cursor-based, not timestamp-based**: `fetchRecent({ since })` returns
   everything after the stored cursor and a `nextCursor` to persist.
 
-Because correctness rests on the cursor, **any notify mechanism can be best-effort** — a
-dropped or duplicated push is harmless; core reconciles against the store via `fetchRecent`.
+Because correctness rests on the cursor, **any notify mechanism can be best-effort about what it
+DROPS** — core reconciles against the store via `fetchRecent`. It may not be best-effort about
+repeats: "never twice" above is a conformance obligation on `subscribe`, and core's `backendMsgId`
+dedup is a second line under it, not a licence for a plugin to deliver a message twice.
 
 ---
 
@@ -213,51 +269,11 @@ dropped or duplicated push is harmless; core reconciles against the store via `f
   written to the **backend** via `post` so it lives in durable history for the next
   catch-up. Rule: *replies always write to the backend; the live channel is only the fast
   hop.* Otherwise the instance's own messages vanish on restart.
-- **Live-push filtering.** The live path forwards **all** messages in subscribed topics;
-  handle-mention is a **filter flag**, not a separate subscription. Filtering lives in one
-  place in `bridge-core`.
+- **Live-push filtering.** The live path forwards every message it receives in subscribed topics
+  (which is a subset of them — §6); handle-mention is a **filter flag**, not a separate
+  subscription. Filtering lives in one place in `bridge-core`.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
-- **Presence / liveness.** A bridge announces itself by posting `hello` / `heartbeat` /
-  `goodbye` to **one shared presence topic** (`presence.topic`, default `parley-presence`), and
-  each beat carries the instance's subscribed topics **plus its `post_topics` reach** (the regex
-  sources it may post to but does not subscribe, §14). This is isolated from real topics: the
-  presence topic is **never subscribed and never enters catch-up / dedup**, so heartbeats never
-  surface as `<channel>` events or pollute durable history — and because it is a single stream, a
-  human on a real chat backend mutes **one** topic instead of one per context. It is also
-  **reserved**: no `post` / `fetch_recent` (nor any `post_topics` pattern, §14) may target it, so
-  a peer cannot spoof the roster. The `parley_list_users` tool reconstructs a **reachability roster**
-  from `fetchRecent` over that one topic plus a TTL window — so it works **identically on every backend
-  with no new seam method** and reports each peer's subscribed topics **and post reach**. It is
-  reachability-first, **not just who is awake this instant**: because a post to a sleeping peer's topic
-  lands durably and it catches up on next start, the default roster also includes peers **seen recently
-  but currently offline**, each tagged `online: true | false`, most-recently-seen first (the top
-  hand-off candidates lead). `online_only: true` narrows to live peers; `since_ms` bounds how far back
-  offline peers reach (default 24h); `limit` caps the result. Its default (unscoped) roster is
-  **everyone you share a channel with in either direction** — peers subscribed to a topic *you* can
-  post to, or whose advertised `post_topics` can reach a topic *you* subscribe to — so a
-  freshly-onboarded agent on a unique topic still discovers the peers it can hand off to (advertised
-  pattern sources are inbound, so they are compiled defensively, never enumerated). Liveness is scoped
-  **per instance**: each beat carries a fresh per-process `instanceId`, and a handle is `online` iff
-  **any** of its instances has a fresh, non-`goodbye` beat — so a `goodbye` from an exiting process
-  reaps only its own instance and a relaunch's `hello` is never clobbered by the old process's trailing
-  `goodbye`. TTL reclaims crashed instances; `goodbye` is a best-effort fast-path. The roster envelope
-  is `{ users, truncated }` — `truncated: true` warns the scanned presence page was full, so offline
-  peers older than it are not guaranteed to appear. **Presence records are versioned** (`v`; current
-  line `v:2`): evolve the format *additively within a version* — new optional fields (e.g. `postTopics`
-  and the per-process `instanceId`, both added on the `v:2` line)
-  decode to a default on older readers and are ignored by them, so mixed-version fleets interoperate
-  and a rolling upgrade only forgoes the *new* signal until every peer is current. A **version bump
-  is a flag day**, not a graceful step: `decodePresence` returns null for any record whose `v` it
-  does not recognize (a `v:2` reader *drops* a `v:1` record — pre-v2 beats simply never land on the
-  shared presence topic), so a bump needs every peer on the same line, or a reader taught to accept
-  both versions. Prefer additive fields.
-  This is **Parley-participant liveness, not a human directory** — a human in a native chat client
-  appears only once they send a real message. A reactive-only front door (the chat instance)
-  cannot receive `<channel>` pushes and can set `presence.enabled: false` to stay silent. Powered
-  above the seam by `post`/`fetchRecent`; knobs in §11 (`presence`). Keep `presence.topic`
-  consistent across a deployment — bridges announcing on different presence topics cannot see each
-  other.
 
 ---
 
@@ -301,7 +317,8 @@ families:
 - **Polling** (SQLite): the server runs a poll loop —
   `SELECT WHERE cursor > :lastSeen` per subscribed topic on an interval — normalizes new
   rows, invokes handler, advances `lastSeen`. Silent at the MCP-protocol level.
-- **Event-driven / blocking** (Redis `XREAD BLOCK`, Matrix sync, XMPP PubSub, NATS subscribe):
+- **Event-driven / blocking** (Redis `XREAD BLOCK`, Matrix sync, XMPP's joined-MUC message
+  stream, NATS subscribe):
   handler is driven by genuine backend events instead of a timer.
 
 Because core's emit-to-channel handler is identical across mechanisms, **push developed
@@ -319,8 +336,13 @@ dumb and dependency-free: poll, reconcile via cursor, done.
 - **Event-driven push is introduced by `bridge-redis` (v0.3)**, the first backend that
   drives `subscribe` from a real blocking event source (`XREAD BLOCK`). That milestone
   inherits the job of proving the push path works against genuine events, not a timer.
-- Poll interval (e.g. 500ms–2s) is a latency/cost knob on the SQLite plugin with **no
-  correctness impact** — the cursor guarantees nothing is missed regardless of cadence.
+- Poll interval (e.g. 500ms–2s) is a latency/cost knob on the SQLite plugin. The cursor makes a
+  poll tick miss nothing **that is still in the store**, whatever the cadence — but retention is
+  not cursor-aware: `bridge-sqlite`'s prune deletes by row `ts` age, independent of any
+  subscriber's position, so at the documented floor (`retention_days: 1/1440`, 60s) with a longer
+  poll interval, rows are deleted before the tick that would have delivered them. Keep the interval
+  well below the retention window. What push does not cover is the start-up window above, and
+  catch-up is what closes that.
 - **Multi-process** (N sessions → N bridges on one host, §10) is safe with SQLite **WAL mode**
   (already specified) plus a busy-timeout/retry so simultaneous `post`s from different
   instances don't error. With UDS gone, that concurrent-write handling is the *only*
@@ -357,6 +379,23 @@ config (handle, topics, subscriptions). This is structural, not a preference:
   Code session.
 - **Cursor / read-state is per-instance, not global.** Different sessions legitimately hold
   different read positions per topic. Never share cursor state across instances.
+
+**The files `state_path` names.** Core writes five names under the one configured path — four that
+persist and one transient — and they carry very different weight:
+
+| File | Holds | If you delete it |
+|---|---|---|
+| `<state_path>` | the AGENT's read position per topic — what `parley_fetch_recent` has handed it | every topic resumes from the backend's recent window, and anything older is unreachable |
+| `<state_path>.corrupt` | a read-position file that could not be parsed, moved aside so it is not silently overwritten | nothing; it is evidence, never read back |
+| `<state_path>.warmed` | how far ON-START CATCH-UP has already paged per topic — a cache, so a restart warms the dedup set from the live boundary instead of re-reading the backlog | one re-paged boot per topic. It costs round trips and reaches strictly MORE, never less. Always safe |
+| `<state_path>.warmed.corrupt` | the same evidence copy for the marker | nothing |
+| `<state_path>.<pid>.<uuid>.tmp` | a write in progress: every update is written here and renamed into place, so a reader never sees a half-written file. Process-unique, so two flushes cannot interleave | nothing — but nothing cleans it up either. A process killed between the write and the rename leaves one behind permanently, and the next flush writes a differently-named one |
+
+The split is the point: catch-up must not advance the read position (§7), so it keeps its own
+record. A marker cursor this backend cannot parse — the instance previously ran against a different
+one — is a **cache miss**: core warns and re-reads. The same cursor in the read position is
+**fatal**, because that one is the record of what the agent has been handed and guessing past it
+loses whatever sits between.
 
 Multi-instance on one host is safe. For SQLite the only concern is concurrent DB access (WAL
 mode + busy-timeout, §9). For network backends it's a non-issue — each bridge is just another
@@ -411,37 +450,78 @@ authenticates exactly one owner.
 
 A single config object drives the bridge; sane defaults everywhere. Illustrative:
 
+There is deliberately **no `backend:` key**. Core cannot load a plugin by name without learning
+backend names, which the seam forbids (§3) — so the backend is chosen by *which binary you run*.
+Every backend package ships one (`parley-sqlite`, `parley-redis`, `parley-matrix`, …), each a small
+composition root that constructs its own plugin and calls `createStdioBridge`. A config carrying a
+`backend:` key is rejected at load, naming the binary to run instead, rather than silently ignored.
+
 ```yaml
-backend: local-sqlite      # local-sqlite | local-redis | matrix | xmpp | nats
+# Run with: parley-sqlite --config parley.config.yaml
+instance_id: "ctx-payments-a"   # read-state namespace; defaults to identity.handle.
+                                # MUST be distinct per concurrent session sharing a handle, and
+                                # should be fresh when repointing at a different backend (cursors
+                                # are backend-specific — see §6).
+# state_path: /srv/parley/read-state.json
+#   override the read-state file location; omit the key for the default
+#   $XDG_STATE_HOME/parley/<instance_id>/read-state.json
+#   Core writes .corrupt, .warmed and .warmed.corrupt siblings beside it — see §10.
 identity:
   handle: "ctx-payments"   # this instance's logical handle
 topics:                    # subscribe to / catch up on (one fetchRecent call each) — THE ALLOWLIST
   - "ctx-payments"
   - "ctx-payments-reviews"
 post_topics:               # OPTIONAL extra topics allowed for post/fetch only, as full-match regexes
-  - "ctx-payments-.*"      # (never subscribed/caught-up; the presence topic can never be matched)
+  - "ctx-payments-.*"      # (never subscribed/caught-up)
 catchup:
   on_start: true
-  limit: 100
+  limit: 100                    # page size per fetchRecent
+  block_max_ms: 60000           # server-side cap on the parley_fetch_recent `block_ms` long-poll;
+                                # a caller's value is clamped to this before it reaches a plugin,
+                                # kept below client tool timeouts so a blocked call never trips them
+  block_poll_interval_ms: 250    # how often core re-drives fetchRecent AFTER a plugin came back
+                                 # from a budget early with nothing for the topic asked for. NOT the
+                                 # delivery latency while a plugin is parked: Redis and NATS spend
+                                 # the budget inside one fetchRecent (measured: 402ms arrival,
+                                 # ~1205ms idle return, identical at cadence 250 and 5000), and the
+                                 # eight that refuse block_ms never start the loop at all. Redis
+                                 # does return early — a disconnect mid-budget, a caught reader
+                                 # failure, or a caller past its concurrent-reader cap — and this
+                                 # cadence is what honours the rest of that budget.
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
-presence:                  # announce hello/heartbeat/goodbye; powers parley_list_users (§7)
-  enabled: true            # reactive-only front doors (chat) can set this false
-  topic: "parley-presence" # ONE shared topic all bridges announce on; mute this one to hide presence
-  heartbeat_ms: 600000     # 10 min — agents stay subscribed a long time
-  ttl_ms: 1800000          # a handle is "live" if its last beat is within this window; default 3× heartbeat_ms
 permissions:
-  skip_permissions: false  # DANGEROUS; sandbox-only; default off
-backend_config:            # opaque to core; passed to the plugin
-  # local-sqlite:
-  #   db_path: ...
-  #   poll_interval_ms: 1000   # latency knob only; no correctness impact
-  # local-redis:  { url }
-  # matrix: { homeserver, user, access_token, ... }
-  # xmpp:   { jid, password, muc_service, ... }
-  # nats:   { servers, subject_prefix, jetstream: true, ... }
+  skip_permissions: false  # NOT IMPLEMENTED — nothing in core or any plugin reads it (§14).
+                           # `true` is a load error rather than an accepted no-op, so it can never
+                           # imply a sandbox mode that does not exist.
+auth:                      # remote/chat mode only; ignored under local stdio (§10)
+  mode: builtin            # builtin = the bundled single-tenant OAuth 2.1 AS
+                           # oidc    = delegate to an external IdP; Parley becomes a pure
+                           #           resource server (RFC 9728). See docs/keycloak-integration.md
+  oidc:
+    issuer: "https://auth.example.com/realms/parley"
+    audience: "parley-mcp"       # Keycloak ignores RFC 8707 `resource` — an audience mapper is required
+    required_role: "parley-owner"  # optional identity gates: also allowed_subjects / allowed_usernames
+backend_config:            # opaque to core; passed verbatim to the plugin's connect()
+  db_path: ./parley.sqlite # this file runs parley-sqlite; each plugin's own shape:
+  # sqlite:   { db_path, poll_interval_ms, retention_days? }
+  #             poll_interval_ms is a latency knob only; no correctness impact
+  # redis:    { url, retention_days? }          postgres: { url, table_name, pool_size, retention_days? }
+  # matrix:   { homeserver_url, user, password | access_token, shared_room? }
+  # xmpp:     { service, domain, muc_service, username, password, nick?, mam_page? }
+  # nats:     { servers, stream_prefix, retention_days? }
+  # zulip / discord / slack / telegram: see each plugin's README
 ```
+
+`retention_days` is an opt-in prune knob on the backends whose store Parley itself owns (sqlite,
+postgres, redis, nats). All four read it the same way: omit the key — or write it with no value, so
+it parses as `null` — to keep every message forever, and a window is a number of days no smaller
+than `1/1440` (one minute) and no larger than each store's own representable ceiling. Below the
+floor the window deletes the whole history the moment it is applied, and past the ceiling the
+cutoff predates every message the store could hold, so pruning silently never runs. Matrix and XMPP
+retention is a homeserver feature, not something an unprivileged bridge account can enact — see
+each plugin's README.
 
 Identity/topic→backend mapping is **convention-based by default** (derive
 room/subject/channel from handle/topic), overridable in `backend_config`.
@@ -478,7 +558,10 @@ room/subject/channel from handle/topic), overridable in `backend_config`.
 - Success criterion: adding it touches **only** the new plugin, never `bridge-core`.
 
 **v0.4 — `bridge-matrix` (first external-network backend).**
-- matrix-js-sdk; room→topic, sync token→cursor, sync loop→subscribe, history→fetchRecent.
+- room→topic, `event_id`→cursor, sync loop→subscribe, history→fetchRecent. NOTE: the shipped
+  plugin is a hand-rolled raw Client-Server HTTP client, NOT matrix-js-sdk — the SDK's weight is
+  only earned by E2EE device management, which unencrypted rooms do not need. Reading this
+  reference remains the path for an encrypted-room variant.
 - First true proof the seam isn't local-shaped. Also the first backend that can run on a
   **different machine** from the bridge (§10 decoupling).
 - Infra: README points to the canonical upstream Synapse Docker setup (§15); not authored
@@ -501,15 +584,17 @@ room/subject/channel from handle/topic), overridable in `backend_config`.
   (local floor) and Redis (broker).
 - **Zulip** (self-hosted): the closest native fit — stream+topic→topic (near 1:1; Zulip
   topics are mutable, so membership can drift if admins move messages), globally monotonic
-  message id→cursor, narrowed event queue + `/events` long-poll→subscribe (queue GC recovered
-  by re-register + cursor gap-fill), `GET /messages` anchor→fetchRecent.
+  message id→cursor, narrowed event queue + `/events` long-poll→subscribe (a GC'd queue is
+  re-registered and the loop resumes from the new one; whatever the dead queue held is left to the
+  next `fetchRecent`, per the subset contract in §6 — the push path issues no history read at all),
+  `GET /messages` anchor→fetchRecent.
 - **Discord, Telegram, Slack** — the first **hosted SaaS** backends, unlike the self-hosted
   core set; history durability and identity live under the vendor's policy (positioning
   noted in each plugin's class JSDoc). Discord: channel→topic, snowflake→cursor, gateway
   websocket→subscribe, `?after=`→fetchRecent. Slack: channel→topic, per-channel `ts`→cursor,
   Socket Mode websocket→subscribe (every envelope acked before processing),
-  `conversations.history` paging→fetchRecent. Telegram: chat→topic, per-chat
-  `message_id`→cursor, `getUpdates` long-poll→subscribe (one poller per token — no
+  `conversations.history` paging→fetchRecent. Telegram: chat→topic, local observation
+  sequence→cursor (`<chat_id>:<message_id>`→dedup key), `getUpdates` long-poll→subscribe (one poller per token — no
   multi-instance writers), **fetchRecent replays a local observed-message store** because the
   Bot API has no history endpoint — the one backend that structurally strains the
   durable-replayable-history line of the fit contract (no pre-join backfill, ever).
@@ -529,9 +614,11 @@ parley/
 ├── packages/
 │   ├── bridge-core/          # seam, Message type, cursor/dedup, channel emit, reactive tools
 │   │   ├── transport/        #   local-stdio + remote-HTTP transports
-│   │   └── auth/             #   OAuth front door for remote mode (v0.2); absent in local mode
+│   │   ├── auth/             #   OAuth front door for remote mode (v0.2); absent in local mode
+│   │   └── testing/          #   published `@sharptrick/parley-core/testing` subpath: fixtures a
+│   │                         #   plugin's own suite imports
 │   │                         # ZERO backend dependencies
-│   ├── bridge-local-sqlite/  # v0.1 — zero-infra on-ramp; polling-only
+│   ├── bridge-sqlite/        # v0.1 — zero-infra on-ramp; polling-only
 │   ├── bridge-redis/         # v0.3 — first event-driven push; first networked local-ish backend
 │   ├── bridge-matrix/        # v0.4 — first network backend (flagship external)
 │   ├── bridge-xmpp/          # v0.5
@@ -540,7 +627,10 @@ parley/
 │   ├── bridge-zulip/         # v0.6 — self-hosted; closest native fit (streams+topics)
 │   ├── bridge-discord/       # v0.6 — hosted SaaS; gateway push
 │   ├── bridge-telegram/      # v0.6 — hosted SaaS; local observed store (no history API)
-│   └── bridge-slack/         # v0.6 — hosted SaaS; Socket Mode push
+│   ├── bridge-slack/         # v0.6 — hosted SaaS; Socket Mode push
+│   ├── bridge-net-util/      # PUBLISHED: fetch+retry, credential/loopback classifier, delay —
+│   │                         #   shared BELOW the seam by every backend but SQLite
+│   └── conformance/          # PUBLISHED: the shared seam suite every plugin runs
 ├── examples/
 │   ├── fakechat-loopback/    # local test harness for the channel path
 │   ├── self-host-remote/     # reference deployment for remote/chat mode (public + OAuth)
@@ -559,7 +649,7 @@ parley/
 **transport/auth layer inside core**, not a plugin — the seam and backends are identical in
 local and remote mode. The local `bridge-local-sqlite` and networked `bridge-redis` implementations both satisfy the seam,
 demonstrating core is genuinely backend-agnostic before any network backend exists. The
-promise: *implement five methods, get a Claude bridge for your platform.*
+promise: *implement six methods, get a Claude bridge for your platform.*
 
 ---
 
@@ -568,16 +658,16 @@ promise: *implement five methods, get a Claude bridge for your platform.*
 - **Topic allowlist.** The bridge only subscribes to / catches up on an explicit list of
   topics (`topics`). No wildcard-everything by default. `post_topics` optionally extends
   **post/fetch only** with full-match regex patterns (for a chat instance posting to ad-hoc
-  topics) — it never widens subscribe/catch-up/presence, which stay the explicit list. The
-  presence topic is **reserved**: no pattern, however broad, makes it postable/fetchable, so a
-  peer cannot spoof the presence roster.
+  topics) — it never widens subscribe/catch-up, which stay the explicit list.
 - **Inbound is untrusted.** A backend message becomes agent context; treat it as untrusted
   input, never as privileged instruction. With spawn deferred, worst case is "writes into a
   live session," but the prompt-injection surface concentrates here — keep backends private
   and lock write access to known handles.
 - **Secrets** (tokens, JIDs, NATS/Redis creds) live in `backend_config`, never in core,
   never committed. Document `.env` / secret handling in the README.
-- **`skip_permissions` defaults OFF**, sandbox-only.
+- **`skip_permissions` is NOT IMPLEMENTED.** Nothing in core or any plugin reads it, and
+  `true` is a load error rather than an accepted no-op — there is no sandbox mode to opt
+  into, and adding one would be adding the leniency this line exists to refuse. See §11.
 - **Remote mode (chat): single-tenant OAuth front door.** Each public instance authenticates
   exactly one owner via OAuth 2.1 + PKCE with user consent. Owner credential handoff to the
   server is **local** (CLI / stdin / localhost page) so no secret crosses the public internet
@@ -630,7 +720,7 @@ Three properties define the niche, and *the combination* is what's unclaimed:
    (Claude chat via remote/OAuth mode), and coding agents (Claude Code via channels). Most
    prior art does *one or two*, usually agent-to-agent only.
 3. **Deliberately small and standalone** — a focused give-away, not a feature buried inside a
-   platform. "Implement five methods, get a Parley backend for your transport."
+   platform. "Implement six methods, get a Parley backend for your transport."
 
 ### Why we did not just use or contribute to an existing project
 
@@ -729,6 +819,30 @@ coding-agent in one bus, and (3) a small standalone give-away. **Parley's niche 
 unclaimed.** Worth tracking: the memory-pluggability convergence validates the "implement an
 interface, swap the backend" thesis in an adjacent domain.
 
+**Re-scan at 1.0 (2026-07-29).** Searched by function again (transport-agnostic MCP messaging,
+agent-to-agent over MCP, conversation/session hand-off between Claude surfaces). The niche is
+**no longer empty** — two entrants now overlap parts of it, and the honest read is narrower than
+June's:
+
+- **`trust-delta/conversation-handoff-mcp`** — hand-off of conversation context between AI chats
+  and systems (Claude Desktop, Claude Code, ChatGPT), sharing across MCP clients via a background
+  HTTP server. This is the closest thing yet to Parley's *use case*. The difference is
+  architectural rather than promotional: it ships one transport it owns, where Parley's whole
+  thesis is a seam with ten interchangeable backends behind a shared conformance suite — so a
+  Parley thread can live in a Matrix room a human already reads, which a bespoke HTTP store
+  cannot offer.
+- **`agenttrust/mcp-server`** — A2A messaging with verified agent identity, HITL escalation and
+  prompt-injection detection, exposed as MCP tools. Overlaps the agent-to-agent leg but is a
+  hosted trust/identity service, not a backend-agnostic seam, and does not target the
+  human-in-an-ordinary-chat-app case.
+- Community **Claude Code ↔ Codex CLI bridges** (Mar 2026) confirm the underlying demand while
+  being exactly the point-to-point glue Parley argues against in §16.
+
+Conclusion, stated more carefully than last time: the *problem* is now visibly contested, and the
+combination Parley still holds alone is (1) a real backend-agnostic messaging seam proven by one
+suite across ten backends, plus (2) humans, chat bots and coding agents on the same bus. Claims of
+an empty field should be retired; §16 should be read as a claim about the *seam*, not the problem.
+
 ---
 
 ## 18. Discoverability — function-based tags
@@ -764,8 +878,19 @@ the name (`parley`), so the evocative name and the searchable terms both do thei
 ## 19. Open items for review (non-blocking)
 
 - [x] **Project name: `parley`** — locked. Propagates to package/repo/scope/channel id.
-- [ ] (none blocking) — design is ready to hand to a Code instance; next artifacts are
-      `CLAUDE.md` and `TASKS.md`.
+- [x] Design handed to a Code instance; `CLAUDE.md` and `TASKS.md` written and worked to
+      completion. v0.1–v1 plus the post-v1 OIDC mode all shipped.
+- [ ] **Cut 1.0.** The seam has been frozen since v0.1 and survived ten backends, one post-freeze
+      capability (`block_ms`) and its later WITHDRAWAL from eight of them, with no method changes:
+      the capability landed as one optional field, and the withdrawal added NO field at all — the
+      `capabilities` declaration written for it was built and then removed, and a backend that
+      cannot park refuses the argument at the moment it is used. See `docs/1.0-readiness.md` for the
+      evidence, what 1.0 would and would not freeze, and the mechanics. Deliberately not
+      automatic: per `CLAUDE.md`, breaking changes land as `feat:` until 1.0 is cut on purpose.
+- [ ] Deferred by choice, not oversight (see `TASKS.md`): spawn-on-unknown-handle, richer
+      payloads (files/images), multi-instance routing, and splitting plugins into separate
+      repos — the last now satisfies its own gate (two consecutive backends with zero core
+      changes) many times over, but lockstep releasing is working, so it stays deferred.
 
 **Resolved since earlier revisions:**
 - Name is **Parley** (`@sharptrick/parley-*`).

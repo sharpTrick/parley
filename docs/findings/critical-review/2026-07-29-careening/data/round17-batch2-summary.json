@@ -1,0 +1,86 @@
+{
+ "round": 17,
+ "converged": false,
+ "blockingClean": false,
+ "wakeAll": false,
+ "counts": {
+  "confirmed": 26,
+  "blocking": 10,
+  "plausible": 0,
+  "total": 26
+ },
+ "ranTargets": [
+  "postgres",
+  "matrix",
+  "xmpp",
+  "nats",
+  "zulip"
+ ],
+ "quiescedTargets": [
+  "core-seam",
+  "core-engine",
+  "core-auth",
+  "sqlite",
+  "redis",
+  "discord",
+  "slack",
+  "telegram",
+  "shared",
+  "repo"
+ ],
+ "byLens": {
+  "concurrency-and-failure": {
+   "total": 6,
+   "confirmed": 6,
+   "blocking": 4
+  },
+  "test-integrity": {
+   "total": 5,
+   "confirmed": 5,
+   "blocking": 1
+  },
+  "truth-in-docs": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 0
+  },
+  "test-hygiene": {
+   "total": 2,
+   "confirmed": 2,
+   "blocking": 0
+  },
+  "security": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 2
+  },
+  "protocol-conformance": {
+   "total": 1,
+   "confirmed": 1,
+   "blocking": 1
+  },
+  "design-principles": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 1
+  },
+  "correctness": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 1
+  }
+ },
+ "batch": 2,
+ "base": "8e8d22e",
+ "byTarget": {
+  "postgres": 6,
+  "matrix": 8,
+  "xmpp": 5,
+  "nats": 3,
+  "zulip": 4
+ },
+ "errored": [],
+ "tokens": 1089301,
+ "toolCalls": 279,
+ "wallMs": 4892078
+}

@@ -2,15 +2,47 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { asBackendMsgId, asHandle, asTopic } from '../message.js';
-import { FakePlugin } from '../testing/fake-plugin.js';
-import { catchUpAll, catchUpTopic } from './catchup.js';
+import { asBackendMsgId, asCursor, asHandle, asTopic, type Message } from '../message.js';
+import { NoSuchTopicError } from '../no-such-topic.js';
+import type { BackendPlugin, FetchRecentArgs, FetchRecentResult } from '../seam.js';
+import { FakePlugin } from '../test-support/fake-plugin.js';
+import {
+  coarseHistory,
+  memoryReadState,
+  NONCONFORMANT_SHAPE_NAMES,
+  NONCONFORMANT_SHAPES,
+  pagingProbe,
+} from '../test-support/nonconformant.js';
+import { catchUpAll, catchUpTopic, MAX_CATCHUP_PAGES } from './catchup.js';
 import { ReadStateStore } from './read-state.js';
-import { SeenSet } from './seen-set.js';
+import { SEEN_MAX_PER_TOPIC, SeenSet } from './seen-set.js';
 
 const rsPath = () => join(mkdtempSync(join(tmpdir(), 'parley-cu-')), 'read-state.json');
+
+/** Await a promise that MUST reject, and hand back the Error (never the resolved value). */
+async function rejectionOf(p: Promise<unknown>): Promise<Error> {
+  return p.then(
+    () => {
+      throw new Error('expected the promise to reject, but it resolved');
+    },
+    (e: unknown) => e as Error,
+  );
+}
 const T = asTopic('ctx');
 const me = asHandle('alice');
+
+/**
+ * The two shapes a backend's HISTORY read comes in. `coarse` is not a nonconformance: a wildcard
+ * subject, a room carrying several logical topics and a stream/topic split all hand back other
+ * topics' messages, and CATCH_UP_TERMINAL_CONDITION is written about exactly those backends. Every
+ * table that drives the pager runs against both, so a rule that holds on one grain cannot be walked
+ * around on the other.
+ */
+const HISTORY_GRAINS = {
+  'exact-topic': (p: BackendPlugin) => p,
+  coarse: coarseHistory,
+};
+const HISTORY_GRAIN_NAMES = Object.keys(HISTORY_GRAINS) as Array<keyof typeof HISTORY_GRAINS>;
 
 async function seeded(n: number, prefix = 'm') {
   const p = new FakePlugin();
@@ -20,37 +52,466 @@ async function seeded(n: number, prefix = 'm') {
 }
 
 describe('catch-up driver', () => {
-  it('drains all, warms the seen-set, advances read-state', async () => {
+  it('drains all, warms the seen-set, and leaves the read position where it found it', async () => {
     const p = await seeded(5);
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     const n = await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen });
     expect(n).toBe(5);
-    expect(readState.get(T)).toBe('5'); // cursor of the last message
     expect(seen.has(T, asBackendMsgId('5'))).toBe(true);
     // warmed: a message already pulled should NOT count as first-seen on the push path
     expect(seen.firstSeen(T, asBackendMsgId('3'))).toBe(false);
+    // The five it just paged over are the five `parley_fetch_recent` still owes the agent, and the
+    // stored position is that tool's record of what the agent has been handed. A driver that
+    // advanced it here consumed the backlog invisibly: the agent's next since-less call resumed
+    // from the far end and answered with the newest window, and everything before it was gone.
+    expect(
+      readState.get(T),
+      'on-start catch-up advanced the read position past a backlog it never handed anyone',
+    ).toBeUndefined();
   });
 
-  it('second catch-up returns only newer (exclusive since)', async () => {
+  /**
+   * The seam's TYPE is no guarantee — a JS plugin, or a TS one returning a value typed away, can
+   * omit `nextCursor` or spell it as something no cursor can be. The driver pages over such an
+   * answer without persisting anything, so the position a restart resumes from survives it; the
+   * refusal itself belongs to the tool that does the writing, and `tools.test.ts` grades it there.
+   */
+  it.each([
+    ['no nextCursor at all', {}],
+    ['a null nextCursor', { nextCursor: null }],
+    ['a numeric nextCursor', { nextCursor: 7 }],
+    ['an empty-string nextCursor', { nextCursor: '' }],
+  ])('a page carrying %s leaves the stored read position intact', async (_label, over) => {
+    const path = rsPath();
+    const readState = new ReadStateStore(path);
+    readState.set(T, asCursor('42'));
+    const plugin = {
+      fetchRecent: (): Promise<FetchRecentResult> =>
+        Promise.resolve({ messages: [], ...over } as unknown as FetchRecentResult),
+    } as unknown as BackendPlugin;
+
+    await expect(
+      catchUpTopic({ plugin, topic: T, limit: 10, readState, seen: new SeenSet() }),
+    ).resolves.toBe(0);
+    expect(readState.get(T)).toBe('42');
+    expect(new ReadStateStore(path).get(T)).toBe('42');
+  });
+
+  it('a resumed catch-up reads only newer (exclusive since)', async () => {
     const p = await seeded(3, 'a');
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(3);
     for (let i = 0; i < 2; i++) await p.post(T, me, `b${i}`);
+    // NO hand-advancement between the calls. Writing the agent's position here is what let this
+    // case stay green while the driver re-read the whole backlog on every boot: the driver's own
+    // marker is what has to make the next start incremental, and the agent's position must not move.
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(2);
-    expect(readState.get(T)).toBe('5');
-    // fully drained → no further messages
     expect(await catchUpTopic({ plugin: p, topic: T, limit: 100, readState, seen })).toBe(0);
+    expect(readState.get(T)).toBeUndefined();
   });
 
-  it('paginates when limit < total', async () => {
-    const p = await seeded(10);
-    const readState = new ReadStateStore(rsPath());
-    const seen = new SeenSet();
-    const n = await catchUpTopic({ plugin: p, topic: T, limit: 3, readState, seen });
-    expect(n).toBe(10);
-    expect(readState.get(T)).toBe('10');
+  // Keep cold-start out of any case named for pagination, so that a since-less drain is never
+  // asserted to reach the whole history: with no stored cursor the driver reads the newest `limit`
+  // window and adopts its tail. Both arms are pinned by the stored-cursor × page-size grid below.
+
+  describe('resume-from-disk failures carry an actionable hint', () => {
+    const rejectingPlugin = (message: string) =>
+      ({
+        fetchRecent: () => Promise.reject(new Error(message)),
+      }) as unknown as Parameters<typeof catchUpTopic>[0]['plugin'];
+
+    it.each([
+      ['invalid input syntax for type bigint: "1785300194045-0"'], // postgres given a redis id
+      ['ERR Invalid stream ID specified as stream command argument'], // redis given a bigserial
+      ['M_INVALID_PARAM: invalid from token'], // matrix given anything else
+    ])('names the state file and the stored cursor (%s)', async (backendError) => {
+      const path = rsPath();
+      const readState = new ReadStateStore(path);
+      readState.set(T, '1785300194045-0' as never);
+
+      await expect(
+        catchUpTopic({
+          plugin: rejectingPlugin(backendError),
+          topic: T,
+          limit: 100,
+          readState,
+          seen: new SeenSet(),
+        }),
+      ).rejects.toThrow(
+        new RegExp(
+          `resuming from the stored cursor.*1785300194045-0.*${backendError.slice(0, 12)}`,
+          's',
+        ),
+      );
+      const err = await rejectionOf(
+        catchUpTopic({
+          plugin: rejectingPlugin(backendError),
+          topic: T,
+          limit: 100,
+          readState,
+          seen: new SeenSet(),
+        }),
+      );
+      expect(err.message).toContain(path);
+      // Assert on `stack`, not only `message`, so that a wrapper which clobbers the stack cannot
+      // discard the hint at the one place a human reads it while this test stays green.
+      expect(err.stack).toContain('resuming from the stored cursor');
+      expect(err.stack).toContain(path);
+      expect((err.cause as Error).message).toBe(backendError);
+    });
+
+    /**
+     * The hint names a state file and advises deleting it, so it belongs to the ONE page that
+     * replays a cursor read off disk and to no other: told it about a transient mid-pagination blip,
+     * an operator deletes read-state and re-drains the whole history. Cross "was a cursor stored"
+     * with which page rejects — exactly one cell is annotated, so widening the scope to every page
+     * and narrowing it to none each flip a cell.
+     */
+    describe('the resume hint is scoped to the page that replays the stored cursor', () => {
+      /** Serves one message per page with an advancing cursor, rejecting on the chosen page. */
+      const failingOnPage = (failAt: number): BackendPlugin => {
+        let page = 0;
+        return {
+          fetchRecent: (a: FetchRecentArgs): Promise<FetchRecentResult> => {
+            const n = page++;
+            if (n === failAt) return Promise.reject(new Error('ECONNRESET'));
+            return Promise.resolve({
+              messages: [
+                {
+                  topic: a.topic,
+                  senderHandle: me,
+                  content: `m${n}`,
+                  timestamp: '1970-01-01T00:00:00.000Z',
+                  backendMsgId: asBackendMsgId(String(n)),
+                  cursor: asCursor(String(n + 1)),
+                  mentions: [],
+                } as Message,
+              ],
+              nextCursor: asCursor(String(n + 1)),
+            });
+          },
+        } as unknown as BackendPlugin;
+      };
+
+      const CELLS = [true, false].flatMap((resumed) =>
+        [0, 1, 3].map((failAt) => [resumed, failAt] as const),
+      );
+
+      it.each(CELLS)('stored cursor=%s, page %i rejects', async (resumed, failAt) => {
+        const path = rsPath();
+        const readState = new ReadStateStore(path);
+        if (resumed) readState.set(T, asCursor('0'));
+
+        const err = await rejectionOf(
+          catchUpTopic({
+            plugin: failingOnPage(failAt),
+            topic: T,
+            limit: 1,
+            readState,
+            seen: new SeenSet(),
+          }),
+        );
+
+        if (resumed && failAt === 0) {
+          expect(err.message).toMatch(/resuming from the stored cursor/);
+          expect(err.message).toContain(path);
+          expect(err.message).toMatch(/instance_id/);
+          expect((err.cause as Error).message).toBe('ECONNRESET');
+        } else {
+          expect(err.message).toBe('ECONNRESET');
+          expect(err.cause).toBeUndefined();
+        }
+      });
+    });
+  });
+
+  /**
+   * seam.ts declares NoSuchTopicError the ONE rejection meaning "topic not present yet" rather than
+   * a backend failure. Table every catch-up entry point against BOTH kinds so a call site that
+   * honours the sentinel on one path and not its siblings cannot pass: the sentinel must degrade
+   * (zero messages, read-state untouched, bridge alive), the generic error must propagate.
+   */
+  describe('the absent-topic sentinel degrades; every other rejection propagates', () => {
+    const rejectingWith = (make: () => Error, only?: string): BackendPlugin =>
+      ({
+        fetchRecent: (a: FetchRecentArgs) =>
+          only === undefined || a.topic === only
+            ? Promise.reject(make())
+            : Promise.resolve({ messages: [] as Message[], nextCursor: asCursor('9') }),
+      }) as unknown as BackendPlugin;
+
+    const sentinel = (): Error => new NoSuchTopicError('ops');
+    const generic = (): Error => new Error('backend on fire');
+
+    const entryPoints: Array<
+      [name: string, run: (plugin: BackendPlugin, readState: ReadStateStore) => Promise<number>]
+    > = [
+      [
+        'catchUpTopic',
+        (plugin, readState) =>
+          catchUpTopic({ plugin, topic: asTopic('ops'), limit: 100, readState, seen: new SeenSet() }),
+      ],
+      [
+        'catchUpAll',
+        (plugin, readState) =>
+          catchUpAll({
+            plugin,
+            topics: [asTopic('ctx'), asTopic('ops')],
+            limit: 100,
+            readState,
+            seen: new SeenSet(),
+          }),
+      ],
+    ];
+
+    for (const [name, run] of entryPoints) {
+      for (const cold of [true, false]) {
+        const start = cold ? 'cold start' : 'resuming from a stored cursor';
+
+        it(`${name} treats NoSuchTopicError as an empty topic (${start})`, async () => {
+          const readState = new ReadStateStore(rsPath());
+          if (!cold) readState.set(asTopic('ops'), asCursor('stored'));
+          const drained = await run(rejectingWith(sentinel, 'ops'), readState);
+          expect(drained).toBe(0);
+          // Read-state must not move for a topic we never actually read.
+          expect(readState.get(asTopic('ops'))).toBe(cold ? undefined : 'stored');
+        });
+
+        it(`${name} propagates a generic backend failure (${start})`, async () => {
+          const readState = new ReadStateStore(rsPath());
+          if (!cold) readState.set(asTopic('ops'), asCursor('stored'));
+          await expect(run(rejectingWith(generic, 'ops'), readState)).rejects.toThrow(
+            /backend on fire/,
+          );
+        });
+      }
+    }
+
+    it('catchUpAll keeps draining the healthy topics around an absent one', async () => {
+      const p = await seeded(4);
+      const absent = {
+        fetchRecent: (a: FetchRecentArgs) =>
+          a.topic === 'ops' ? Promise.reject(new NoSuchTopicError('ops')) : p.fetchRecent(a),
+      } as unknown as BackendPlugin;
+      const readState = new ReadStateStore(rsPath());
+      const total = await catchUpAll({
+        plugin: absent,
+        topics: [asTopic('ops'), T, asTopic('ops')],
+        limit: 100,
+        readState,
+        seen: new SeenSet(),
+      });
+      expect(total).toBe(4);
+      expect(readState.get(T)).toBeUndefined();
+    });
+
+  });
+
+  /**
+   * How much a cold start actually drains is a function of BOTH inputs — stored cursor and page
+   * size — and the loop silently reads only the newest window when there is no cursor. Pin the
+   * exact drained count per cell, and the position it started from as the position it ends at,
+   * against the SHARED fake: a bespoke conformant-window plugin here would leave the shared one
+   * free to keep answering a since-less read backwards, which is how this grid came to be the only
+   * place the clause was visible.
+   */
+  describe('drained window depends on stored-cursor × page-size', () => {
+    const WINDOWS = [
+      // stored cursor | total | limit | drained
+      [undefined, 2, 3, 2],
+      [undefined, 3, 3, 3],
+      [undefined, 10, 3, 3], // cold start reads the newest window: 7 rows never paged over
+      [undefined, 1000, 100, 100],
+      ['0', 2, 3, 2],
+      ['0', 3, 3, 3],
+      ['0', 10, 3, 10], // resumed catch-up pages to exhaustion
+      ['5', 10, 3, 5],
+    ] as const;
+
+    it.each(
+      HISTORY_GRAIN_NAMES.flatMap((grain) =>
+        WINDOWS.map(([stored, total, limit, drained]) => [grain, stored, total, limit, drained] as const),
+      ),
+    )(
+      '%s history: stored=%s total=%i limit=%i drains %i and leaves the position at stored',
+      async (grain, stored, total, limit, drained) => {
+        const readState = new ReadStateStore(rsPath());
+        if (stored !== undefined) readState.set(T, asCursor(stored));
+        const seen = new SeenSet();
+        const n = await catchUpTopic({
+          plugin: HISTORY_GRAINS[grain](await seeded(total)),
+          topic: T,
+          limit,
+          readState,
+          seen,
+        });
+        expect(
+          n,
+          'the drain count counted messages on OTHER topics. It is the number this instance ' +
+            'reports as its own progress, and it is what decides whether the boundary page runs — ' +
+            'so foreign traffic in a page makes a boot that drained nothing look busy',
+        ).toBe(drained);
+        expect(readState.get(T)).toBe(stored);
+        expect(
+          seen.has(T, asBackendMsgId(String(total))),
+          "the boot ended with the topic's live-boundary id missing from the dedup set, so the " +
+            'push loop it is about to start will re-emit it',
+        ).toBe(true);
+      },
+    );
+  });
+
+  /**
+   * A page's LENGTH proves nothing: the seam promises only "max messages to return in this page",
+   * and the backends whose ceiling is not negotiable (Discord's 100, Telegram, Matrix `/messages`)
+   * return short pages with more behind them. So the driver's stop rule is an EMPTY page, and every
+   * other adversarial shape must still terminate in a bounded number of calls rather than wedging
+   * startup. Run the whole shape table, not the one shape whose guard this file happens to own.
+   */
+  describe('a non-conformant backend can neither wedge nor short-change catch-up', () => {
+    it.each(NONCONFORMANT_SHAPE_NAMES)('%s', async (name) => {
+      const { serve, drains } = NONCONFORMANT_SHAPES[name]!;
+      const { plugin, calls } = pagingProbe(serve);
+      const drained = await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      expect(calls.length).toBeLessThanOrEqual(MAX_CATCHUP_PAGES);
+      if (drains !== undefined) expect(drained).toBe(drains);
+    });
+
+    it('a topic whose pages never stop arriving stops at the page ceiling', async () => {
+      const { plugin, calls } = pagingProbe(NONCONFORMANT_SHAPES['a cursor that walks backwards, then forwards again']!.serve);
+      await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      expect(calls).toHaveLength(MAX_CATCHUP_PAGES);
+    });
+
+    // The ceiling has to hold with the REAL store, not only the in-memory stand-in above — and the
+    // position a restart resumes from must survive a backend that hands back the same cursor
+    // forever, rather than being moved to a cursor that names no progress.
+    it('a stuck cursor stops in a handful of calls and moves no stored position', async () => {
+      const path = rsPath();
+      const readState = new ReadStateStore(path);
+      readState.set(T, asCursor('start'));
+      const { plugin, calls } = pagingProbe(
+        NONCONFORMANT_SHAPES['a full page whose cursor never advances']!.serve,
+      );
+      await catchUpTopic({ plugin, topic: T, limit: 1_000, readState, seen: new SeenSet() });
+      expect(calls.length).toBeLessThan(5);
+      expect(new ReadStateStore(path).get(T)).toBe('start');
+    });
+
+    /**
+     * What the seam's byte-stability requirement BUYS, graded as the difference between two plugins
+     * standing at the same position. The brake is `nextCursor === since`, so a plugin that re-mints
+     * a semantically identical cursor per call (re-serialised object, re-rendered timestamp) buys
+     * itself the page ceiling instead of one wasted round-trip. A doc that tells a plugin author
+     * core "never compares" a cursor is describing the left-hand column and shipping the right one.
+     */
+    const pagesUntilStop = async (shape: string): Promise<number> => {
+      const { plugin, calls } = pagingProbe(NONCONFORMANT_SHAPES[shape]!.serve);
+      await catchUpTopic({
+        plugin,
+        topic: T,
+        limit: 1_000,
+        readState: memoryReadState() as unknown as ReadStateStore,
+        seen: new SeenSet(),
+      });
+      return calls.length;
+    };
+
+    it('brakes on a no-progress cursor only while the plugin spells it the same way twice', async () => {
+      expect(await pagesUntilStop('a full page whose cursor never advances')).toBeLessThan(5);
+      expect(
+        await pagesUntilStop('a full page whose cursor names one position but is spelled differently each call'),
+      ).toBe(MAX_CATCHUP_PAGES);
+    });
+  });
+
+  /**
+   * The class: a start-up driver whose work is not bounded by what changed since the last start.
+   * Measured before the marker existed: boots 1, 2 and 3 each drained 500 messages in 6
+   * `fetchRecent` calls with the stored position unchanged, because the ONLY thing that made a
+   * catch-up incremental was the agent having advanced its read position through the tool — and the
+   * case above hand-wrote that advancement, so it stayed green through the whole defect.
+   *
+   * Two boots, no hand-advancement, a counter on the PLUGIN so the assertion is round trips rather
+   * than messages. Cross how the instance starts with how deep the backlog is, including one past
+   * the dedup window, where the oldest ids a boot reads are evicted before it finishes reading them.
+   */
+  describe('a second boot costs round trips for what arrived, not for the backlog', () => {
+    const LIMIT = 10;
+    const CELLS = HISTORY_GRAIN_NAMES.flatMap((grain) =>
+      (['cold', 'resumed'] as const).flatMap((start) =>
+        [0, LIMIT - 1, LIMIT, 5 * LIMIT, SEEN_MAX_PER_TOPIC + 1].map(
+          (backlog) => [grain, start, backlog] as const,
+        ),
+      ),
+    );
+
+    /** Counts what reaches the backend, so the bound below is round trips and not page size. */
+    const counting = (inner: BackendPlugin) => {
+      let calls = 0;
+      return {
+        plugin: {
+          fetchRecent: (a: FetchRecentArgs) => {
+            calls += 1;
+            return inner.fetchRecent(a);
+          },
+        } as unknown as BackendPlugin,
+        calls: () => calls,
+        reset: () => {
+          calls = 0;
+        },
+      };
+    };
+
+    /** One process start: the marker comes off disk, the dedup window does not. */
+    const boot = (path: string, plugin: BackendPlugin, seen: SeenSet): Promise<number> =>
+      catchUpAll({ plugin, topics: [T], limit: LIMIT, readState: new ReadStateStore(path), seen });
+
+    it.each(CELLS)('%s history, %s start over a %i message backlog', async (grain, start, backlog) => {
+      const path = rsPath();
+      if (start === 'resumed') new ReadStateStore(path).set(T, asCursor('0'));
+      const counter = counting(HISTORY_GRAINS[grain](await seeded(backlog)));
+
+      await boot(path, counter.plugin, new SeenSet());
+      const first = counter.calls();
+      counter.reset();
+
+      const seen = new SeenSet();
+      await boot(path, counter.plugin, seen);
+
+      expect(
+        counter.calls(),
+        'the second boot re-read a backlog nothing had added to. On matrix/discord/telegram that ' +
+          'is thousands of rate-limited round trips at every session start, and the ceiling is ' +
+          'MAX_CATCHUP_PAGES x catchup.limit messages read and discarded',
+      ).toBeLessThanOrEqual(2);
+
+      if (backlog > 0) {
+        expect(
+          seen.has(T, asBackendMsgId(String(backlog))),
+          'the second boot left the dedup set without the ids at the topic\'s live boundary, so ' +
+            'the push loop it is about to start can re-emit them',
+        ).toBe(true);
+      }
+      // Whatever the driver did, the AGENT is still owed everything it has not been handed.
+      expect(new ReadStateStore(path).get(T)).toBe(start === 'resumed' ? '0' : undefined);
+      // …and the bound above is not vacuous: this backlog really did cost the first boot pages.
+      if (start === 'resumed' && backlog > LIMIT) expect(first).toBeGreaterThan(2);
+    });
   });
 
   it('catchUpAll loops over every configured topic', async () => {
@@ -64,7 +525,7 @@ describe('catch-up driver', () => {
     const readState = new ReadStateStore(rsPath());
     const seen = new SeenSet();
     expect(await catchUpAll({ plugin: p, topics: [A, B], limit: 100, readState, seen })).toBe(3);
-    expect(readState.get(A)).toBe('1');
-    expect(readState.get(B)).toBe('3');
+    expect(readState.get(A)).toBeUndefined();
+    expect(readState.get(B)).toBeUndefined();
   });
 });

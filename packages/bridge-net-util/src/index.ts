@@ -1,17 +1,52 @@
 /**
- * `@sharptrick/parley-net-util` — the one HTTP-with-429-retry skeleton shared by the HTTP chat
- * backends (Zulip, Matrix, Discord, Telegram, Slack). Deliberately NOT part of `bridge-core`:
- * core stays a dependency-free seam so the non-HTTP backends (SQLite/Redis/NATS/Postgres) consume
- * it without pulling any HTTP concerns. Each plugin keeps its own auth-header building, body
- * encoding, and per-API `Retry-After` parser (the wire formats genuinely differ) and delegates
- * only the loop/guard/cap/default/`stopped` semantics here.
+ * `@sharptrick/parley-net-util` — shared network and timing helpers for the backends that wait or
+ * speak HTTP. Deliberately NOT part of `bridge-core`: core stays a dependency-free seam, so the
+ * plugins that need an HTTP retry loop share one here instead. Each plugin keeps its own
+ * auth-header building, body encoding, and per-API `Retry-After` body field, and delegates the
+ * loop and its bounds to this module.
  *
  * Lockstep-published: semantic-release publishes this alongside every other Parley package — never
  * hand-version it.
  */
 
-/** `setTimeout` promise — the one copy that replaces the per-plugin `delay` duplicates. */
-export const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+import { fetchOnce } from './attempt.js';
+import { HttpStatusError, LabelledError } from './errors.js';
+import { errorBody } from './redact.js';
+import { retryAfterFromHeader, usableHint } from './retry-after.js';
+import { sleepUnlessStopped } from './timing.js';
+
+export { HttpStatusError, statusOf } from './errors.js';
+export { describeConfigValue } from './config-value.js';
+export {
+  isBaseUrl,
+  isLoopbackHost,
+  type PlaintextCredentialRisk,
+  plaintextRemoteOrigin,
+} from './plaintext.js';
+export { MAX_ERROR_BODY, sanitizeBody } from './redact.js';
+export { bodyRetryAfter, retryAfterFromHeader } from './retry-after.js';
+export { delay, STOP_POLL_MS } from './timing.js';
+
+/** Wait applied when a 429 carries no usable hint. */
+export const DEFAULT_BACKOFF_MS = 500;
+/**
+ * Ceiling past which a wait read out of a 429's BODY stops being a wait and becomes a unit error.
+ * The body field and its unit are a per-backend GUESS in this repo — four vendors state the same
+ * thing in four field names and two units — so a hint above this is dropped, exactly as an
+ * unparseable body is, rather than adopted. Keep it, so that one server-controlled JSON number
+ * cannot exceed the deadline and REFUSE every call through the shared loop; the RFC-defined
+ * `Retry-After` header is not bounded by it and still governs alone.
+ */
+export const MAX_BODY_WAIT_MS = 3_600_000;
+/** Attempts a single call will make before giving up. */
+export const DEFAULT_MAX_ATTEMPTS = 8;
+/** Wall-clock ceiling on a single call, kept under `catchup.block_max_ms` (DESIGN §11). */
+export const DEFAULT_DEADLINE_MS = 30_000;
+/**
+ * Default ceiling on the bytes a single response may put in memory. The body of a response the
+ * caller never sees is bounded far tighter than this — see {@link fetchWithRetry}.
+ */
+export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface FetchWithRetryOptions {
   /** Error-message prefix, e.g. `Slack chat.postMessage` or `Matrix GET /sync`. */
@@ -19,35 +54,168 @@ export interface FetchWithRetryOptions {
   /** True once the plugin has disconnected — stop retrying, throw instead of looping. */
   isStopped: () => boolean;
   /**
-   * Per-backend Retry-After parser → milliseconds to wait. MUST enforce the unified contract:
-   * prefer a `> 0`-guarded value (header and/or body), cap at 5000, default 500. Receives the
-   * 429 `Response` (clone it before reading the body).
+   * Per-backend `Retry-After` extraction → milliseconds, or undefined when the response carries no
+   * usable hint. Only the body field differs between APIs; the header and the default are handled
+   * here. Receives the 429 `Response` (clone it before reading the body) — a body the caller never
+   * sees, so it is bounded to a few KB rather than to `maxBodyBytes`.
+   *
+   * A source of an ADDITIONAL hint, never a ceiling: the standard `Retry-After` header is a FLOOR
+   * this cannot lower. Do not clamp what you return here, so that a parser bug cannot retry sooner
+   * than the vendor asked — that is what escalates a rate limit into a ban. A figure past
+   * {@link MAX_BODY_WAIT_MS} is dropped by the loop rather than honoured.
    */
-  retryAfterOf: (res: Response) => Promise<number> | number;
+  retryAfterOf?: (res: Response) => Promise<number | undefined> | number | undefined;
   /** Non-2xx statuses the caller treats as expected (returned, not thrown). Default: none. */
   allowStatuses?: number[];
+  /**
+   * Attempts before giving up. Default {@link DEFAULT_MAX_ATTEMPTS}. A non-finite figure is refused
+   * rather than read as "unlimited": `NaN` and `Infinity` both turn the attempt bound off entirely.
+   */
+  maxAttempts?: number;
+  /**
+   * Wall-clock budget for the whole call, INCLUDING the time a single request spends in flight.
+   * A caller whose request legitimately blocks longer than {@link DEFAULT_DEADLINE_MS} (a
+   * long-poll) must raise this, so that its own request is not aborted at the default.
+   */
+  deadlineMs?: number;
+  /**
+   * Ceiling on the bytes ONE response the caller will read may put in memory. Default
+   * {@link MAX_RESPONSE_BYTES}; past it the call fails with `<label> → body: …` rather than handing
+   * back a truncated body a `res.json()` would misparse. A response that can only become an error
+   * message is bounded far tighter and never fails on size. A non-finite figure is refused rather
+   * than read as "no cap".
+   */
+  maxBodyBytes?: number;
+  /** Injectable clock, for tests. */
+  now?: () => number;
 }
 
 /**
- * Shared HTTP-with-429-retry loop. Builds nothing itself — the caller passes a fully-formed
- * `init` (auth headers + encoded body + optional `signal`). Retries 429 honoring the caller's
- * `retryAfterOf`, stops the moment `isStopped()` is true, returns the `Response` on ok /
- * allowStatuses, else throws `<label> → <status>: <text>`. Backend response *shapes* (Slack's
- * `ok:false`, XMPP IQ) are NOT unified here — interpret those in the caller.
+ * The caller's own `Retry-After` parser, whose failure is not this call's failure. A hook that reads
+ * the body — `res.clone().json()` against an HTML 429 page from a CDN — throws, and an unguarded
+ * hook throws THAT out of the loop: unlabeled, unredacted, and carrying no status for a caller to
+ * branch on. Keep the catch, so that a parser which cannot read the body means "no usable hint"
+ * rather than an error outside the envelope; the header floor is computed independently of it.
+ */
+async function callerHint(
+  parse: FetchWithRetryOptions['retryAfterOf'],
+  res: Response,
+): Promise<number | undefined> {
+  try {
+    return await parse?.(res);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A wait the caller's parser read out of a body, or undefined when it is too long to be one. See
+ * {@link MAX_BODY_WAIT_MS}.
+ */
+const credibleBodyHint = (ms: number | undefined): number | undefined =>
+  ms !== undefined && ms <= MAX_BODY_WAIT_MS ? ms : undefined;
+
+/**
+ * Shared HTTP-with-429-retry loop. Builds nothing itself — the caller passes a fully-formed `init`
+ * (auth headers + encoded body + optional `signal`). Retries 429 within a bounded attempt and
+ * wall-clock budget, abandons a backoff within {@link STOP_POLL_MS} of `isStopped()` turning true,
+ * returns the `Response` on ok / allowStatuses, else throws `<label> → <status>: <body>`. A server
+ * asking for a longer wait than this call's deadline IN THE HEADER ends the call rather than being
+ * retried sooner than it asked; a body hint past {@link MAX_BODY_WAIT_MS} is dropped instead, so
+ * that the call's fate rests on the RFC-defined field and not on one vendor-specific JSON number.
+ * The returned `Response` is already buffered — bounded by `maxBodyBytes` — so reading it cannot
+ * fail on the deadline. Backend response *shapes* (Slack's `ok:false`, XMPP IQ) are NOT unified
+ * here — interpret those in the caller.
  */
 export async function fetchWithRetry(
   url: string,
   init: RequestInit,
   opts: FetchWithRetryOptions,
 ): Promise<Response> {
-  for (;;) {
-    const res = await fetch(url, init);
-    if (res.status === 429) {
-      if (opts.isStopped()) throw new Error(`${opts.label} → 429 (disconnected)`);
-      await delay(await opts.retryAfterOf(res));
-      continue;
+  const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const maxBytes = opts.maxBodyBytes ?? MAX_RESPONSE_BYTES;
+  const now = opts.now ?? Date.now;
+  // Every bound below is a comparison against a caller's figure, and `NaN` loses every comparison
+  // it takes part in while `Infinity` wins them all — so an unusable reading does not fail, it
+  // silently REMOVES the bound it was supposed to state. `Number(cfg.whatever)` on an absent key is
+  // NaN, so that reading arrives by accident. Refuse both here, so that a knob nobody can honour
+  // ends the call under this module's label instead of turning its bound off.
+  if (!Number.isFinite(maxBytes)) {
+    throw new LabelledError(
+      `${opts.label} → body: maxBodyBytes ${maxBytes} is not a finite number of bytes`,
+      undefined,
+    );
+  }
+  if (!Number.isFinite(maxAttempts)) {
+    throw new LabelledError(
+      `${opts.label} → attempts: maxAttempts ${maxAttempts} is not a finite count of attempts`,
+      undefined,
+    );
+  }
+  const started = now();
+  const attemptOpts = {
+    label: opts.label,
+    maxBytes,
+    keeps: (res: Response): boolean =>
+      res.ok || (opts.allowStatuses?.includes(res.status) ?? false),
+  };
+
+  let received: number | undefined;
+  for (let attempt = 1; ; attempt++) {
+    const budget = deadlineMs - (now() - started);
+    // `deadlineMs` and `now` are both caller knobs, and the budget they assemble is what arms this
+    // call's abort signal. Refuse a non-finite one HERE, so that `Infinity`/`NaN` — the two figures
+    // a caller most plausibly writes to mean "no deadline" — leave through the label rather than as
+    // the raw `RangeError` the timer would throw from outside this envelope.
+    if (!Number.isFinite(budget)) {
+      throw new LabelledError(
+        `${opts.label} → deadline: deadlineMs ${deadlineMs} against this clock is not a finite ` +
+          `budget of milliseconds`,
+        received,
+      );
     }
-    if (res.ok || (opts.allowStatuses?.includes(res.status) ?? false)) return res;
-    throw new Error(`${opts.label} → ${res.status}: ${await res.text()}`);
+    if (budget <= 0) {
+      throw new LabelledError(
+        `${opts.label} → deadline: exceeded ${deadlineMs}ms before attempt ${attempt}`,
+        received,
+      );
+    }
+
+    const res = await fetchOnce(url, init, budget, attemptOpts);
+    received = res.status;
+    if (opts.allowStatuses?.includes(res.status) ?? false) return res;
+    if (res.status !== 429) {
+      if (res.ok) return res;
+      throw new HttpStatusError(opts.label, res.status, await errorBody(res, url));
+    }
+
+    if (opts.isStopped()) throw new LabelledError(`${opts.label} → 429 (disconnected)`, 429);
+
+    // Honour a server-stated wait IN FULL, so that we never retry sooner than the vendor asked —
+    // that is what escalates a rate limit into a ban. The header is a FLOOR the caller's parser
+    // cannot lower, and a header past this call's deadline is refused below, not shortened.
+    const header = usableHint(retryAfterFromHeader(res));
+    const parsed = credibleBodyHint(usableHint(await callerHint(opts.retryAfterOf, res)));
+    const hinted = header === undefined ? parsed : Math.max(header, parsed ?? 0);
+    const stated = hinted !== undefined;
+    const wait = hinted ?? DEFAULT_BACKOFF_MS;
+    const elapsed = now() - started;
+    const overDeadline = elapsed + wait >= deadlineMs;
+    if (attempt >= maxAttempts || overDeadline) {
+      throw new HttpStatusError(
+        opts.label,
+        429,
+        stated && overDeadline
+          ? `upstream asked for ${Math.round(wait)}ms, past this call's ${deadlineMs}ms deadline ` +
+            `(${elapsed}ms elapsed). Raise deadlineMs to wait it out.`
+          : `still rate limited after ${attempt} attempts (${elapsed}ms)`,
+      );
+    }
+
+    const waitedItOut = await sleepUnlessStopped(wait, opts.isStopped);
+    if (!waitedItOut || opts.isStopped()) {
+      throw new LabelledError(`${opts.label} → 429 (disconnected)`, 429);
+    }
   }
 }

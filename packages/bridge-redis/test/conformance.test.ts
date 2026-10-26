@@ -1,45 +1,21 @@
 import { runConformanceSuite } from '@sharptrick/parley-conformance';
-import { asHandle, asTopic, type Topic } from '@sharptrick/parley-core';
-import { createClient } from 'redis';
+import { asHandle, type Topic } from '@sharptrick/parley-core';
 import { describe, it } from 'vitest';
 import { RedisPlugin } from '../src/index.js';
-
-const REDIS_URL = process.env.PARLEY_REDIS_URL ?? 'redis://127.0.0.1:6379';
-
-async function isRedisUp(url: string): Promise<boolean> {
-  const c = createClient({ url, socket: { connectTimeout: 800, reconnectStrategy: false } });
-  c.on('error', () => undefined);
-  try {
-    await c.connect();
-    await c.ping();
-    await c.disconnect();
-    return true;
-  } catch {
-    await c.disconnect().catch(() => undefined);
-    return false;
-  }
-}
-
-let seq = 0;
-const rand = () => Math.random().toString(36).slice(2, 8);
+import { freshPrefix, freshTopic, isRedisUp, REDIS_URL, wipe } from './support.js';
 
 async function makeContext() {
-  const prefix = `parleytest:${rand()}:`;
+  const prefix = freshPrefix();
   const plugin = new RedisPlugin();
   await plugin.connect({ url: REDIS_URL, key_prefix: prefix, block_ms: 500 });
   return {
     plugin,
-    supportsBlockingFetch: true, // Redis honors blockMs natively via XREAD BLOCK (issue #20)
-    freshTopic: (): Topic => asTopic(`t-${++seq}-${rand()}`),
+    freshTopic: (): Topic => freshTopic('t'),
+    carriesSenderIdentity: true,
+    refusesContentShapes: [],
     cleanup: async () => {
       await plugin.disconnect();
-      // wipe this context's streams
-      const admin = createClient({ url: REDIS_URL });
-      admin.on('error', () => undefined);
-      await admin.connect();
-      const keys = await admin.keys(`${prefix}*`);
-      if (keys.length > 0) await admin.del(keys);
-      await admin.disconnect();
+      await wipe(prefix);
     },
     concurrentPost: async (topic: Topic, writers: number, perWriter: number) => {
       const plugins = await Promise.all(
