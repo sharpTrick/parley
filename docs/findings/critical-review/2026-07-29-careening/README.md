@@ -1,8 +1,9 @@
 # Careening — adversarial review partitioned by package
 
-**Status: pre-registered, run in progress.** Everything below the line was written *before* round 1
-and will be reported as stated regardless of how it comes out. Results will be appended, not
-substituted.
+**Status: complete.** The pre-registered budget closed at round 20; round 21 ran as the pre-PR
+review, and the series merged to `main` as sharpTrick/parley#22 on 2026-10-25. Everything below the
+line was written *before* round 1 and is reported as stated. Results were appended, not substituted.
+The strengths-and-weaknesses synthesis is [`ASSESSMENT.md`](./ASSESSMENT.md).
 
 **Why "Careening."** Careening is beaching a ship and heeling it over to expose the hull below the
 waterline — the only way to see the rot, and impossible to do underway. You stop sailing in order to
@@ -147,6 +148,7 @@ Appended as rounds complete. Raw per-round data is in `data/`.
 | 18 | 15 / 15 | 103 | 102 | 31 | 1 | 0 | no |
 | 19 | 15 / 15 | 89 | 88 | 32 | 1 | 0 | no |
 | 20 | 15 / 15 | 101 | 99 | 26 | 2 | 0 | no |
+| 21 | 15 / 15 | 188 | 180 | 28 | 8 | 0 | no |
 
 Three rounds ran no critics. Rounds 11, 12 and 14 are **decomposition rounds** — the simplify-first
 rule described in `docs/REVIEW_PROTOCOL.md`, splitting single-file packages after `bridge-sqlite`
@@ -363,6 +365,7 @@ same agent that wrote the fixes being judged.
 | 18 | 103 | 86 | 11 | **89%** |
 | 19 | 89 | 75 | 14 | **84%** |
 | 20 | 101 | 79 | 16 | **83%** |
+| 21 | 188 | 155 | 16 | **91%** |
 
 Round 1 is not gradeable — there was no prior experiment commit for a line to be attributed to.
 
@@ -378,9 +381,9 @@ Total iatrogenesis mixes suggestions with the findings that gate the stop rule. 
 oracle to CONFIRMED-and-blocking asks the sharper question — *is the loop still finding things that
 matter in the original codebase, or only in its own output?*
 
-| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | 4 | 1 | 8 | **6** |
+| round | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 13 | 15 | 16 | 17 | 18 | 19 | 20 | 21 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pre-existing blocking | 36 | 25 | 20 | 11 | 5 | 10 | 9 | 11 | 8 | 6 | 6 | 10 | 4 | 1 | 8 | 6 | **2** |
 
 Round 6's fall to 5 looked like the knee ouroboros reported. It was not: rounds 7–10 recovered to a
 stable 8–11 band, which is what the halfway reading recorded as *"no knee at the run level."*
@@ -488,6 +491,26 @@ than dropped.
 One condition changed between rounds 19 and 20 and any cross-round claim about matrix has to say so:
 round 20 reviewed against a Synapse reset immediately beforehand, after the round-19 gate
 investigation found one room holding 84% of the server's events.
+
+### Round 21: the pre-PR round, its remediation, and first contact with CI
+
+Round 21 ran past the budget as the pre-PR review of `claude/simplify-parley` at `88f0daf`. It was
+wake-all, with all 15 critics run and none errored: **188 findings, 180 confirmed, 28 blocking, 8
+PLAUSIBLE**, for 3.05M tokens over 2h24m. The oracle graded 155 of 171 resolvable findings, and 21 of
+23 graded blocking ones, as self-induced. That is **91%**, a ceiling, because the September
+simplification moved a great deal of code, and 17 anchors were unresolvable.
+
+Its 29 blocking findings (28 confirmed, 1 PLAUSIBLE) were remediated under the same contract as
+before. 28 were fixed. One (r21-183) was confirmed from Zulip's server source and documented rather
+than fixed: ids commit out of order, and no plugin-side change can close that. Then a single
+regression pass by fresh reviewers over the remediation diff found **7 defects in 5 of the 28
+fixes**. Every one had passed its package suite, a mutation proof, the diff guard and the full
+suite. Five were fixed and two documented.
+
+The branch had not been through CI since July. The PR's first CI run failed on a host-dependent
+guard. The second failed on a NATS liveness defect whose false premise had been written in round 1
+and survived 17 further scored rounds. The third passed. Both defects, and what they say about the
+process, are worked through in [`ASSESSMENT.md`](./ASSESSMENT.md) (W3, W4).
 
 ### What remediation measures that review does not
 

@@ -26,7 +26,8 @@ until reviews come back clean — and then ask whether the effort went where the
 
 - **[`2026-07-29-careening/`](./2026-07-29-careening/)** — full-surface adversarial review of the
   Parley monorepo, partitioned **by package** (one all-lens critic each) rather than by lens, on a
-  deliberately deeper surface than the prior run. Pre-registered; in progress.
+  deliberately deeper surface than the prior run. Pre-registered; 21 rounds, merged as
+  sharpTrick/parley#22. Strengths and weaknesses: [`ASSESSMENT.md`](./2026-07-29-careening/ASSESSMENT.md).
 
 ## Companion documents
 
