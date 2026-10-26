@@ -11,9 +11,9 @@ export abstract class NatsLive extends NatsReads {
    * Live path = an ephemeral `consume()` consumer resuming at the last delivered sequence + 1
    * (DESIGN §9 — genuine events; history is owned by catch-up). `lastSeq` is seeded from the stream
    * tail at subscribe time so the FIRST consumer, like every rebuilt one, backfills whatever landed
-   * while it was absent. ANY iterator exit rebuilds — a connection drop ends `consume()` with no
-   * status event at all — and so does a break in the consumer's delivery sequence, which is the only
-   * evidence left of an `AckPolicy.None` message the server sent into a link that was already gone.
+   * while it was absent. ANY iterator exit rebuilds, and so does a reconnect and a break in the
+   * consumer's delivery sequence: both are evidence of an `AckPolicy.None` message the server may
+   * have sent into a link that was already gone.
    * The outer loop honors `disconnect()`: the registered closer plus the epoch it captured stop it
    * without a rebuild, as does a permanently closed connection. The epoch is what makes teardown
    * final — `disconnect()` retires every loop, so one still parked in its backoff cannot wake into a
@@ -72,6 +72,11 @@ export abstract class NatsLive extends NatsReads {
         }
 
         const statusTask = closeOnConsumerLoss(iter);
+        // Keep the rebuild on reconnect, so that a message the server wrote into the dead link is
+        // recovered even when no later delivery arrives to expose the gap: nats.js re-pulls on the
+        // SAME consumer after a reconnect, and the server never resends what it counted delivered.
+        const closeOnReconnect = (): void => void iter.close().catch(() => undefined);
+        this.onReconnect.add(closeOnReconnect);
 
         try {
           let nextDelivery = 1;
@@ -96,7 +101,9 @@ export abstract class NatsLive extends NatsReads {
             safeDeliver(handler, () => this.rowToMessage(topic, m.seq, m.data));
           }
         } catch {
-          /* iterator closed on disconnect or consumer loss */
+          /* iterator closed on disconnect, consumer loss or reconnect */
+        } finally {
+          this.onReconnect.delete(closeOnReconnect);
         }
         await statusTask;
         await ephemeral.reap();

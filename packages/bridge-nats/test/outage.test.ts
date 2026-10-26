@@ -110,40 +110,46 @@ suite('nats network faults', () => {
     }
   }
 
-  // The shape no reconnect can repair by itself: the link stalls, the server writes the message
-  // into it and — `AckPolicy.None` — counts it delivered, then the socket dies. The consumer
-  // resumes PAST that message, so only noticing the hole in the delivery sequence recovers it.
-  it('delivers a message the server pushed into a link that was already gone', async () => {
-    const proxy: TcpProxy = await startTcpProxy(serverTarget().host, serverTarget().port);
-    const sub = new NatsPlugin();
-    const pub = new NatsPlugin();
-    await sub.connect({ ...base, servers: proxy.address });
-    await pub.connect({ ...base, servers: SERVERS });
-    try {
-      const topic = asTopic(`pushed-${rand()}`);
-      const got: string[] = [];
-      await sub.subscribe(topic, (m) => {
-        got.push(m.content);
-      });
-      await pub.post(topic, asHandle('sys'), 'before');
-      await waitFor(() => got.includes('before'), 20000);
+  const followers = [
+    { name: 'a later message follows it', after: 'after' as string | undefined },
+    { name: 'nothing follows it', after: undefined },
+  ];
 
-      proxy.cut('stall');
-      await pub.post(topic, asHandle('sys'), 'swallowed');
-      await new Promise((r) => setTimeout(r, 2000));
-      proxy.cut('reset');
-      await new Promise((r) => setTimeout(r, 500));
-      proxy.heal();
+  for (const follower of followers) {
+    it(`delivers a message the server pushed into a link that was already gone when ${follower.name}`, async () => {
+      const proxy: TcpProxy = await startTcpProxy(serverTarget().host, serverTarget().port);
+      const sub = new NatsPlugin();
+      const pub = new NatsPlugin();
+      await sub.connect({ ...base, servers: proxy.address });
+      await pub.connect({ ...base, servers: SERVERS });
+      try {
+        const topic = asTopic(`pushed-${rand()}`);
+        const got: string[] = [];
+        await sub.subscribe(topic, (m) => {
+          got.push(m.content);
+        });
+        await pub.post(topic, asHandle('sys'), 'before');
+        await waitFor(() => got.includes('before'), 20000);
 
-      await pub.post(topic, asHandle('sys'), 'after');
-      await waitFor(() => got.includes('after'), 40000);
-      expect([...new Set(got)]).toEqual(['before', 'swallowed', 'after']);
-    } finally {
-      await sub.disconnect();
-      await pub.disconnect();
-      await proxy.close();
-    }
-  }, 90_000);
+        proxy.cut('stall');
+        await pub.post(topic, asHandle('sys'), 'swallowed');
+        await new Promise((r) => setTimeout(r, 2000));
+        proxy.cut('reset');
+        await new Promise((r) => setTimeout(r, 500));
+        proxy.heal();
+
+        const after = follower.after;
+        if (after !== undefined) await pub.post(topic, asHandle('sys'), after);
+        await waitFor(() => got.includes(after ?? 'swallowed'), 40000);
+        const expected = after === undefined ? ['before', 'swallowed'] : ['before', 'swallowed', after];
+        expect([...new Set(got)]).toEqual(expected);
+      } finally {
+        await sub.disconnect();
+        await pub.disconnect();
+        await proxy.close();
+      }
+    }, 90_000);
+  }
 
   const teardowns: { name: string; run: (p: NatsPlugin, t: Topic) => Promise<unknown> }[] = [
     { name: 'a subscriber', run: (p, t) => p.subscribe(t, () => undefined) },

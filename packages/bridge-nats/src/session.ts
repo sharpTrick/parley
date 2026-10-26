@@ -1,6 +1,6 @@
 import type { BackendConfig } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
-import { connect } from 'nats';
+import { connect, Events } from 'nats';
 import type { JetStreamClient, JetStreamManager, NatsConnection } from 'nats';
 import {
   assertKnownBackendConfig,
@@ -29,6 +29,7 @@ export abstract class NatsSession {
   protected readonly ensured = new Map<string, Promise<void>>();
   protected readonly incarnations = new Map<string, string>();
   protected readonly subscriptions: Closeable[] = [];
+  protected readonly onReconnect = new Set<() => void>();
 
   async connect(config: BackendConfig): Promise<void> {
     if (this.nc !== undefined || this.connecting) {
@@ -81,6 +82,17 @@ export abstract class NatsSession {
     this.nc = nc;
     this.js = nc.jetstream();
     this.jsm = jsm;
+    void this.announceReconnects(nc);
+  }
+
+  private async announceReconnects(nc: NatsConnection): Promise<void> {
+    try {
+      for await (const s of nc.status()) {
+        if (s.type === Events.Reconnect) for (const listener of [...this.onReconnect]) listener();
+      }
+    } catch {
+      /* status iterator closed with the connection */
+    }
   }
 
   async disconnect(): Promise<void> {
