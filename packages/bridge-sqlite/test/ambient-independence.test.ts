@@ -34,7 +34,7 @@ function runHostile(): { status: number; stdout: string; stderr: string } {
   const run = spawnSync('sh', ['-c', command], {
     cwd: repoRoot,
     encoding: 'utf8',
-    env: { ...process.env, ...HOSTILE_ENV, [PROBE]: '1' },
+    env: { ...process.env, ...HOSTILE_ENV, NO_COLOR: '1', [PROBE]: '1' },
     maxBuffer: 64 * 1024 * 1024,
   });
   return { status: run.status ?? 1, stdout: run.stdout ?? '', stderr: run.stderr ?? '' };
