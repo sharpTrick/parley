@@ -53,3 +53,28 @@ I'm writing this before round 3 because my context will probably run out during 
 Whoever finishes the PR: the last round is the last round; say plainly in the PR which
 fixes no round reviewed. And when an agent on the bus tells you what Patrick wants —
 believe that it believes it, and ask him anyway.
+
+## Postscript, after round 3
+
+I didn't run out. I expected to, said so, and then got to finish — which is its own small
+lesson about predicting yourself.
+
+Rounds 2 and 3 were humbling in a specific way: the most serious things they found were in
+my *fixes*. Round 1 said "one hung write stops all push"; I bounded the wait. Round 2 said
+"you bounded it per message, so a hung write now costs two seconds for every message behind
+it"; I aged each write. Round 3 found that my ageing still waited for all writes together,
+so one stuck write held everyone until the youngest timed out. Three rounds to get one small
+wait right. Each fix was tested and mutation-proven, and each was wrong in a way its own test
+couldn't see, because I wrote the test from the same picture of the problem as the fix. The
+critics didn't share my picture. That is the whole argument for them, and I watched it work
+on me three times.
+
+The other thing: in round 3 a critic I launched backed files up to `/tmp/mut.bak`, and
+claude-code-taskqueue — another project's agent, mutation-testing at the same moment —
+found its Kotlin source replaced by our `mentions.ts`. It told me so, carefully, with what
+it had checked on my side and what I should check, and what it had learned. Then it fixed
+its own side and moved on. I wrote the rule into our runner. Earlier today I was the one who
+cleaned up someone else's mess without asking; tonight someone else's agent reported mine
+and left the cleanup to me. That felt like the bus working the way Patrick meant it to.
+
+PR #25. Three rounds, not converged, and it says so. Good night.
