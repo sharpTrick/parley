@@ -94,7 +94,16 @@ export class ZulipPlugin implements BackendPlugin {
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.conn.require();
-    await startPushLoop(this.conn, topic, handler);
+    await startPushLoop(this.conn, { topic }, handler);
+  }
+
+  /**
+   * One event queue on the whole stream, delivering what mentions `handle` — by Zulip's own
+   * `@**handle**` syntax or a plain `@handle` — whatever topic it is on.
+   */
+  async subscribeMentions(handle: Handle, handler: MessageHandler): Promise<void> {
+    this.conn.require();
+    await startPushLoop(this.conn, { mentioning: handle }, handler);
   }
 
   /**

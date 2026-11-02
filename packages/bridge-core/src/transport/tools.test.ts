@@ -47,6 +47,7 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
       'parley_live_status',
       'parley_post',
       'parley_reply',
+      'parley_whoami',
     ]);
   });
 
@@ -73,15 +74,15 @@ describe('reactive MCP tools (real Server↔Client path)', () => {
   });
 
   it('parley_fetch_recent returns messages + nextCursor and honors since', async () => {
-    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'a' } });
-    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'b' } });
+    await plugin.post('ctx' as never, 'bob' as never, 'a');
+    await plugin.post('ctx' as never, 'bob' as never, 'b');
     const first = parse(
       await client.callTool({ name: 'parley_fetch_recent', arguments: { topic: 'ctx' } }),
     ) as { messages: unknown[]; nextCursor: string };
     expect(first.messages).toHaveLength(2);
     expect(first.nextCursor).toBe('2');
 
-    await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'c' } });
+    await plugin.post('ctx' as never, 'bob' as never, 'c');
     const since = parse(
       await client.callTool({
         name: 'parley_fetch_recent',
@@ -960,6 +961,7 @@ describe('every registered tool refuses an argument it did not advertise', () =>
     parley_live_status: {},
     parley_post: { topic: 'ctx', content: 'body' },
     parley_reply: { topic: 'ctx', content: 'body' },
+    parley_whoami: {},
   };
 
   const registered = async (): Promise<Tool[]> => {

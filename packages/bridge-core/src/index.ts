@@ -63,6 +63,8 @@ export { MAX_MATCH_INPUT } from './regex-safety.js';
 
 // Engine: dedup / ordering / catch-up / read-state (DESIGN §6/§7).
 export { SeenSet } from './engine/seen-set.js';
+// What a bridge wrote, so its echo is never pushed back: `PushLoopOptions` and `ToolDeps` carry it.
+export { OwnPosts } from './engine/own-posts.js';
 export { ReadStateStore, defaultReadStatePath } from './engine/read-state.js';
 export { catchUpTopic, catchUpAll, type CatchUpArgs } from './engine/catchup.js';
 // The run-time half of the seam's live-delivery clause: a push path that delivers NOTHING is

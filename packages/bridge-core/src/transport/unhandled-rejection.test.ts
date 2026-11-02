@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
 import { LiveDeliveryLedger } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import {
@@ -50,6 +51,7 @@ describe('no fire-and-forget seam call escapes as an unhandled rejection', () =>
           mentionFilter: false,
           live: new LiveDeliveryLedger([]),
           identity: asHandle('agent'),
+          own: new OwnPosts(),
         });
         await plugin.post(asTopic('ctx'), asHandle('bob'), 'hi');
         await vi.waitFor(() => expect(notifications).toBeGreaterThan(0));
@@ -242,8 +244,6 @@ describe('every discarded promise in src/ is a known one', () => {
       'closeQuietly absorbs every shape, graded by the per-request table above',
     "transport/http.ts: void closeQuietly('reactive server', server);":
       'closeQuietly absorbs every shape, graded by the per-request table above',
-    'transport/push-loop.ts: void emitChannel(server, m).catch(() => {':
-      'the catch absorbs every shape, graded by the push-emit table above',
     'safe-deliver.ts: void Promise.resolve(handler(message())).catch(() => undefined);':
       'safeDeliver absorbs every shape in FAILURE_SHAPES, which both safe-deliver.test.ts and the ' +
       'conformance handler-fault clause are driven from — so this row cannot outlive the table',

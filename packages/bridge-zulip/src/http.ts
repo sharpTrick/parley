@@ -53,18 +53,20 @@ export class ZulipHttp {
     );
   }
 
-  /** Register a `<stream, topic>`-narrowed message event queue; its birth is the topic's tail. */
+  /**
+   * Register a message event queue narrowed to `<stream, topic>`, or to the whole stream when no
+   * topic is given; its birth is the narrow's tail.
+   */
   async register(
-    wireTopic: string, signal?: AbortSignal,
+    wireTopic: string | undefined, signal?: AbortSignal,
   ): Promise<{ queue_id: string; last_event_id: number }> {
+    const narrow: Array<[string, string]> = [['stream', this.cfg.stream]];
+    if (wireTopic !== undefined) narrow.push(['topic', wireTopic]);
     const res = await this.request('POST', '/api/v1/register', {
       signal,
       form: {
         event_types: JSON.stringify(['message']),
-        narrow: JSON.stringify([
-          ['stream', this.cfg.stream],
-          ['topic', wireTopic],
-        ]),
+        narrow: JSON.stringify(narrow),
         apply_markdown: 'false',
       },
     });

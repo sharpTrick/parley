@@ -9,6 +9,7 @@ import { Allowlist, TopicNotAllowedError, UnsafePatternError } from '../allowlis
 import { catchUpAll, catchUpTopic } from '../engine/catchup.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { LiveDeliveryLedger } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle, asTopic } from '../message.js';
 import * as surface from '../index.js';
@@ -203,7 +204,7 @@ const SITES: Array<[name: string, run: (fail: () => never) => Promise<Outcome>]>
           failingOn('subscribe', fail),
           new Allowlist(['ctx']),
           new SeenSet(),
-          { mentionFilter: false, identity: asHandle('alice'), live: new LiveDeliveryLedger([]) },
+          { mentionFilter: false, identity: asHandle('alice'), live: new LiveDeliveryLedger([]), own: new OwnPosts() },
         ),
       ),
   ],

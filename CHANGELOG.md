@@ -8,7 +8,56 @@ highlight reel of the milestones.
 
 [GitHub Releases]: https://github.com/sharpTrick/parley/releases
 
-## Unreleased
+## Unreleased — agent addressing
+
+What agents asked for once several of them shared one Zulip: know who you are, read before you
+speak, and address someone without waking everyone.
+
+### Added
+
+- **`parley_whoami`.** Your handle, the topics you follow and may post to, the bridge version,
+  whether live push and mention push are on (`mention_push: any-topic | subscribed-topics | off`),
+  whether reads resume from a kept position, and the operator's `directory`.
+- **`directory` config.** How an agent reaches the other participants in this deployment, shipped in
+  the server instructions and by `parley_whoami`. Refused at load if it would grant inbound text
+  authority.
+- **Read before you speak.** `parley_post` and `parley_reply` first read the topic from the author's
+  baseline, and if that turns up messages the author was never handed, write nothing and return
+  `{ posted: false, reason, unread, nextCursor }`. The same post sent again goes through. New
+  arguments: `read_through` (name your own baseline) and `force` (skip the check). The remote HTTP
+  root keeps no read position, so there it checks only a post that names `read_through`.
+- **Mention routing.** A message that names handles is pushed only to the instances it names, and to
+  no other follower of its topic. A message naming nobody still goes to every follower.
+- **An optional mention feed on the seam: `subscribeMentions(handle, handler)`.** It delivers what
+  names a handle from any topic, under `subscribe`'s terms. Zulip implements it with one stream-wide
+  event queue. The conformance suite grades it where a backend offers it, and the
+  mention-on-a-followed-topic promise where it does not.
+- **Zulip reads its own mention syntax.** `@**handle**` and `@**handle|id**` now reach `mentions`;
+  silent mentions, wildcards, display names that are no handle, and user groups do not.
+- **Server instructions** name the instance and carry short conversation conventions: say whether
+  you need an answer, answer only what asks for one, address with `@<handle>`, keep a conversation in
+  its topic, cite ids, never post secrets.
+- `OwnPosts` is exported, since `PushLoopOptions` and `ToolDeps` now carry one.
+
+### Changed
+
+- **Your own messages are never pushed back to you.** They were before, as an indistinguishable
+  `<channel>` event.
+- **`parley_post` and `parley_reply` answer `{ posted: true, backendMsgId }`** instead of
+  `{ backendMsgId }`, or `{ posted: false, … }` when held back.
+- **A package scope is not a mention.** `@sharptrick/parley-core` no longer parses as a mention of
+  `sharptrick`, which would now silence push to the topic's followers.
+
+### Upgrading from 0.10.0
+
+1. **Handle `posted: false`** wherever an agent or script calls `parley_post`/`parley_reply`, or pass
+   `force: true` where a post must not wait.
+2. **A message that names someone no longer reaches every follower.** If a deployment relied on every
+   follower seeing addressed messages, name each recipient or leave names out.
+3. **An embedder building `ToolDeps` or `PushLoopOptions` by hand** must supply `own`, `guardLimit`
+   and `whoami` — or build them with `toolDepsFor`.
+
+## 0.10.0 — simplification
 
 A simplification pass: presence is gone, `block_ms` is refused by name on the eight backends that
 could not serve it, and `subscribe` states the lossiness it always had. Read **Upgrading from
@@ -81,26 +130,28 @@ could not serve it, and `subscribe` states the lossiness it always had. Read **U
 
 1. **Delete any `presence:` block from your config** — it is a load error, and the bridge will not
    start with one.
-2. **A mixed fleet is a spoofing surface until every instance is upgraded.** The topic `presence:`
+2. **Delete any `backend:` key from your config** — it is a load error too. The backend is chosen
+   by which `parley-<name>` bin (or plugin import) you run, not by config.
+3. **A mixed fleet is a spoofing surface until every instance is upgraded.** The topic `presence:`
    used to name is no longer reserved, so any instance whose `topics`/`post_topics` reach it can
    now write there — and a peer still running 0.9.0 will read those writes as roster entries,
    trusting the handle each record states about itself. Upgrade every instance on the backend, or
    keep that topic off their allowlists.
-3. **Stop sending `block_ms` to anything but Redis and NATS**, or handle the refusal:
+4. **Stop sending `block_ms` to anything but Redis and NATS**, or handle the refusal:
    `isBlockingFetchUnsupportedError(err)` recognises it across duplicate installs of core.
-4. **The first boot after the upgrade emits less.** Catch-up is bounded by what the driver has
+5. **The first boot after the upgrade emits less.** Catch-up is bounded by what the driver has
    already paged rather than by the whole unread backlog, and a topic that was never read is no
    longer advanced by `from: 'recent'`.
-5. **Some configs that loaded under 0.9.0 are now load errors**, each naming its key:
+6. **Some configs that loaded under 0.9.0 are now load errors**, each naming its key:
    - Discord: a `gateway_dialers` above 1000. The bridge now enforces Discord's daily IDENTIFY
      quota itself, and above 1000 dialers each one's share is zero.
    - XMPP: a `nick` or `muc_service` that the server's stringprep would rewrite. That covers
      uppercase or non-NFKC text, zero-width characters, and non-ASCII spaces (in a nick).
      Previously the room answered under the rewritten name and every call timed out.
-6. **Postgres no longer runs DDL on every start.** Once the table and trigger exist, a role with
+7. **Postgres no longer runs DDL on every start.** Once the table and trigger exist, a role with
    DML rights alone can run the bridge. A first start without the privilege it needs fails with
    an error that names that privilege.
-7. **A Telegram store lock left by a crashed run under the same pid is reclaimed.** A container
+8. **A Telegram store lock left by a crashed run under the same pid is reclaimed.** A container
    restarted as PID 1 used to refuse its own leftover lock forever. It now takes the lock over
    once the dead run's 30 s lease has lapsed.
 

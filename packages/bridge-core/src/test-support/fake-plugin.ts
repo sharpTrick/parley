@@ -128,6 +128,42 @@ export class FakePlugin implements BackendPlugin {
 }
 
 /**
+ * {@link FakePlugin} with the seam's optional mention feed: a post that mentions a handle reaches
+ * that handle's feed whatever topic it is on — before the post's own id comes back, as the topic
+ * subscriptions already do, so an echo of the bridge's own write races that write.
+ */
+export class MentionFeedPlugin extends FakePlugin {
+  private readonly feeds = new Map<Handle, Set<MessageHandler>>();
+
+  async subscribeMentions(handle: Handle, handler: MessageHandler): Promise<void> {
+    this.require();
+    let set = this.feeds.get(handle);
+    if (set === undefined) {
+      set = new Set<MessageHandler>();
+      this.feeds.set(handle, set);
+    }
+    set.add(handler);
+  }
+
+  override async post(
+    topic: Topic,
+    identity: Handle,
+    content: string,
+    opts?: { inReplyTo?: BackendMsgId },
+  ): Promise<BackendMsgId> {
+    const id = await super.post(topic, identity, content, opts);
+    const msg = this.recorded(topic).find((m) => m.backendMsgId === id)!;
+    for (const handle of msg.mentions) for (const handler of this.feeds.get(handle) ?? []) handler(msg);
+    return id;
+  }
+
+  override async disconnect(): Promise<void> {
+    this.feeds.clear();
+    await super.disconnect();
+  }
+}
+
+/**
  * The one nonconformance the seam's third clause exists to forbid: a `subscribe` that resolves,
  * registers nothing, and delivers nothing, over a `fetchRecent` that is complete. Every message
  * still reaches the agent — through catch-up — so nothing above the seam errors, nothing is lost,

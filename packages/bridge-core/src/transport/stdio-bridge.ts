@@ -5,24 +5,22 @@ import { instanceIdOf, type ParleyConfig } from '../config.js';
 import { catchUpAll } from '../engine/catchup.js';
 import { defaultReadStatePath, ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
-import { withInboundTrustBoundary } from '../inbound-trust.js';
 import { asHandle } from '../message.js';
 import type { BackendConfig, BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
+import { serverInstructions } from './instructions.js';
 import { startPushLoop } from './push-loop.js';
 import { registerTools, toolDepsFor } from './tools.js';
 
-/**
- * The system-prompt string Claude Code adds when it loads this channel (channels gate), minus the
- * untrusted-inbound boundary {@link withInboundTrustBoundary} appends to it.
- */
+/** What Claude Code is told about this channel when it loads it (channels gate). */
 const CHANNEL_INSTRUCTIONS_BODY = [
   'Parley channel: messages from a shared, topic-organized backend arrive as <channel> events',
-  'with attributes topic, sender, cursor, msg_id (and mentions). To respond, call parley_reply',
-  'with the same `topic`. To pull missed history for a topic, call parley_fetch_recent (on',
-  'session start for each configured topic, then on demand). To publish or hand off, call',
-  'parley_post. To check whether the live path is actually delivering — rather than assuming a',
-  'quiet topic — call parley_live_status.',
+  'with attributes topic, sender, cursor, msg_id (and mentions). A message naming no one comes to',
+  'everyone on its topic; one naming handles comes only to those it names. Your own messages are',
+  'never pushed back to you. To respond, call parley_reply with the same `topic`. To pull missed history for',
+  'a topic, call parley_fetch_recent (on session start for each configured topic, then on demand).',
+  'To publish or hand off, call parley_post. To check whether the live path is actually delivering',
+  '— rather than assuming a quiet topic — call parley_live_status.',
 ];
 
 /** A transport accepted by `McpServer.connect` (stdio in production, in-memory in tests). */
@@ -44,17 +42,6 @@ export interface ParleyBridge {
  * loopback harness can attach an InMemoryTransport and the CLI can attach stdio.
  */
 export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Promise<ParleyBridge> {
-  const server = new McpServer(
-    { name: 'parley', version: CORE_VERSION },
-    {
-      capabilities: {
-        tools: {},
-        experimental: { 'claude/channel': {} },
-      },
-      instructions: withInboundTrustBoundary(CHANNEL_INSTRUCTIONS_BODY),
-    },
-  );
-
   const identity = asHandle(cfg.identity.handle);
   const allow = allowlistFor(cfg);
   const seen = new SeenSet();
@@ -65,6 +52,16 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
   // tool is not later re-pushed — and on this ONE read-state, which is the AGENT's read position:
   // the tool resumes from it and advances it, while on-start catch-up only reads it.
   const deps = toolDepsFor(plugin, cfg, { seen, readState });
+  const server = new McpServer(
+    { name: 'parley', version: CORE_VERSION },
+    {
+      capabilities: {
+        tools: {},
+        experimental: { 'claude/channel': {} },
+      },
+      instructions: serverInstructions(CHANNEL_INSTRUCTIONS_BODY, deps.whoami),
+    },
+  );
   registerTools(server, deps);
 
   await plugin.connect(cfg.backend_config as BackendConfig);
@@ -141,6 +138,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
             mentionFilter: cfg.live_push.mention_filter,
             identity,
             live: deps.live,
+            own: deps.own,
           });
           abortIfToreDown();
         }

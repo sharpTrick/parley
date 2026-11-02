@@ -3,6 +3,7 @@ import { blockingCases } from './cases/blocking.js';
 import { catchUpCases } from './cases/catch-up.js';
 import { concurrencyCases } from './cases/concurrency.js';
 import { liveCases } from './cases/live.js';
+import { mentionFeedCases } from './cases/mentions.js';
 import { postCases } from './cases/post.js';
 import { toolSurfaceCases } from './cases/tool-surface.js';
 import {
@@ -138,6 +139,7 @@ export function runConformanceSuite(name: string, factory: BackendFactory): void
     postCases(current);
     toolSurfaceCases(current);
     liveCases(current);
+    mentionFeedCases(current);
     blockingCases(current);
     concurrencyCases(current);
   });

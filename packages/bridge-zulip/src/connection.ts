@@ -1,4 +1,4 @@
-import type { Topic } from '@sharptrick/parley-core';
+import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import { resolveConfig, type ZulipConfig } from './config.js';
 import { TEARDOWN_TIMEOUT_MS, ZulipHttp } from './http.js';
@@ -146,6 +146,11 @@ export class ZulipConnection {
     const wire = this.wireTopic(topic);
     this.claimedWireTopics.set(wire, topic);
     return wire;
+  }
+
+  /** The Parley topic a wire topic belongs to: the one that claimed it, else the wire name itself. */
+  topicOf(wire: string): Topic {
+    return this.claimedWireTopics.get(wire.toLowerCase()) ?? asTopic(wire.toLowerCase());
   }
 
   require(): void {

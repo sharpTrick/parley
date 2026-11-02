@@ -1,10 +1,12 @@
 import { allowlistFor, type Allowlist } from '../allowlist.js';
-import type { ParleyConfig } from '../config.js';
+import { instanceIdOf, type ParleyConfig } from '../config.js';
 import { LiveDeliveryLedger, liveDeliveryBlockers } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import type { SeenSet } from '../engine/seen-set.js';
-import { asHandle, type Handle } from '../message.js';
+import { asHandle, type Handle, type Topic } from '../message.js';
 import type { BackendPlugin } from '../seam.js';
+import { CORE_VERSION } from '../version.js';
 
 /** Dependencies the reactive/reply tools close over. */
 export interface ToolDeps {
@@ -41,6 +43,33 @@ export interface ToolDeps {
    * counters cannot be compared refuses to answer rather than reporting health.
    */
   live: LiveDeliveryLedger;
+  /** What this bridge wrote: kept off the read guard, and shared with the push loop's echo check. */
+  own: OwnPosts;
+  /** Page size of the read a post makes first, to find what its author has not seen. */
+  guardLimit: number;
+  /** What `parley_whoami` answers: fixed for the life of the bridge. */
+  whoami: WhoAmI;
+}
+
+/** An instance's answer to "who am I here, and what can this bridge do". */
+export interface WhoAmI {
+  handle: Handle;
+  instance_id: string;
+  /** Topics followed: caught up on and, with live push on, pushed. */
+  subscribed_topics: Topic[];
+  /** Further topics allowed for post/fetch only, as full-match regex sources. */
+  post_topics: string[];
+  version: string;
+  live_push: boolean;
+  /**
+   * Where a message naming this handle is pushed from: `any-topic` needs a backend with a mention
+   * feed; without one only followed topics push, and with live push off nothing does.
+   */
+  mention_push: 'any-topic' | 'subscribed-topics' | 'off';
+  /** Whether this bridge keeps a read position, so a since-less read resumes rather than re-reads. */
+  read_position: boolean;
+  /** Operator guidance on how to reach the other participants, when the deployment gives one. */
+  directory?: string;
 }
 
 /**
@@ -54,14 +83,29 @@ export function toolDepsFor(
   extras?: { seen?: SeenSet; readState?: ToolDeps['readState'] },
 ): ToolDeps {
   const allow = allowlistFor(cfg);
+  const identity = asHandle(cfg.identity.handle);
+  const livePush = cfg.live_push.enabled && extras?.seen !== undefined;
   return {
     plugin,
-    identity: asHandle(cfg.identity.handle),
+    identity,
     allow,
     blockMaxMs: cfg.catchup.block_max_ms,
     blockPollIntervalMs: cfg.catchup.block_poll_interval_ms,
     seen: extras?.seen,
     readState: extras?.readState,
+    own: new OwnPosts(),
+    guardLimit: cfg.catchup.limit,
+    whoami: {
+      handle: identity,
+      instance_id: instanceIdOf(cfg),
+      subscribed_topics: allow.topics(),
+      post_topics: allow.patterns(),
+      version: CORE_VERSION,
+      live_push: livePush,
+      mention_push: !livePush ? 'off' : plugin.subscribeMentions !== undefined ? 'any-topic' : 'subscribed-topics',
+      read_position: extras?.readState !== undefined,
+      ...(cfg.directory !== undefined ? { directory: cfg.directory } : {}),
+    },
     live: new LiveDeliveryLedger(
       allow.topics(),
       liveDeliveryBlockers({

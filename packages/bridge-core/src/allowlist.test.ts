@@ -519,6 +519,19 @@ describe('each caller-facing surface consults the allowlist dimension its doc na
       },
     },
     {
+      // Names the followed topics; the pattern-only ones are reported as the patterns themselves.
+      label: 'parley_whoami',
+      tool: 'parley_whoami',
+      dimension: 'EXPLICIT',
+      reaches: async (h, topic) => {
+        const answer = (await h.client.callTool({ name: 'parley_whoami', arguments: {} })) as {
+          content: Array<{ text: string }>;
+        };
+        const who = JSON.parse(answer.content[0]!.text) as { subscribed_topics: string[] };
+        return who.subscribed_topics.includes(topic);
+      },
+    },
+    {
       label: 'subscribe / catch-up',
       dimension: 'EXPLICIT',
       reaches: (h, topic) => Promise.resolve(h.allow.topics().some((t) => t === topic)),

@@ -240,6 +240,7 @@ const FULL = {
   identity: { handle: 'h' },
   topics: ['ctx'],
   post_topics: ['ctx-.*'],
+  directory: 'each project agent is claude-code-<folder>, at home on topic project-<folder>',
   catchup: {
     on_start: true,
     limit: 10,
@@ -514,6 +515,7 @@ describe('config rejects an empty string in any field that names something', () 
       'auth.oidc.jwks_uri',
       'auth.oidc.required_role',
       'auth.oidc.required_scope',
+      'directory',
       'identity.handle',
       'instance_id',
       'post_topics[0]',

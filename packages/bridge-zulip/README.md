@@ -20,6 +20,7 @@ resolveIdentity`); adding it required **zero** changes to `@sharptrick/parley-co
 | `fetchRecent` (no `since`)| `GET /api/v1/messages` narrowed to `<stream, topic>`, `anchor=newest&include_anchor=true&num_before=N` → the most recent window, ascending. Zulip resolves `newest` to a sentinel larger than any message id, so no row can be the anchor and `include_anchor` decides nothing on this read; it is sent explicitly all the same, because it is the value that stays correct if that ever changes. Zulip caps a request at 5000 messages, so a larger `limit` is paginated transparently rather than returned as a 400. |
 | `fetchRecent` (`since`)   | `anchor=<since>&include_anchor=false&num_before=0&num_after=N` — the anchor itself is excluded, so `since` is strictly **exclusive** server-side. Zulip returns ascending by id; no client-side reordering. |
 | `subscribe`               | `POST /api/v1/register` a `<stream, topic>`-narrowed message **event queue** (only later sends enter it; awaited before subscribe resolves), then a `GET /api/v1/events` long-poll loop. A message that reaches the server while no queue of ours exists — before `register` lands, or between a garbage-collected queue and its replacement — reaches no queue at all: live push is a **subset** of the post-subscribe tail (the seam's contract), and that window is left to the next `parley_fetch_recent`. Zulip delivers our own sends back to our own queue. Queues idle-GC after ~10 min → on `BAD_EVENT_QUEUE_ID` the loop re-registers and resumes; a `register` mints an *empty* queue and reports `last_event_id: -1`, so the replacement can never re-serve what the dead one already delivered. A duplicate is still forbidden, and the loop holds that with a last-delivered-id watermark: an event whose id it cannot ack leaves the queue position where it was, and the server re-serves the message behind it on every poll until the fault clears. `disconnect()` aborts in-flight polls and best-effort deletes the queues. Only a body the server actually sent counts as evidence the queue is alive — our own cap ends a healthy idle poll and a black-holed one identically — so the poll issued after a cap asks for the queue as it stands (`dont_block=true`). Progress is measured by the ACK, not by bytes: a poll that asked to park and came back with nothing — or with events whose ids leave the ack where it was, so the very same answer is served again — is a wake that never came, and is backed off and named on stderr rather than re-issued forever. |
+| `subscribeMentions`       | One more event queue, narrowed to the whole **stream** rather than one topic, on the same long-poll loop; it hands over only the messages that mention the handle (see *Mentions*), each under the topic it was posted on — the Parley topic that claimed that Zulip topic, else the Zulip topic name itself. |
 | `resolveIdentity`         | `GET /api/v1/users`, matched on `email` or `full_name` → `backendRef` = the Zulip `user_id`; miss (or error) degrades to `{ handle, backendRef: handle }`. |
 
 `senderHandle` ← `message.sender_email`, `content` ← raw `message.content` (`apply_markdown=false`
@@ -38,6 +39,20 @@ the `/api/v1/events` event queue.
 > **email**, never your `identity.handle` — see "Multiple concurrent sessions" for what that costs
 > transcripts. **`inReplyTo` is ignored too:** Zulip has no per-message reply parent; it threads
 > *by topic*, and the topic is already Parley's addressing unit.
+
+## Mentions
+
+A message names a handle in either of Zulip's own spellings — `@**claude-code-x**`, or
+`@**claude-code-x|42**` as the compose box writes it — or as a plain `@claude-code-x`. Each named
+handle reaches `Message.mentions`, and through `subscribeMentions` the instance it names, on any
+topic in the stream. A **silent** mention (`@_**name**`) notifies nobody and names no one; the
+wildcards (`@**all**`, `@**everyone**`, `@**channel**`, `@**stream**`, `@**topic**`) address the whole
+topic rather than a participant; a display name that is no handle (`@**Jane Doe**`) and a user group
+(`@*team*`) name no Parley participant either. So for Zulip's autocomplete to write a mention core can
+route, give each bot the full name of its Parley handle when you provision it.
+
+The feed is a queue of its own, so it adds one subscribed topic's worth of polling to the
+`events_timeout_ms` budget below: count it as one more topic.
 
 ## Topic names: case-folded, 60 characters, validated
 

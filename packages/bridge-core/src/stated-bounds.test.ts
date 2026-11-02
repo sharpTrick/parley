@@ -8,6 +8,7 @@ import { ParleyOAuthProvider } from './auth/oauth-provider.js';
 import { DISCOVERY_TIMEOUT_MS, fetchOidcDiscovery } from './auth/oidc-discovery.js';
 import {
   MAX_BLOCK_MS,
+  MAX_DIRECTORY_LEN,
   MAX_HANDLE_LEN,
   MAX_POST_TOPICS,
   MAX_TOPIC_LEN,
@@ -15,6 +16,7 @@ import {
   parseConfig,
 } from './config.js';
 import { catchUpTopic, MAX_CATCHUP_PAGES } from './engine/catchup.js';
+import { OWN_POSTS_MAX, OwnPosts } from './engine/own-posts.js';
 import { ReadStateStore } from './engine/read-state.js';
 import { SEEN_MAX_PER_TOPIC, SEEN_MAX_TOPICS, SeenSet } from './engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic } from './message.js';
@@ -441,6 +443,27 @@ const CAPACITIES: Capacity[] = [
     refusesPast: () => !rememberedAfter(4097),
   },
   {
+    name: 'OWN_POSTS_MAX',
+    actual: OWN_POSTS_MAX,
+    expected: 1024,
+    realistic: 'a bridge still recognises its echo after 1024 posts of its own',
+    accepts: () => ownRememberedAfter(1024),
+    refusesPast: async () => !(await ownRememberedAfter(1025)),
+  },
+  {
+    name: 'MAX_DIRECTORY_LEN',
+    actual: MAX_DIRECTORY_LEN,
+    expected: 1000,
+    realistic: 'a paragraph telling agents how to reach each other',
+    accepts: () =>
+      parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], directory: 'x'.repeat(1000) })
+        .directory?.length === 1000,
+    refusesPast: () =>
+      refused(() =>
+        parseConfig({ identity: { handle: 'h' }, topics: ['ctx'], directory: 'x'.repeat(1001) }),
+      ),
+  },
+  {
     name: 'SEEN_MAX_TOPICS',
     actual: SEEN_MAX_TOPICS,
     expected: 256,
@@ -493,6 +516,13 @@ const ctxTopics = (n: number): string[] => Array.from({ length: n }, (_, i) => `
 const id = (n: number): string => `msg-${n}`;
 
 /** Whether the OLDEST id is still deduped after `n` ids land on one topic. */
+/** Whether the bridge's FIRST post is still recognised as its own after `n` posts. */
+async function ownRememberedAfter(n: number): Promise<boolean> {
+  const own = new OwnPosts();
+  for (let i = 0; i < n; i++) await own.track(() => Promise.resolve(asBackendMsgId(id(i))));
+  return own.has(asBackendMsgId(id(0)));
+}
+
 function rememberedAfter(n: number): boolean {
   const seen = new SeenSet();
   const topic = asTopic('ctx');

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpTopic } from '../engine/catchup.js';
 import { LiveDeliveryLedger } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
@@ -12,6 +13,7 @@ import { NoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin, MessageHandler } from '../seam.js';
 import { FakePlugin } from '../test-support/fake-plugin.js';
 import { memoryReadState } from '../test-support/nonconformant.js';
+import { writePathDeps } from '../test-support/tool-harness.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { startPushLoop } from './push-loop.js';
 import { registerTools } from './tools.js';
@@ -45,6 +47,7 @@ async function wired(opts: { mentionFilter: boolean; identity: string }) {
     mentionFilter: opts.mentionFilter,
     identity: asHandle(opts.identity),
     live: new LiveDeliveryLedger(allow.topics()),
+    own: new OwnPosts(),
   });
   return { plugin, calls, seen };
 }
@@ -118,12 +121,14 @@ describe('startPushLoop (core emit handler)', () => {
         blockMaxMs: 1_000,
         blockPollIntervalMs: 20,
         live: new LiveDeliveryLedger([asTopic('ctx')]),
+        ...writePathDeps(new Allowlist(['ctx'])),
       });
       const emits = vi.spyOn(server.server, 'notification').mockResolvedValue(undefined);
       await startPushLoop(server, plugin, new Allowlist(['ctx']), seen, {
         mentionFilter: false,
         identity: asHandle('agent'),
         live: new LiveDeliveryLedger([asTopic('ctx')]),
+        own: new OwnPosts(),
       });
       const [clientT, serverT] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
@@ -200,6 +205,7 @@ describe('startPushLoop (core emit handler)', () => {
         mentionFilter: false,
         identity: asHandle('me'),
         live: new LiveDeliveryLedger(topics.map(asTopic)),
+        own: new OwnPosts(),
       });
       return { plugin, subscribed, calls, start };
     }
@@ -251,7 +257,7 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
       plugin,
       new Allowlist(['ctx']),
       new SeenSet(),
-      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]) },
+      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]), own: new OwnPosts() },
     );
     let seq = 0;
     return {

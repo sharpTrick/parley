@@ -15,6 +15,7 @@ export const CLAUSES: readonly string[] = [
   'never-posted topic',
   'hands a resuming session everything it missed',
   'via live push and via catch-up',
+  'delivers what names the handle from any topic',
   'either round-trips',
   'post accepts inReplyTo',
   'only the post-subscribe tail',

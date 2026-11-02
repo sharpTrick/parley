@@ -605,6 +605,7 @@ describe('a state file this process cannot write does not stop the bridge starti
         'parley_live_status',
         'parley_post',
         'parley_reply',
+        'parley_whoami',
       ]);
 
       const answer = (await client.callTool({

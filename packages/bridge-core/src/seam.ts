@@ -102,6 +102,18 @@ export interface BackendPlugin {
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
 
   /**
+   * OPTIONAL. Register interest in messages that mention `handle`, from ANY topic — including ones
+   * nobody subscribed to. `handler` fires under the same terms as `subscribe`'s: at most once per
+   * message, in ascending cursor order per topic, only for messages arriving after this call, and a
+   * subset rather than all of them. Every message it delivers carries `handle` in `mentions`.
+   *
+   * A backend that leaves it out still delivers mentions on the topics an instance subscribes to;
+   * what it loses is a mention on a topic that instance does not follow, which then reaches the
+   * agent only through `fetchRecent`.
+   */
+  subscribeMentions?(handle: Handle, handler: MessageHandler): Promise<void>;
+
+  /**
    * Single centralized durable write path. Writes `content` to `topic`, optionally threaded to
    * `inReplyTo`. Returns the new message's stable backend id. `identity` is the handle core asks
    * the write to be attributed to; a backend whose transport authenticates as an account of its own
