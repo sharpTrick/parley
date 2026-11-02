@@ -222,7 +222,7 @@ function deliverPage(deps: ToolDeps, t: Topic, result: FetchRecentResult, read: 
     // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
     // thing that distinguishes a dead live path: a message reaching the agent that push never
     // delivered. Past `markSeen` every message looks delivered.
-    if (i >= liveFrom && !seen.has(t, m.backendMsgId)) deps.live.recordReconciled(t);
+    if (i >= liveFrom && !seen.has(t, m.backendMsgId) && !deps.own.has(m.backendMsgId)) deps.live.recordReconciled(t);
     seen.markSeen(t, m.backendMsgId);
   });
   return { kept, nextCursor, fresh };

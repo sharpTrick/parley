@@ -78,9 +78,12 @@ export async function startPushLoop(
   const route = async (m: Message, followed: boolean): Promise<void> => {
     await opts.own.settled();
     if (opts.own.has(m.backendMsgId)) return;
+    // Re-checked after the wait, so that a read that handed the message over meanwhile is not
+    // followed by the same message as a push.
+    if (opts.handed.has(m.topic, m.backendMsgId)) return;
     if (!routesTo(m, opts.identity, { followed, mentionFilter: opts.mentionFilter })) return;
-    opts.handed.markSeen(m.topic, m.backendMsgId);
     await emitChannel(server, m);
+    opts.handed.markSeen(m.topic, m.backendMsgId);
   };
   const handlerFor = (fromMentionFeed: boolean) => (m: Message): void => {
     const followed = subscribed.has(m.topic);

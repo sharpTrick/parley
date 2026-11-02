@@ -134,7 +134,7 @@ const ZULIP_MENTION = /(?<![^\s'"(,:<])@\*\*([^*|\n]{1,100}?)(?:\|\d+)?\*\*/g;
  * The markdown Zulip renders without mentions: code fences, inline code and block quotes. Zulip
  * neither links nor notifies a name written there, so it addresses nobody.
  */
-const UNADDRESSABLE = [/^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gm, /`[^`\n]*`/g, /^[ \t]*>.*$/gm];
+const UNADDRESSABLE = [/^(```|~~~)[^\n]*\n[\s\S]*?(?:^\1[^\n]*$|(?![\s\S]))/gm, /`[^`\n]*`/g, /^[ \t]*>.*$/gm];
 const ZULIP_WILDCARDS = new Set(['all', 'everyone', 'stream', 'channel', 'topic']);
 
 function zulipMentions(content: string): Handle[] {

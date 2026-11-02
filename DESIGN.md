@@ -287,7 +287,7 @@ dedup is a second line under it, not a licence for a plugin to deliver a message
   baseline — a cursor it names, else its read position — paging on while the cursor advances, and
   if that turns up messages it was never shown (by push or by a read; on-start catch-up shows it
   nothing), write nothing and hand those over instead. The author's own
-  messages never count. The read and the write are not atomic, and need not be: the point is that
+  messages from this session never count (the stateless HTTP root keeps no such record). The read and the write are not atomic, and need not be: the point is that
   reading first is not a separate call an agent must remember. `force` skips it.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.

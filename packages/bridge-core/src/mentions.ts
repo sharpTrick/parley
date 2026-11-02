@@ -10,7 +10,7 @@ const HANDLE_BODY = '[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?';
 // atomically (a lookahead capture, then `\1`), so that the guard cannot make the engine retry every
 // shorter prefix of a long hostile token.
 const MENTION_RE = new RegExp(
-  `(?:^|[^\\p{L}\\p{N}_.@-])@(?=(${HANDLE_BODY}))\\1(?![._-]*/)`,
+  `(?:^|[^\\p{L}\\p{M}\\p{N}_.@-])@(?=(${HANDLE_BODY}))\\1(?![._-]*/)`,
   'gu',
 );
 

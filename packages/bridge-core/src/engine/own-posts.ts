@@ -44,20 +44,20 @@ export class OwnPosts {
   }
 
   /**
-   * Resolves once every write still young enough to be waited on has returned its id, or once the
-   * youngest of them is no longer. Keep the age limit per write, so that a write that never returns
-   * costs one bounded wait rather than one per message behind it.
+   * Resolves once every write in flight has either returned its id or grown too old to wait on.
+   * Keep the age limit per write, so that a write that never returns costs one bounded wait — not
+   * one per message behind it, and not one more for every younger write that returns in time.
    */
-  settled(): Promise<void> {
+  async settled(): Promise<void> {
     const now = Date.now();
-    const young = [...this.inFlight].filter((w) => now - w.started < WRITE_WAIT_MS);
-    if (young.length === 0) return Promise.resolve();
-    const remaining = Math.max(...young.map((w) => w.started)) + WRITE_WAIT_MS - now;
+    await Promise.all([...this.inFlight].map((w) => this.doneOrAged(w, WRITE_WAIT_MS - (now - w.started))));
+  }
+
+  private async doneOrAged(write: { done: Promise<void> }, remainingMs: number): Promise<void> {
+    if (remainingMs <= 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const aged = new Promise<void>((resolve) => (timer = setTimeout(resolve, remaining)));
-    return Promise.race([Promise.all(young.map((w) => w.done)).then(() => undefined), aged]).finally(() =>
-      clearTimeout(timer),
-    );
+    const aged = new Promise<void>((resolve) => (timer = setTimeout(resolve, remainingMs)));
+    await Promise.race([write.done, aged]).finally(() => clearTimeout(timer));
   }
 
   private remember(id: BackendMsgId): void {

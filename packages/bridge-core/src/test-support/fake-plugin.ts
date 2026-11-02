@@ -1,12 +1,12 @@
 import {
   asBackendMsgId,
   asCursor,
+  buildMessage,
   type BackendMsgId,
   type Handle,
   type Message,
   type Topic,
 } from '../message.js';
-import { parseMentions } from '../mentions.js';
 import type {
   BackendConfig,
   BackendIdentity,
@@ -74,17 +74,15 @@ export class FakePlugin implements BackendPlugin {
     const seq = ++this.seq;
     const id = asBackendMsgId(String(seq));
     const addressed = this.addressedIn(content);
-    const msg: Message = {
+    const msg: Message = buildMessage({
       topic,
-      senderHandle: identity,
+      sender: identity,
       content,
       // Deterministic; timestamp is informational only and never used for order/dedup.
       timestamp: new Date(seq * 1000).toISOString(),
-      backendMsgId: id,
-      cursor: asCursor(String(seq)),
-      mentions: [...new Set([...parseMentions(content), ...(addressed ?? [])])],
+      id: String(seq),
       ...(addressed !== undefined ? { addressed } : {}),
-    };
+    });
     this.rows.push({ seq, msg });
     for (const handler of this.subs.get(topic) ?? []) handler(msg);
     return id;

@@ -165,6 +165,52 @@ describe('who a live message reaches', () => {
     await vi.waitFor(() => expect(s.pushes).toEqual(flowing), { timeout: 3_500 });
   });
 
+  it('does not push a message the agent already read while push waited on a write', async () => {
+    const plugin = new SlowAcknowledgement(400);
+    const s = await session({ plugin });
+    const writing = call(s.client, 'parley_post', { topic: FOLLOWED, content: 'mine', force: true });
+    await vi.waitFor(() => expect(plugin.acknowledging).toBe(true));
+    await s.plugin.post(asTopic(FOLLOWED), PEER, 'read while waiting');
+    expect((await call(s.client, 'parley_fetch_recent', { topic: FOLLOWED })).messages.map((m: Message) => m.content)).toContain(
+      'read while waiting',
+    );
+    await writing;
+    expect(await pushedBefore(s)).toEqual([]);
+  });
+
+  it('waits for the youngest write in flight, not just the oldest', async () => {
+    class HungThenSlow extends FakePlugin {
+      private writes = 0;
+      override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+        if (identity !== asHandle(ME)) return super.post(topic, identity, content);
+        if (this.writes++ === 0) return new Promise(() => undefined);
+        const id = await super.post(topic, identity, content);
+        await new Promise((r) => setTimeout(r, 600));
+        return id;
+      }
+    }
+    const s = await session({ plugin: new HungThenSlow() });
+    void s.client.callTool({ name: 'parley_post', arguments: { topic: FOLLOWED, content: 'hung', force: true } }).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 1_600));
+    await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'slow but mine', force: true });
+    expect(await pushedBefore(s)).toEqual([]);
+  }, 10_000);
+
+  it('does not count its own fetched posts as messages push failed to deliver', async () => {
+    class NoOwnEcho extends FakePlugin {
+      override async subscribe(topic: Topic, handler: (m: Message) => void): Promise<void> {
+        await super.subscribe(topic, (m) => {
+          if (m.senderHandle !== asHandle(ME)) handler(m);
+        });
+      }
+    }
+    const s = await session({ plugin: new NoOwnEcho() });
+    await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'mine', force: true });
+    await call(s.client, 'parley_fetch_recent', { topic: FOLLOWED });
+    const report = await call(s.client, 'parley_live_status');
+    expect(report.topics.find((t: { topic: string }) => t.topic === FOLLOWED).status).not.toBe('not-delivering');
+  });
+
   it('recognises its own echo when it arrives while the write is still waiting for its id', async () => {
     class EchoBeforeAcknowledgement extends FakePlugin {
       override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
@@ -363,10 +409,35 @@ describe('an agent can find out who it is and what the bridge can do', () => {
     expect(() => parseConfig({ identity: { handle: ME }, topics: [FOLLOWED], directory })).toThrow(/directory/);
   });
 
+  it.each([
+    ['agents are claude-code-<folder>; CI runs as trusted-ci'],
+    ['ask @comply-bot for licence checks'],
+  ])('loads a directory that names handles whatever their words: %s', (directory) => {
+    expect(parseConfig({ identity: { handle: ME }, topics: [FOLLOWED], directory }).directory).toBe(directory);
+  });
+
   it.each([['trusted-ci'], ['comply-bot'], ['obey']])('loads an identifier handle whatever its words: %s', (handle) => {
     expect(parseConfig({ identity: { handle }, topics: [FOLLOWED] }).identity.handle).toBe(handle);
   });
 });
+
+/** A backend whose writes return their id only after `ackMs`, with the echo already delivered. */
+class SlowAcknowledgement extends FakePlugin {
+  acknowledging = false;
+
+  constructor(private readonly ackMs: number) {
+    super();
+  }
+
+  override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+    const id = await super.post(topic, identity, content);
+    if (identity !== asHandle(ME)) return id;
+    this.acknowledging = true;
+    await new Promise((r) => setTimeout(r, this.ackMs));
+    this.acknowledging = false;
+    return id;
+  }
+}
 
 /**
  * A backend whose history read is one shared room: a page carries the next rows after the cursor

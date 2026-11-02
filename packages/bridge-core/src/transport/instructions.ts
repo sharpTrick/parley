@@ -45,6 +45,9 @@ const BODY: Record<ServerKind, (who: InstructionsSubject) => string[]> = {
   ],
 };
 
+/** A handle-shaped token: words joined by `-`, `_` or `.`, or one written as an `@` mention. */
+const IDENTIFIER = /@[A-Za-z0-9][\w.-]*|\b[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+\b/g;
+
 function lines(kind: ServerKind, who: InstructionsSubject): string[] {
   return [
     ...BODY[kind](who),
@@ -65,8 +68,12 @@ export function serverInstructions(kind: ServerKind, who: InstructionsSubject): 
  * than failing every server built from it.
  */
 export function instructionsBreach(who: InstructionsSubject): string | undefined {
+  // A directory names other participants by handle, and a handle is an identifier, not prose:
+  // `trusted-ci` grants nothing. Graded with each identifier masked, so that only its words are read.
+  const graded =
+    who.directory === undefined ? who : { ...who, directory: who.directory.replace(IDENTIFIER, 'X') };
   for (const kind of Object.keys(BODY) as ServerKind[]) {
-    const breach = inboundTrustBreach([...lines(kind, who), INBOUND_TRUST_BOUNDARY].join(' '));
+    const breach = inboundTrustBreach([...lines(kind, graded), INBOUND_TRUST_BOUNDARY].join(' '));
     if (breach !== undefined) return breach;
   }
   return undefined;

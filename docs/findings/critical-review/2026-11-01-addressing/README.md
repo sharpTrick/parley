@@ -36,3 +36,10 @@ strict rule.
 |---|---|---|---|---|---|---|---|
 | 1 | `0025502` | 137 (28) | 7 | 26, plus 4 caused elsewhere | 114 | 2.31M | 68 min |
 | 2 | `dacb160` | 130 (25) | 7 | 26 | 111 | 2.31M | 73 min |
+| 3 | `83feea7` | 139 (23) | 9 | 21 | 127 | 2.58M | 95 min |
+
+Round 3 was the last. Its fixes were mutation-tested but reviewed by no further round. Two
+critics in round 3 collided on shared scratch paths in `/tmp` — one with another project's session
+(`/tmp/mut.bak`), one with a sibling critic (`/tmp/mut`) — so mutation verdicts from `core-seam`
+and `core-auth` near 21:12–21:25 are suspect. Every worktree and the main tree were checked clean
+afterwards, and the runner's brief now forbids fixed scratch names in `/tmp`.

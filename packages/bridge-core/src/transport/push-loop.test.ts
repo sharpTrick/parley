@@ -52,6 +52,29 @@ async function wired(opts: { mentionFilter: boolean; identity: string }) {
   return { plugin, calls, seen };
 }
 
+describe('what push records as shown to the agent', () => {
+  it.each([
+    ['a push the transport sends', () => Promise.resolve(), true],
+    ['a push the transport fails to send', () => Promise.reject(new Error('transport closed')), false],
+  ] as const)('%s is recorded as shown: %s', async (_label, notify, shown) => {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    const server = { server: { notification: vi.fn(notify) } } as unknown as McpServer;
+    const handed = new SeenSet();
+    await startPushLoop(server, plugin, new Allowlist(['ctx']), new SeenSet(), {
+      mentionFilter: false,
+      identity: asHandle('me'),
+      live: new LiveDeliveryLedger([asTopic('ctx')]),
+      own: new OwnPosts(),
+      handed,
+    });
+    const id = await plugin.post(asTopic('ctx'), asHandle('bob'), 'hi');
+    await vi.waitFor(() => expect(server.server.notification).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(handed.has(asTopic('ctx'), id)).toBe(shown);
+  });
+});
+
 describe('startPushLoop (core emit handler)', () => {
   it('emits a channel notification for a new message', async () => {
     const { plugin, calls } = await wired({ mentionFilter: false, identity: 'me' });

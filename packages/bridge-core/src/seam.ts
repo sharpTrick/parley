@@ -1,8 +1,8 @@
 /**
  * The Seam — the backend plugin interface (DESIGN §4). THE PRODUCT.
  *
- * A backend plugin implements these six methods; everything hard (push delivery,
- * catch-up, routing, dedup) lives ABOVE this seam in @sharptrick/parley-core. Dependencies point
+ * A backend plugin implements these six methods, and may add the optional mention feed; everything
+ * hard (push delivery, catch-up, routing, dedup) lives ABOVE this seam in @sharptrick/parley-core. Dependencies point
  * one way: plugins depend on core, never the reverse (CLAUDE.md prime directive #1).
  *
  * Conformance contract (what makes a backend correct):

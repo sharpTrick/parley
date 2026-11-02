@@ -51,6 +51,7 @@ const GRAMMAR: readonly (readonly [label: string, content: string, expected: rea
     ['a scope-like token is not a mention', 'hi @a/b there', []],
     ['a package scope is not a mention', 'bump @sharptrick/parley-core', []],
     ['a non-ASCII letter before @ makes it an email, not a mention', 'mail josé@bob.example', []],
+    ['a combining mark before @ makes it an email (NFD input)', 'mail jose\u0301@bob.example', []],
     ['a scope token is refused past a trailing separator', 'see @docs./intro', []],
     ['interior plus ends the handle', 'hi @a+b there', ['a']],
     ['interior at-sign ends the handle', 'hi @a@b there', ['a']],
@@ -109,7 +110,7 @@ describe('the @mention grammar, pinned as literals', () => {
 // either class can be replayed against the table: a mutant no row disagrees with is a hole in the
 // table, and it fails HERE rather than after the hole has been shipped.
 const HANDLE_BODY = '[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?';
-const GUARD_CLASS = '[^\\p{L}\\p{N}_.@-]';
+const GUARD_CLASS = '[^\\p{L}\\p{M}\\p{N}_.@-]';
 const TAIL_GUARD = '(?![._-]*/)';
 
 const parseWith =
@@ -133,10 +134,11 @@ const MUTANTS: readonly (readonly [label: string, body: string, guard: string, t
     GUARD_CLASS,
   ],
   ['the handle may end with punctuation', '[A-Za-z0-9][A-Za-z0-9._-]*', GUARD_CLASS],
-  ['the guard class drops _', HANDLE_BODY, '[^\\p{L}\\p{N}.@-]'],
-  ['the guard class drops .', HANDLE_BODY, '[^\\p{L}\\p{N}_@-]'],
-  ['the guard class drops -', HANDLE_BODY, '[^\\p{L}\\p{N}_.@]'],
-  ['the guard class drops @', HANDLE_BODY, '[^\\p{L}\\p{N}_.-]'],
+  ['the guard class drops _', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}.@-]'],
+  ['the guard class drops .', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_@-]'],
+  ['the guard class drops -', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_.@]'],
+  ['the guard class drops @', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_.-]'],
+  ['the guard class drops combining marks', HANDLE_BODY, '[^\\p{L}\\p{N}_.@-]'],
   ['the guard class is ASCII-only', HANDLE_BODY, '[^A-Za-z0-9_.@-]'],
 ];
 
