@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express, { type Express, type RequestHandler } from 'express';
 import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
 import { serverInstructions } from './instructions.js';
@@ -21,7 +22,9 @@ export function buildReactiveServer(deps: ToolDeps): McpServer {
     { name: 'parley', version: CORE_VERSION },
     { capabilities: { tools: {} }, instructions: serverInstructions('reactive', deps.whoami) },
   );
-  registerTools(server, deps);
+  // Keep the write ledger per request: every chat client on the port shares `deps`, and one
+  // client's post must never be taken for another's own.
+  registerTools(server, { ...deps, own: new OwnPosts() });
   return server;
 }
 

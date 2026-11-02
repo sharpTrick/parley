@@ -28,6 +28,11 @@ describe('who a Zulip message mentions, and who it is explicitly addressed to', 
       (w): Row => [`the @**${w}** wildcard`, `heads up @**${w}**`, [], []],
     ),
     ['a person’s display name, which is no handle', 'thanks @**Patrick Sharp**', [], []],
+    ['an address in inline code', 'type `@**claude-code-taskqueue**` to address it', [], []],
+    ['an address in a code fence', '```\n@**claude-code-taskqueue**\n```', [], []],
+    ['an address in a block quote', '> @**claude-code-taskqueue** said so', [], []],
+    ['an address run into the word before it', 'mail@**claude-code-taskqueue**', [], []],
+    ['an address in parentheses', '(@**claude-code-taskqueue**)', [ME], [ME]],
     ['a user group', 'ping @*maintainers*', [], []],
   ])('%s', (_label, content, mentions, addressed) => {
     const m = buildZulipMessage(asTopic('t'), { id: 1, content }, 1);
@@ -87,6 +92,47 @@ describe('subscribeMentions delivers what names the handle, from every topic', (
     fake.injectMessage({ topic: posted, content: '@**claude-code-taskqueue** look' });
 
     await vi.waitFor(() => expect(got.map((m) => m.topic)).toEqual([posted]));
+  });
+
+  it('delivers a mention whose id was committed late, on another topic', async () => {
+    const { plugin, fake } = await boot();
+    const got: Message[] = [];
+    await plugin.subscribeMentions(ME, (m) => got.push(m));
+
+    const late = fake.injectMessage({ topic: `a-${rand()}`, content: 'placeholder' });
+    fake.injectMessage({ topic: `b-${rand()}`, content: '@**claude-code-taskqueue** first committed' });
+    fake.injectRaw({ topic: `c-${rand()}`, fields: { id: late, content: '@**claude-code-taskqueue** committed late' } });
+
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toContain('@**claude-code-taskqueue** committed late'));
+  });
+
+  it('keeps a topic’s own queue narrowed to its topic after Zulip garbage-collects it', async () => {
+    const { plugin, fake } = await boot();
+    const mine = asTopic(`mine-${rand()}`);
+    const got: Message[] = [];
+    await plugin.subscribe(mine, (m) => got.push(m));
+    fake.expireQueues();
+    await sleep(300);
+
+    fake.injectMessage({ topic: `other-${rand()}`, content: 'not for this topic' });
+    fake.injectMessage({ topic: mine, content: 'for this topic' });
+
+    await vi.waitFor(() => expect(got.map((m) => m.content)).toContain('for this topic'), { timeout: 3_000 });
+    await sleep(300);
+    expect(got.map((m) => m.content)).toEqual(['for this topic']);
+  });
+
+  it('delivers nothing once the plugin disconnects', async () => {
+    const { plugin, fake } = await boot();
+    const got: Message[] = [];
+    await plugin.subscribeMentions(ME, (m) => got.push(m));
+    fake.injectMessage({ topic: `a-${rand()}`, content: '@**claude-code-taskqueue** before' });
+    await vi.waitFor(() => expect(got).toHaveLength(1));
+
+    await plugin.disconnect();
+    fake.injectMessage({ topic: `a-${rand()}`, content: '@**claude-code-taskqueue** after' });
+    await sleep(500);
+    expect(got.map((m) => m.content)).toEqual(['@**claude-code-taskqueue** before']);
   });
 
   it('keeps reading the whole stream after Zulip garbage-collects its queue', async () => {

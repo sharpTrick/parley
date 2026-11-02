@@ -24,18 +24,18 @@ const WRITE_WAIT_MS = 2_000;
  */
 export class OwnPosts {
   private readonly ids = new Set<BackendMsgId>();
-  private inFlight = 0;
-  private idle: Promise<void> = Promise.resolve();
-  private release: () => void = () => {};
+  private readonly inFlight = new Set<{ started: number; done: Promise<void> }>();
 
   async track(write: () => Promise<BackendMsgId>): Promise<BackendMsgId> {
-    if (this.inFlight++ === 0) this.idle = new Promise((resolve) => (this.release = resolve));
+    const pending = write();
+    const entry = { started: Date.now(), done: pending.then(() => undefined, () => undefined) };
+    this.inFlight.add(entry);
     try {
-      const id = await write();
+      const id = await pending;
       this.remember(id);
       return id;
     } finally {
-      if (--this.inFlight === 0) this.release();
+      this.inFlight.delete(entry);
     }
   }
 
@@ -44,14 +44,20 @@ export class OwnPosts {
   }
 
   /**
-   * Resolves once no write is in flight, so every id a write is about to return is known — or after
-   * a bounded wait, whichever is first.
+   * Resolves once every write still young enough to be waited on has returned its id, or once the
+   * youngest of them is no longer. Keep the age limit per write, so that a write that never returns
+   * costs one bounded wait rather than one per message behind it.
    */
   settled(): Promise<void> {
-    if (this.inFlight === 0) return this.idle;
+    const now = Date.now();
+    const young = [...this.inFlight].filter((w) => now - w.started < WRITE_WAIT_MS);
+    if (young.length === 0) return Promise.resolve();
+    const remaining = Math.max(...young.map((w) => w.started)) + WRITE_WAIT_MS - now;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const elapsed = new Promise<void>((resolve) => (timer = setTimeout(resolve, WRITE_WAIT_MS)));
-    return Promise.race([this.idle, elapsed]).finally(() => clearTimeout(timer));
+    const aged = new Promise<void>((resolve) => (timer = setTimeout(resolve, remaining)));
+    return Promise.race([Promise.all(young.map((w) => w.done)).then(() => undefined), aged]).finally(() =>
+      clearTimeout(timer),
+    );
   }
 
   private remember(id: BackendMsgId): void {

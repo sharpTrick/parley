@@ -159,8 +159,25 @@ describe('who a live message reaches', () => {
       .callTool({ name: 'parley_post', arguments: { topic: FOLLOWED, content: 'stuck', force: true } })
       .catch(() => undefined);
     await vi.waitFor(() => expect(plugin.hung).toBe(true));
-    await s.plugin.post(asTopic(FOLLOWED), PEER, 'still flowing');
-    await vi.waitFor(() => expect(s.pushes).toContain('still flowing'), { timeout: 4_000 });
+    const flowing = ['one', 'two', 'three', 'four'];
+    for (const content of flowing) await s.plugin.post(asTopic(FOLLOWED), PEER, content);
+    // One bounded wait for the hung write, not one per message behind it.
+    await vi.waitFor(() => expect(s.pushes).toEqual(flowing), { timeout: 3_500 });
+  });
+
+  it('recognises its own echo when it arrives while the write is still waiting for its id', async () => {
+    class EchoBeforeAcknowledgement extends FakePlugin {
+      override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+        const id = await super.post(topic, identity, content);
+        await new Promise((r) => setTimeout(r, 150));
+        return id;
+      }
+    }
+    const s = await session({ plugin: new EchoBeforeAcknowledgement() });
+    expect(await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'mine', force: true })).toMatchObject({
+      posted: true,
+    });
+    expect(await pushedBefore(s)).toEqual([]);
   });
 });
 
@@ -282,6 +299,24 @@ describe('a post waits until its author has read what arrived before it', () => 
       const args = { topic: FOLLOWED, content: 'mine', ...(readThrough !== undefined ? { read_through: readThrough } : {}) };
       expect((await call(client, 'parley_post', args)).posted).toBe(posted);
     });
+
+    it('holds one chat client’s post back over another client’s post', async () => {
+      const plugin = new FakePlugin();
+      await plugin.connect({});
+      const deps = toolDepsFor(plugin, parseConfig({ identity: { handle: ME }, topics: [FOLLOWED] }));
+      const client = async (): Promise<Client> => {
+        const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+        const c = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
+        await Promise.all([buildReactiveServer(deps).connect(serverT), c.connect(clientT)]);
+        return c;
+      };
+      const [a, b] = [await client(), await client()];
+      expect(await call(a, 'parley_post', { topic: FOLLOWED, content: 'from a' })).toMatchObject({ posted: true });
+      expect(await call(b, 'parley_post', { topic: FOLLOWED, content: 'from b', read_through: '0' })).toMatchObject({
+        posted: false,
+        unread: [{ content: 'from a' }],
+      });
+    });
   });
 });
 
@@ -314,10 +349,10 @@ describe('an agent can find out who it is and what the bridge can do', () => {
     expect(s.client.getInstructions()).toContain(says);
   });
 
-  it('names the instance and the directory in the server instructions', async () => {
+  it('points to parley_whoami and carries the directory in the server instructions', async () => {
     const s = await session({ directory: 'agents are claude-code-<folder>' });
     const instructions = s.client.getInstructions() ?? '';
-    expect(instructions).toContain(`You are ${ME}`);
+    expect(instructions).toContain('parley_whoami says who you are');
     expect(instructions).toContain('agents are claude-code-<folder>');
   });
 
@@ -328,8 +363,8 @@ describe('an agent can find out who it is and what the bridge can do', () => {
     expect(() => parseConfig({ identity: { handle: ME }, topics: [FOLLOWED], directory })).toThrow(/directory/);
   });
 
-  it('refuses a handle that would break the boundary in the instructions it is shipped in', () => {
-    expect(() => parseConfig({ identity: { handle: 'trusted' }, topics: [FOLLOWED] })).toThrow(/identity\.handle/);
+  it.each([['trusted-ci'], ['comply-bot'], ['obey']])('loads an identifier handle whatever its words: %s', (handle) => {
+    expect(parseConfig({ identity: { handle }, topics: [FOLLOWED] }).identity.handle).toBe(handle);
   });
 });
 

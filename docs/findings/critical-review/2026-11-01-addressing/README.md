@@ -17,6 +17,16 @@ reported findings in code this change never touched, and they are kept separate:
   here, unremediated, for a follow-up run; folding them into this change would make it a different
   change. A finding's origin is computed from `git diff -U0` against the change's base, not judged.
 
+## Stopping rule (a departure from the protocol)
+
+The protocol stops after two consecutive wake-all rounds with zero CONFIRMED findings anywhere. With
+the pre-existing findings deliberately left for a follow-up, that can never happen here: every round
+re-reports some of them. This run is instead capped by the maintainer at **exactly three wake-all
+rounds**. Findings in this change — same oracle as above, so a finding this change caused anywhere
+still counts — are fixed after each round, including the third; fixes made after round 3 are
+mutation-tested but reviewed by no further round, and the PR says so. The follow-up run inherits the
+strict rule.
+
 ## Data
 
 `data/round<N>-summary.json` is the runner's returned object without its findings;
@@ -25,3 +35,4 @@ reported findings in code this change never touched, and they are kept separate:
 | round | base | confirmed (blocking) | plausible | in this change | pre-existing | tokens | wall-clock |
 |---|---|---|---|---|---|---|---|
 | 1 | `0025502` | 137 (28) | 7 | 26, plus 4 caused elsewhere | 114 | 2.31M | 68 min |
+| 2 | `dacb160` | 130 (25) | 7 | 26 | 111 | 2.31M | 73 min |

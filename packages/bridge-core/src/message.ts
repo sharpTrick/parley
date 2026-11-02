@@ -54,8 +54,9 @@ export interface Message {
   /**
    * OPTIONAL. The handles this message is explicitly addressed to in the backend's own syntax —
    * Zulip's `@**handle**` — set only by a plugin that can tell an address from an incidental
-   * `@word`. A non-empty list is pushed only to those handles, so every entry must also be in
-   * `mentions`: that is what a mention feed delivers by.
+   * `@word`. A non-empty list keeps the message from every follower it neither addresses nor
+   * mentions. Every entry is also in `mentions`, which is what a mention feed delivers by;
+   * {@link buildMessage} guarantees it.
    */
   addressed?: Handle[];
 }
@@ -78,6 +79,8 @@ export interface BuildMessageInput {
   id: string;
   /** Order key; defaults to `id` when the backend uses one value for both. */
   cursor?: string;
+  /** Handles the backend's own syntax explicitly addresses; each is added to `mentions` too. */
+  addressed?: string[];
 }
 
 /**
@@ -86,6 +89,7 @@ export interface BuildMessageInput {
  * mention + assembly semantics live in ONE place. `topic` is passed pre-branded.
  */
 export function buildMessage(input: BuildMessageInput): Message {
+  const addressed = input.addressed?.map(asHandle);
   return {
     topic: input.topic,
     senderHandle: asHandle(input.sender),
@@ -93,6 +97,7 @@ export function buildMessage(input: BuildMessageInput): Message {
     timestamp: input.timestamp,
     backendMsgId: asBackendMsgId(input.id),
     cursor: asCursor(input.cursor ?? input.id),
-    mentions: parseMentions(input.content),
+    mentions: [...new Set([...parseMentions(input.content), ...(addressed ?? [])])],
+    ...(addressed !== undefined ? { addressed } : {}),
   };
 }

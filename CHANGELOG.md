@@ -39,9 +39,9 @@ speak, and address someone without waking everyone.
 - **Zulip reads its own mention syntax.** `@**handle**` and `@**handle|id**` now reach `mentions`
   and `addressed`; silent mentions, wildcards, display names that are no handle, and user groups do
   not. A mention on a topic nobody claimed keeps the case it was posted in.
-- **Server instructions** name the instance and carry short conversation conventions: say whether
-  you need an answer, answer only what asks for one, address with `@<handle>`, keep a conversation in
-  its topic, cite ids, never post secrets.
+- **Server instructions** point to `parley_whoami` and carry short conversation conventions: say
+  whether you need an answer, answer only what asks for one, name someone with `@<handle>`, keep a
+  conversation in its topic, cite ids, never post secrets.
 - `OwnPosts` is exported, since `PushLoopOptions` and `ToolDeps` now carry one, beside a `handed`
   `SeenSet` of what the agent has been shown.
 
@@ -53,9 +53,11 @@ speak, and address someone without waking everyone.
   `{ backendMsgId }`, or `{ posted: false, … }` when held back.
 - **A package scope is not a mention.** `@sharptrick/parley-core` no longer parses as a mention of
   `sharptrick`.
-- **The server instructions say what live push carries**, including under `mention_filter`, and the
-  handle and `directory` are graded against the untrusted-inbound boundary in the exact text each
-  server ships, at load.
+- **The server instructions say what live push carries**, including under `mention_filter`, and
+  `directory` is graded against the untrusted-inbound boundary in the exact text each server ships,
+  at load.
+- **`buildMessage` takes `addressed`** and adds every address to `mentions`, so a plugin cannot
+  build an address a mention feed would never deliver.
 
 ### Upgrading from 0.10.0
 
@@ -66,8 +68,8 @@ speak, and address someone without waking everyone.
    withholding the message from the rest.
 3. **An embedder building `ToolDeps` or `PushLoopOptions` by hand** must supply `own`, `guardLimit`,
    `whoami` and (for `PushLoopOptions`) `handed` — or build them with `toolDepsFor`.
-4. **A handle or `directory` that would break the untrusted-inbound boundary** in the shipped
-   instructions is now a load error.
+4. **A `directory` that would break the untrusted-inbound boundary** in the shipped instructions is
+   a load error.
 
 ## 0.10.0 — simplification
 

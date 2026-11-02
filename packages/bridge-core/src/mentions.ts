@@ -4,14 +4,14 @@ import { asHandle, type Handle } from './message.js';
 // trailing one is not, so sentence punctuation ("ping @bob.") isn't absorbed into the handle.
 const HANDLE_BODY = '[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?';
 
-// `@` preceded by start-of-string or a non-handle char — the leading guard stops us matching
-// emails like alice@example.com mid-token. The trailing guard refuses a package scope
-// (`@sharptrick/parley-core`), since an addressed message stops reaching every follower who is not
-// named. Keep the handle matched atomically (a lookahead capture, then `\1`), so that the guard
-// cannot make the engine retry every shorter prefix of a long hostile token.
+// `@` preceded by start-of-string or a character that cannot end a word in any script — the leading
+// guard stops us matching emails like josé@example.com mid-token. The trailing guard refuses a
+// package scope (`@sharptrick/parley-core`), which names no participant. Keep the handle matched
+// atomically (a lookahead capture, then `\1`), so that the guard cannot make the engine retry every
+// shorter prefix of a long hostile token.
 const MENTION_RE = new RegExp(
-  `(?:^|[^A-Za-z0-9_.@-])@(?=(${HANDLE_BODY}))\\1(?![._-]*/)`,
-  'g',
+  `(?:^|[^\\p{L}\\p{N}_.@-])@(?=(${HANDLE_BODY}))\\1(?![._-]*/)`,
+  'gu',
 );
 
 const HANDLE_RE = new RegExp(`^(?:${HANDLE_BODY})$`);

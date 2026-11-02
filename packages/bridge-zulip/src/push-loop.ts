@@ -3,15 +3,6 @@ import type { QueueState, ZulipConnection } from './connection.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
 import { asArray, buildZulipMessage, type EventsResponse, type ZulipMessage, zulipMessageId } from './wire.js';
 
-/**
- * The live path (DESIGN §9 — genuine events, not a poll timer). The queue is awaited before this
- * resolves, so a post immediately after subscribe() is guaranteed to be queued, and Zulip delivers
- * our own sends to our own queue, matching the seam's echo expectation.
- *
- * Delivery is a subset of the tail (DESIGN §6) — but never a repeat. Keep `lastDeliveredId`: an
- * event carrying an id the loop cannot ack leaves the queue position unmoved, and the server then
- * hands back the message behind it on every poll until the fault clears.
- */
 const replacedDuringHandshake = (): Error =>
   new Error(
     'Zulip connection was replaced while subscribe() was registering its event queue, so no ' +
@@ -30,6 +21,15 @@ const subjectOf = (m: ZulipMessage): string => {
  */
 type PushScope = { topic: Topic } | { mentioning: Handle };
 
+/**
+ * The live path (DESIGN §9 — genuine events, not a poll timer). The queue is awaited before this
+ * resolves, so a post immediately after subscribe() is guaranteed to be queued, and Zulip delivers
+ * our own sends to our own queue, matching the seam's echo expectation.
+ *
+ * Delivery is a subset of the tail (DESIGN §6) — but never a repeat. Keep the delivered-id watermark: an
+ * event carrying an id the loop cannot ack leaves the queue position unmoved, and the server then
+ * hands back the message behind it on every poll until the fault clears.
+ */
 export async function startPushLoop(
   conn: ZulipConnection, scope: PushScope, handler: MessageHandler,
 ): Promise<void> {
@@ -55,7 +55,12 @@ export async function startPushLoop(
   // calls `process.exit(0)` the moment shutdown resolves, so whatever is still in flight then is
   // killed mid-request rather than finished.
   /** The newest message id handed to the handler; anything at or below it has already gone out. */
-  let lastDeliveredId: number | undefined;
+  /**
+   * The newest message id handed over, per topic. Keep it per topic, so that on the stream-wide
+   * mention feed a lower id committed late on one topic — Zulip commits ids out of order — is not
+   * suppressed by a higher one already delivered on another.
+   */
+  const lastDelivered = new Map<string, number>();
   let reg: Awaited<ReturnType<typeof rest.register>>;
   try {
     reg = await rest.register(wire, signal);
@@ -169,8 +174,10 @@ export async function startPushLoop(
       const record = ev.message;
       const id = zulipMessageId(record);
       if (record === undefined || id === undefined) continue;
-      if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue;
-      lastDeliveredId = id;
+      const watermarkKey = 'topic' in scope ? '' : String(record.subject ?? '').toLowerCase();
+      const last = lastDelivered.get(watermarkKey);
+      if (last !== undefined && id <= last) continue;
+      lastDelivered.set(watermarkKey, id);
       deliver(() =>
         buildZulipMessage(
           'topic' in scope ? scope.topic : conn.topicOf(subjectOf(record)),

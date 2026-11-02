@@ -1,8 +1,7 @@
 import { INBOUND_TRUST_BOUNDARY, inboundTrustBreach, withInboundTrustBoundary } from '../inbound-trust.js';
 
-/** Who an instance is, as far as the instructions it ships say. */
+/** What of an instance's configuration its instructions describe. */
 export interface InstructionsSubject {
-  handle: string;
   directory?: string;
   mention_filter: boolean;
 }
@@ -31,7 +30,7 @@ const BODY: Record<ServerKind, (who: InstructionsSubject) => string[]> = {
       ? 'Only messages that name you are pushed here.'
       : 'Messages on your topics are pushed to you, except one the backend marks as addressed only ' +
         'to others; one that names you reaches you on any topic the backend can carry it from.',
-    'Your own messages are never pushed back to you. To respond, call parley_reply with the same',
+    'Your own messages are not pushed back to you. To respond, call parley_reply with the same',
     '`topic`. To pull missed history for a topic, call parley_fetch_recent (on session start for',
     'each configured topic, then on demand). To publish or hand off, call parley_post. To check',
     'whether the live path is actually delivering — rather than assuming a quiet topic — call',
@@ -49,7 +48,7 @@ const BODY: Record<ServerKind, (who: InstructionsSubject) => string[]> = {
 function lines(kind: ServerKind, who: InstructionsSubject): string[] {
   return [
     ...BODY[kind](who),
-    `You are ${who.handle}; parley_whoami says what this bridge can do.`,
+    'parley_whoami says who you are here and what this bridge can do.',
     ...(who.directory !== undefined ? [`Reaching others: ${who.directory}`] : []),
     ...CONVERSATION_CONVENTIONS,
   ];
@@ -62,8 +61,8 @@ export function serverInstructions(kind: ServerKind, who: InstructionsSubject): 
 
 /**
  * Why the instructions either server would ship for `who` break the untrusted-inbound boundary, or
- * `undefined`. Run at config load, so that operator text — the handle and the directory — that
- * would break it is refused there rather than failing every server built from it.
+ * `undefined`. Run at config load, so that a `directory` that would break it is refused there rather
+ * than failing every server built from it.
  */
 export function instructionsBreach(who: InstructionsSubject): string | undefined {
   for (const kind of Object.keys(BODY) as ServerKind[]) {

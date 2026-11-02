@@ -217,7 +217,7 @@ describe('public barrel surface', () => {
       'subscribeMentions',
     ],
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
-    BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
+    BuildMessageInput: ['addressed', 'content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
     ConsentError: ['constructor', 'name'],
     BlockingFetchUnsupportedError: ['constructor', 'name'],

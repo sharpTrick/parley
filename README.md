@@ -176,7 +176,7 @@ The *seam* is that one small interface every backend implements. All the hard, b
  catch-up + live push (preview)  post + fetchRecent
 ```
 
-The whole product is these six seam methods:
+The whole product is these six seam methods, plus one optional one:
 
 ```ts
 interface BackendPlugin {
@@ -186,6 +186,7 @@ interface BackendPlugin {
   post(topic, identity, content, opts?): Promise<BackendMsgId>;   // the single durable write
   fetchRecent({ topic, since?, limit? }): Promise<{ messages, nextCursor }>; // catch-up
   resolveIdentity(handle): Promise<BackendIdentity>;
+  subscribeMentions?(handle, handler): Promise<void>;     // OPTIONAL: mentions from any topic (Zulip)
 }
 ```
 
