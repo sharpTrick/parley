@@ -289,6 +289,16 @@ const STAMPED = 'reference-bot' as Handle;
  * authenticated account, which is what every hosted SaaS does and what Matrix's homeserver-stamped
  * `sender` amounts to. The weaker contract that arm buys is graded here rather than nowhere.
  */
+/**
+ * The arm every shipped backend but Zulip is on: no mention feed at all. Without it the suite's
+ * no-feed branch is satisfiable by nothing in this repo.
+ */
+export const makeNoMentionFeedReferenceContext = (): Promise<ConformanceContext> => {
+  const store = newReferenceStore();
+  const { subscribeMentions: _omitted, ...plugin } = delegate(new ReferencePlugin(store));
+  return context(plugin, store);
+};
+
 export const makeStampedSenderReferenceContext = (): Promise<ConformanceContext> => {
   const store = newReferenceStore();
   const inner = new ReferencePlugin(store);
@@ -1340,6 +1350,18 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
         },
       }));
     },
+  },
+  {
+    // An address the feed cannot deliver by: the message is addressed to a handle it never mentions,
+    // so it is withheld from every follower it does not name and reaches its addressee by no feed.
+    name: 'a message addressed to a handle it does not mention',
+    mutates: 'addressed-within-mentions',
+    mustFail: 'delivers what names the handle from any topic',
+    make: () =>
+      wrap((inner) => ({
+        subscribeMentions: (handle, handler) =>
+          inner.subscribeMentions(handle, (m) => handler({ ...m, addressed: [...(m.addressed ?? []), asHandle('ghost')] })),
+      })),
   },
   {
     // The feed a backend advertises and never wires: the agent is told mentions reach it anywhere,

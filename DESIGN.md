@@ -274,15 +274,19 @@ dedup is a second line under it, not a licence for a plugin to deliver a message
   written to the **backend** via `post` so it lives in durable history for the next
   catch-up. Rule: *replies always write to the backend; the live channel is only the fast
   hop.* Otherwise the instance's own messages vanish on restart.
-- **Live-push routing.** Filtering lives in one place in `bridge-core`. A message that names no
-  handle goes to every instance following its topic (a subset of them — §6). A message that names
-  handles is **addressed**: it goes only to the instances it names — on any topic their backend's
-  mention feed carries (§4, 2b) — and to no other follower of its topic. `mention_filter` narrows
-  further: only messages naming this instance. An instance is never pushed its own messages; it
-  recognises them by the ids its writes returned, since a backend may stamp a sender of its own.
+- **Live-push routing.** Filtering lives in one place in `bridge-core`. A message reaches every
+  instance following its topic (a subset of them — §6), and an instance it **mentions** on any topic
+  its backend's mention feed carries (§4, 2b). A message the backend marks as **explicitly
+  addressed** in its own syntax (`Message.addressed`; Zulip's `@**handle**`) reaches only the
+  instances it addresses or mentions, and no other follower. Only an address counts for that: a plain
+  `@word` is too often code, a decorator or a broadcast spelling to withhold a message on.
+  `mention_filter` narrows further: only messages naming this instance. An instance is never pushed
+  its own messages; it recognises them by the ids its writes returned, since a backend may stamp a
+  sender of its own.
 - **Read before you speak.** `parley_post`/`parley_reply` first read the topic from the author's
-  baseline — a cursor it names, else its read position — and if that turns up messages it was never
-  handed (by push or by a read), write nothing and hand those over instead. The author's own
+  baseline — a cursor it names, else its read position — paging on while the cursor advances, and
+  if that turns up messages it was never shown (by push or by a read; on-start catch-up shows it
+  nothing), write nothing and hand those over instead. The author's own
   messages never count. The read and the write are not atomic, and need not be: the point is that
   reading first is not a separate call an agent must remember. `force` skips it.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured

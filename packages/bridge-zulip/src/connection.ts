@@ -148,9 +148,13 @@ export class ZulipConnection {
     return wire;
   }
 
-  /** The Parley topic a wire topic belongs to: the one that claimed it, else the wire name itself. */
-  topicOf(wire: string): Topic {
-    return this.claimedWireTopics.get(wire.toLowerCase()) ?? asTopic(wire.toLowerCase());
+  /**
+   * The Parley topic a Zulip topic belongs to: the one that claimed it, else the topic as it was
+   * posted. Keep the posted case on the fallback, so that a case-sensitive `post_topics` pattern
+   * still matches a topic this instance never claimed.
+   */
+  topicOf(subject: string): Topic {
+    return this.claimedWireTopics.get(subject.toLowerCase()) ?? asTopic(subject);
   }
 
   require(): void {

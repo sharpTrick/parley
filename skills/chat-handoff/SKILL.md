@@ -47,9 +47,9 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
    - **Goal** — what to accomplish.
    - **Context** — key decisions/constraints from this chat (paths, links, prior art).
    - **Acceptance** — how to know it's done.
-   - **@mention** the target handle (e.g. `@claude-code-payments`). A message naming a handle is
-     pushed only to the handles it names, and on a backend with a mention feed it reaches them on
-     any topic.
+   - **@mention** the target handle (e.g. `@claude-code-payments`). On a backend with a mention
+     feed it reaches them on any topic. On Zulip, `@**claude-code-payments**` addresses it: only
+     the handles addressed see it live, not every follower of the topic.
    - Say whether you need an answer: end with "Reply needed: <what>" or "No reply needed".
 4. **Confirm** to the user that the handoff was posted (`posted: true`), and to which topic. If it
    came back `posted: false`, tell the user what arrived in the meantime before posting again.

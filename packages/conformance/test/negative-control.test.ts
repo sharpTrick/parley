@@ -120,7 +120,7 @@ const PARENT_STARTED_AT = Date.now();
  * against every broken variant. Keep the headroom large, so that a clause added to the shared
  * suite — which is the point of the suite — cannot turn every check in this file into a SKIP.
  */
-const NESTED_RUN_BUDGET_MS = 2_400_000;
+const NESTED_RUN_BUDGET_MS = 2_520_000;
 
 /**
  * What one case of one variant's run is allowed to cost ON AVERAGE, in the SLOWEST shard — the one

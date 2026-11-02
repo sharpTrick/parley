@@ -1147,7 +1147,7 @@ describe('Discord REST contract', () => {
               mentionFilter: false,
               identity: asHandle('me'),
               live: new LiveDeliveryLedger([first, second, bad].map(asTopic)),
-              own: new OwnPosts(),
+              own: new OwnPosts(), handed: new SeenSet(),
             }),
             'one mis-mapped topic failed the whole attach',
           ).resolves.toBeUndefined();

@@ -51,6 +51,13 @@ export interface Message {
   cursor: Cursor;
   /** Handles referenced in this message. */
   mentions: Handle[];
+  /**
+   * OPTIONAL. The handles this message is explicitly addressed to in the backend's own syntax —
+   * Zulip's `@**handle**` — set only by a plugin that can tell an address from an incidental
+   * `@word`. A non-empty list is pushed only to those handles, so every entry must also be in
+   * `mentions`: that is what a mention feed delivers by.
+   */
+  addressed?: Handle[];
 }
 
 /**

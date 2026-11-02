@@ -12,17 +12,6 @@ import { serverInstructions } from './instructions.js';
 import { startPushLoop } from './push-loop.js';
 import { registerTools, toolDepsFor } from './tools.js';
 
-/** What Claude Code is told about this channel when it loads it (channels gate). */
-const CHANNEL_INSTRUCTIONS_BODY = [
-  'Parley channel: messages from a shared, topic-organized backend arrive as <channel> events',
-  'with attributes topic, sender, cursor, msg_id (and mentions). A message naming no one comes to',
-  'everyone on its topic; one naming handles comes only to those it names. Your own messages are',
-  'never pushed back to you. To respond, call parley_reply with the same `topic`. To pull missed history for',
-  'a topic, call parley_fetch_recent (on session start for each configured topic, then on demand).',
-  'To publish or hand off, call parley_post. To check whether the live path is actually delivering',
-  '— rather than assuming a quiet topic — call parley_live_status.',
-];
-
 /** A transport accepted by `McpServer.connect` (stdio in production, in-memory in tests). */
 type AnyServerTransport = Parameters<McpServer['connect']>[0];
 
@@ -50,8 +39,10 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
 
   // Keep tools and the push loop on this ONE `seen` set, so a message pulled via the fetch_recent
   // tool is not later re-pushed — and on this ONE read-state, which is the AGENT's read position:
-  // the tool resumes from it and advances it, while on-start catch-up only reads it.
-  const deps = toolDepsFor(plugin, cfg, { seen, readState });
+  // the tool resumes from it and advances it, while on-start catch-up only reads it. Keep `handed`
+  // shared the same way, so that a message pushed to the agent counts as read to a post's guard.
+  const handed = new SeenSet();
+  const deps = toolDepsFor(plugin, cfg, { seen, readState, handed });
   const server = new McpServer(
     { name: 'parley', version: CORE_VERSION },
     {
@@ -59,7 +50,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
         tools: {},
         experimental: { 'claude/channel': {} },
       },
-      instructions: serverInstructions(CHANNEL_INSTRUCTIONS_BODY, deps.whoami),
+      instructions: serverInstructions('channel', deps.whoami),
     },
   );
   registerTools(server, deps);
@@ -139,6 +130,7 @@ export async function buildBridge(plugin: BackendPlugin, cfg: ParleyConfig): Pro
             identity,
             live: deps.live,
             own: deps.own,
+            handed,
           });
           abortIfToreDown();
         }

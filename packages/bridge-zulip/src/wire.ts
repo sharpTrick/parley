@@ -118,7 +118,8 @@ export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number): Me
     timestamp: isoTimestamp(m.timestamp),
     id: String(id),
   });
-  return { ...msg, mentions: [...new Set([...msg.mentions, ...zulipMentions(msg.content)])] };
+  const addressed = zulipMentions(msg.content);
+  return { ...msg, mentions: [...new Set([...msg.mentions, ...addressed])], addressed };
 }
 
 /**
@@ -131,14 +132,14 @@ const ZULIP_MENTION = /@\*\*([^*|\n]{1,100}?)(?:\|\d+)?\*\*/g;
 const ZULIP_WILDCARDS = new Set(['all', 'everyone', 'stream', 'channel', 'topic']);
 
 function zulipMentions(content: string): Handle[] {
-  const out: Handle[] = [];
+  const out = new Set<Handle>();
   for (const match of content.matchAll(ZULIP_MENTION)) {
     const name = match[1]!;
     if (ZULIP_WILDCARDS.has(name.toLowerCase())) continue;
     const [handle] = parseMentions(`@${name}`);
-    if (handle === name) out.push(handle);
+    if (handle === name) out.add(handle);
   }
-  return out;
+  return [...out];
 }
 
 /** Zulip timestamps are Unix SECONDS; an out-of-range or non-numeric one falls back to the epoch. */

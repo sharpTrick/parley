@@ -88,7 +88,7 @@ describe('a delivery coarser than one topic is cut down at every path, not just 
             mentionFilter: false,
             identity: asHandle('alice'),
             live: new LiveDeliveryLedger([asTopic(SUBSCRIBED)]),
-            own: new OwnPosts(),
+            own: new OwnPosts(), handed: new SeenSet(),
           });
           push(SUBSCRIBED, 1);
           for (const [, t] of FOREIGN_TOPIC_KINDS) push(t, 2);

@@ -9,15 +9,6 @@ import { CORE_VERSION } from '../version.js';
 import { serverInstructions } from './instructions.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
 
-/** What a reactive-only client is told about this root. */
-const REACTIVE_INSTRUCTIONS_BODY = [
-  'Parley: a shared, topic-organized message backend. To catch up on a topic, call',
-  'parley_fetch_recent (on session start for each topic you work in, then on demand). To answer a',
-  'message, call parley_reply with the same `topic`. To publish or hand off, call parley_post.',
-  'This root receives no live push at all; parley_live_status says so rather than reporting a',
-  'health it cannot observe.',
-];
-
 /**
  * Build a REACTIVE-ONLY MCP server (DESIGN §8/§10 remote mode): the post / fetchRecent / reply
  * tools over the same seam, with NO `claude/channel` capability and NO push loop — the chat
@@ -28,7 +19,7 @@ const REACTIVE_INSTRUCTIONS_BODY = [
 export function buildReactiveServer(deps: ToolDeps): McpServer {
   const server = new McpServer(
     { name: 'parley', version: CORE_VERSION },
-    { capabilities: { tools: {} }, instructions: serverInstructions(REACTIVE_INSTRUCTIONS_BODY, deps.whoami) },
+    { capabilities: { tools: {} }, instructions: serverInstructions('reactive', deps.whoami) },
   );
   registerTools(server, deps);
   return server;

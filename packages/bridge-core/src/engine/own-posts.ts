@@ -4,6 +4,13 @@ import type { BackendMsgId } from '../message.js';
 export const OWN_POSTS_MAX = 1024;
 
 /**
+ * How long a reader of this ledger waits for in-flight writes to return their ids. Keep it bounded,
+ * so that one write that never answers cannot stop live delivery or every later post — the price is
+ * that an echo racing a write slower than this is taken for someone else's message.
+ */
+const WRITE_WAIT_MS = 2_000;
+
+/**
  * The messages this bridge wrote, so that the live path never hands an agent its own words back
  * and a post's read guard never asks it to read them first.
  *
@@ -36,9 +43,15 @@ export class OwnPosts {
     return this.ids.has(id);
   }
 
-  /** Resolves once no write is in flight, so every id a write is about to return is known. */
+  /**
+   * Resolves once no write is in flight, so every id a write is about to return is known — or after
+   * a bounded wait, whichever is first.
+   */
   settled(): Promise<void> {
-    return this.idle;
+    if (this.inFlight === 0) return this.idle;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const elapsed = new Promise<void>((resolve) => (timer = setTimeout(resolve, WRITE_WAIT_MS)));
+    return Promise.race([this.idle, elapsed]).finally(() => clearTimeout(timer));
   }
 
   private remember(id: BackendMsgId): void {

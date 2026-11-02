@@ -3,6 +3,7 @@ import type { BackendPlugin, Topic } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import {
   makeBlockingReferenceContext,
+  makeNoMentionFeedReferenceContext,
   makeReferenceContext,
   makeStampedSenderReferenceContext,
   makeThrowingReferenceContext,
@@ -15,6 +16,7 @@ const FIXTURES: [string, () => Promise<import('@sharptrick/parley-conformance').
     ['reference (NoSuchTopicError on an absent topic)', makeThrowingReferenceContext],
     ['reference (native blockMs)', makeBlockingReferenceContext],
     ['reference (sender stamped, identity not carried)', makeStampedSenderReferenceContext],
+    ['reference (no mention feed)', makeNoMentionFeedReferenceContext],
   ];
 
 // The suite's positive control, and the only run of it that needs no server: an in-memory plugin

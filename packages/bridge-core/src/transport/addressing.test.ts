@@ -5,8 +5,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../config.js';
-import { asHandle, asTopic } from '../message.js';
-import { FakePlugin, MentionFeedPlugin } from '../test-support/fake-plugin.js';
+import { asCursor, asHandle, asTopic, type BackendMsgId, type Handle, type Message, type Topic } from '../message.js';
+import type { FetchRecentArgs, FetchRecentResult } from '../seam.js';
+import { ExplicitAddressPlugin, FakePlugin, MentionFeedPlugin } from '../test-support/fake-plugin.js';
 import { CORE_VERSION } from '../version.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { buildReactiveServer } from './http.js';
@@ -16,8 +17,8 @@ import { toolDepsFor } from './tools.js';
 /**
  * Who a message reaches, and when a post may go out. Four promises, each graded at the composition
  * root through the tools and the `<channel>` events an agent actually sees:
- *   - a message naming handles reaches only those it names, on any topic a mention feed carries;
- *     one naming nobody reaches every follower of its topic,
+ *   - a message naming a handle reaches it, on any topic a mention feed carries; one the backend
+ *     marks as explicitly addressed reaches no other follower of its topic,
  *   - nothing an instance wrote is pushed back to it,
  *   - a post waits until its author has been handed what arrived on the topic before it,
  *   - `parley_whoami` and the instructions tell an agent who it is and what the bridge can do.
@@ -39,6 +40,7 @@ interface Session {
 interface Opts {
   plugin?: FakePlugin;
   livePush?: boolean;
+  mentionFilter?: boolean;
   directory?: string;
 }
 
@@ -50,12 +52,13 @@ afterEach(async () => {
 
 async function session(opts: Opts = {}): Promise<Session> {
   const plugin = opts.plugin ?? new FakePlugin();
+  await plugin.connect({});
   const cfg = parseConfig({
     identity: { handle: ME },
     topics: [FOLLOWED],
     post_topics: ['proj-.*'],
     state_path: join(mkdtempSync(join(tmpdir(), 'parley-addressing-')), 'read-state.json'),
-    live_push: { enabled: opts.livePush ?? true },
+    live_push: { enabled: opts.livePush ?? true, mention_filter: opts.mentionFilter ?? false },
     ...(opts.directory !== undefined ? { directory: opts.directory } : {}),
   });
   const bridge = await buildBridge(plugin, cfg);
@@ -86,22 +89,78 @@ async function pushedBefore(s: Session): Promise<string[]> {
   return s.pushes.filter((p) => p !== 'sentinel');
 }
 
-describe('a message naming handles reaches only those it names', () => {
-  const CASES: Array<[label: string, topic: string, content: string, feed: boolean, reaches: boolean]> = [
-    ['naming nobody, on a followed topic', FOLLOWED, 'hello all', false, true],
-    ['naming me, on a followed topic', FOLLOWED, 'hi @agent', false, true],
-    ['naming someone else, on a followed topic', FOLLOWED, 'hi @carol', false, false],
-    ['naming someone else and me, on a followed topic', FOLLOWED, 'hi @carol and @agent', false, true],
-    ['naming me, on an unfollowed allowed topic, with a mention feed', ADHOC, 'hi @agent', true, true],
-    ['naming me, on an unfollowed allowed topic, without a mention feed', ADHOC, 'hi @agent', false, false],
-    ['naming nobody, on an unfollowed allowed topic, with a mention feed', ADHOC, 'hello all', true, false],
-    ['naming me, on a topic this instance may not read', FORBIDDEN, 'hi @agent', true, false],
+type Backend = 'plain' | 'feed' | 'explicit';
+const backend = (kind: Backend): FakePlugin =>
+  kind === 'plain' ? new FakePlugin() : kind === 'feed' ? new MentionFeedPlugin() : new ExplicitAddressPlugin();
+
+describe('who a live message reaches', () => {
+  const CASES: Array<[label: string, topic: string, content: string, kind: Backend, reaches: boolean]> = [
+    ['naming nobody, on a followed topic', FOLLOWED, 'hello all', 'plain', true],
+    ['naming me, on a followed topic', FOLLOWED, 'hi @agent', 'plain', true],
+    ['an incidental @word, on a followed topic', FOLLOWED, 'see @param in the docs', 'explicit', true],
+    ['explicitly addressed to someone else, on a followed topic', FOLLOWED, 'hi @**carol**', 'explicit', false],
+    ['explicitly addressed to someone else and me', FOLLOWED, 'hi @**carol** @**agent**', 'explicit', true],
+    ['explicitly addressed to someone else, naming me in passing', FOLLOWED, '@**carol** ask @agent', 'explicit', true],
+    ['naming me, on an unfollowed allowed topic, with a mention feed', ADHOC, 'hi @agent', 'feed', true],
+    ['naming me, on an unfollowed allowed topic, without a mention feed', ADHOC, 'hi @agent', 'plain', false],
+    ['naming nobody, on an unfollowed allowed topic, with a mention feed', ADHOC, 'hello all', 'feed', false],
+    ['naming me, on a topic this instance may not read', FORBIDDEN, 'hi @agent', 'feed', false],
   ];
 
-  it.each(CASES)('%s', async (_label, topic, content, feed, reaches) => {
-    const s = await session({ plugin: feed ? new MentionFeedPlugin() : new FakePlugin() });
+  it.each(CASES)('%s', async (_label, topic, content, kind, reaches) => {
+    const s = await session({ plugin: backend(kind) });
     await s.plugin.post(asTopic(topic), PEER, content);
     expect(await pushedBefore(s)).toEqual(reaches ? [content] : []);
+  });
+
+  it.each([
+    ['naming nobody', 'hello all', false],
+    ['naming me', 'hi @agent', true],
+  ] as const)('with mention_filter, a followed topic message %s', async (_label, content, reaches) => {
+    const s = await session({ mentionFilter: true });
+    await s.plugin.post(asTopic(FOLLOWED), PEER, content);
+    await s.plugin.post(asTopic(FOLLOWED), PEER, 'sentinel @agent');
+    await vi.waitFor(() => expect(s.pushes).toContain('sentinel @agent'));
+    expect(s.pushes.filter((p) => p !== 'sentinel @agent')).toEqual(reaches ? [content] : []);
+  });
+
+  it('counts a mention reaching a followed topic by the feed as no evidence its subscription works', async () => {
+    class DeadSubscription extends MentionFeedPlugin {
+      override async subscribe(): Promise<void> {}
+    }
+    const s = await session({ plugin: new DeadSubscription() });
+    await s.plugin.post(asTopic(FOLLOWED), PEER, 'hi @agent');
+    await vi.waitFor(() => expect(s.pushes).toContain('hi @agent'));
+    const report = await call(s.client, 'parley_live_status');
+    expect(report.topics.find((t: { topic: string }) => t.topic === FOLLOWED).pushed).toBe(0);
+  });
+
+  it('drops a mention from a topic it may not read without blaming the backend', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const s = await session({ plugin: new MentionFeedPlugin() });
+    await s.plugin.post(asTopic(FORBIDDEN), PEER, 'hi @agent');
+    expect(await pushedBefore(s)).toEqual([]);
+    expect(errors.mock.calls.flat().join('\n')).not.toMatch(/delivering beyond/);
+    errors.mockRestore();
+  });
+
+  it('keeps delivering while one of its own writes never returns', async () => {
+    class HungWrites extends FakePlugin {
+      hung = false;
+      override post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+        if (identity !== asHandle(ME)) return super.post(topic, identity, content);
+        this.hung = true;
+        return new Promise(() => undefined);
+      }
+    }
+    const plugin = new HungWrites();
+    const s = await session({ plugin });
+    void s.client
+      .callTool({ name: 'parley_post', arguments: { topic: FOLLOWED, content: 'stuck', force: true } })
+      .catch(() => undefined);
+    await vi.waitFor(() => expect(plugin.hung).toBe(true));
+    await s.plugin.post(asTopic(FOLLOWED), PEER, 'still flowing');
+    await vi.waitFor(() => expect(s.pushes).toContain('still flowing'), { timeout: 4_000 });
   });
 });
 
@@ -130,20 +189,58 @@ describe('a post waits until its author has read what arrived before it', () => 
   });
 
   it.each([
-    ['it was pushed', { livePush: true }, false],
-    ['it was fetched', { livePush: false }, true],
+    ['it was pushed', { livePush: true }, undefined],
+    ['it was fetched', { livePush: false }, {}],
+    ['it was read as the newest page, which moves no read position', { livePush: false }, { from: 'recent' }],
   ] as const)('lets a post through when the earlier message reached the author because %s', async (_l, opts, fetch) => {
     const s = await session(opts);
     await s.plugin.post(asTopic(FOLLOWED), PEER, 'status: green');
-    if (fetch) await call(s.client, 'parley_fetch_recent', { topic: FOLLOWED });
+    if (fetch !== undefined) await call(s.client, 'parley_fetch_recent', { topic: FOLLOWED, ...fetch });
     else await vi.waitFor(() => expect(s.pushes).toContain('status: green'));
     expect(await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'ack' })).toMatchObject({ posted: true });
+  });
+
+  it('never holds a post back for the author’s own post still in flight', async () => {
+    class SlowAcknowledgement extends FakePlugin {
+      override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+        const id = await super.post(topic, identity, content);
+        await new Promise((r) => setTimeout(r, 150));
+        return id;
+      }
+    }
+    const s = await session({ plugin: new SlowAcknowledgement(), livePush: false });
+    const first = call(s.client, 'parley_post', { topic: FOLLOWED, content: 'one' });
+    await new Promise((r) => setTimeout(r, 30));
+    const second = call(s.client, 'parley_post', { topic: FOLLOWED, content: 'two' });
+    expect(await Promise.all([first, second])).toMatchObject([{ posted: true }, { posted: true }]);
   });
 
   it('never holds a post back for the author’s own earlier posts', async () => {
     const s = await session({ livePush: false });
     for (const content of ['one', 'two', 'three'])
       expect(await call(s.client, 'parley_post', { topic: FOLLOWED, content })).toMatchObject({ posted: true });
+  });
+
+  it('holds back a post over a backlog that arrived before the bridge started', async () => {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    await plugin.post(asTopic(FOLLOWED), PEER, 'while you were away');
+    const s = await session({ plugin });
+    expect(await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'back' })).toMatchObject({
+      posted: false,
+      unread: [{ content: 'while you were away' }],
+    });
+  });
+
+  it('reads past a page that carried only other topics before deciding nothing is unread', async () => {
+    const s = await session({ plugin: new SharedRoomPlugin(), livePush: false });
+    await call(s.client, 'parley_fetch_recent', { topic: FOLLOWED });
+    for (let i = 0; i < 120; i++) await s.plugin.post(asTopic('elsewhere'), PEER, `noise ${i}`);
+    await s.plugin.post(asTopic(FOLLOWED), PEER, 'behind the noise');
+    expect(await call(s.client, 'parley_post', { topic: FOLLOWED, content: 'hi' })).toMatchObject({
+      posted: false,
+      unread: [{ content: 'behind the noise' }],
+    });
   });
 
   it('hands over the newest page of a topic the author has never read before its first post there', async () => {
@@ -205,7 +302,16 @@ describe('an agent can find out who it is and what the bridge can do', () => {
       mention_push: mentionPush,
       read_position: true,
       directory: 'agents are claude-code-<folder>',
+      mention_filter: false,
     });
+  });
+
+  it.each([
+    [false, 'one that names you reaches you'],
+    [true, 'Only messages that name you are pushed here.'],
+  ] as const)('tells the agent what live push carries with mention_filter=%s', async (mentionFilter, says) => {
+    const s = await session({ mentionFilter });
+    expect(s.client.getInstructions()).toContain(says);
   });
 
   it('names the instance and the directory in the server instructions', async () => {
@@ -221,4 +327,30 @@ describe('an agent can find out who it is and what the bridge can do', () => {
   ])('refuses a directory that would grant inbound text authority: %s', (directory) => {
     expect(() => parseConfig({ identity: { handle: ME }, topics: [FOLLOWED], directory })).toThrow(/directory/);
   });
+
+  it('refuses a handle that would break the boundary in the instructions it is shipped in', () => {
+    expect(() => parseConfig({ identity: { handle: 'trusted' }, topics: [FOLLOWED] })).toThrow(/identity\.handle/);
+  });
 });
+
+/**
+ * A backend whose history read is one shared room: a page carries the next rows after the cursor
+ * whatever their topic, so a page can hold nothing for the topic asked about and still move on.
+ */
+class SharedRoomPlugin extends FakePlugin {
+  private readonly log: Message[] = [];
+
+  override async post(topic: Topic, identity: Handle, content: string): Promise<BackendMsgId> {
+    const id = await super.post(topic, identity, content);
+    this.log.push(this.recorded(topic).find((m) => m.backendMsgId === id)!);
+    return id;
+  }
+
+  override async fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult> {
+    const since = args.since === undefined ? undefined : Number(args.since);
+    const limit = args.limit ?? 100;
+    const after = this.log.filter((m) => since === undefined || Number(m.cursor) > since);
+    const page = since === undefined ? after.slice(-limit) : after.slice(0, limit);
+    return { messages: page, nextCursor: page.at(-1)?.cursor ?? args.since ?? asCursor('0') };
+  }
+}

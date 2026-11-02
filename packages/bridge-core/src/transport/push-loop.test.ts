@@ -47,7 +47,7 @@ async function wired(opts: { mentionFilter: boolean; identity: string }) {
     mentionFilter: opts.mentionFilter,
     identity: asHandle(opts.identity),
     live: new LiveDeliveryLedger(allow.topics()),
-    own: new OwnPosts(),
+    own: new OwnPosts(), handed: new SeenSet(),
   });
   return { plugin, calls, seen };
 }
@@ -128,7 +128,7 @@ describe('startPushLoop (core emit handler)', () => {
         mentionFilter: false,
         identity: asHandle('agent'),
         live: new LiveDeliveryLedger([asTopic('ctx')]),
-        own: new OwnPosts(),
+        own: new OwnPosts(), handed: new SeenSet(),
       });
       const [clientT, serverT] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
@@ -205,7 +205,7 @@ describe('startPushLoop (core emit handler)', () => {
         mentionFilter: false,
         identity: asHandle('me'),
         live: new LiveDeliveryLedger(topics.map(asTopic)),
-        own: new OwnPosts(),
+        own: new OwnPosts(), handed: new SeenSet(),
       });
       return { plugin, subscribed, calls, start };
     }
@@ -257,7 +257,7 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
       plugin,
       new Allowlist(['ctx']),
       new SeenSet(),
-      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]), own: new OwnPosts() },
+      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]), own: new OwnPosts(), handed: new SeenSet() },
     );
     let seq = 0;
     return {

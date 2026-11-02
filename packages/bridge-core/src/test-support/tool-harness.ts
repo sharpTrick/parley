@@ -60,6 +60,7 @@ export function writePathDeps(allow: Allowlist): Pick<ToolDeps, 'own' | 'guardLi
       live_push: true,
       mention_push: 'subscribed-topics',
       read_position: true,
+      mention_filter: false,
     },
   };
 }
@@ -78,6 +79,7 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
     seen: new SeenSet(),
     live: new LiveDeliveryLedger(allow.topics()),
     readState: memoryReadState(),
+    handed: new SeenSet(),
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,
     ...writePathDeps(allow),

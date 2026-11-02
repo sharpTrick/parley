@@ -73,6 +73,7 @@ export class FakePlugin implements BackendPlugin {
     this.require();
     const seq = ++this.seq;
     const id = asBackendMsgId(String(seq));
+    const addressed = this.addressedIn(content);
     const msg: Message = {
       topic,
       senderHandle: identity,
@@ -81,7 +82,8 @@ export class FakePlugin implements BackendPlugin {
       timestamp: new Date(seq * 1000).toISOString(),
       backendMsgId: id,
       cursor: asCursor(String(seq)),
-      mentions: parseMentions(content),
+      mentions: [...new Set([...parseMentions(content), ...(addressed ?? [])])],
+      ...(addressed !== undefined ? { addressed } : {}),
     };
     this.rows.push({ seq, msg });
     for (const handler of this.subs.get(topic) ?? []) handler(msg);
@@ -108,6 +110,11 @@ export class FakePlugin implements BackendPlugin {
   async resolveIdentity(handle: Handle): Promise<BackendIdentity> {
     this.require();
     return { handle, backendRef: handle };
+  }
+
+  /** The handles a post explicitly addresses in this backend's own syntax; this one has none. */
+  protected addressedIn(_content: string): Handle[] | undefined {
+    return undefined;
   }
 
   /**
@@ -160,6 +167,16 @@ export class MentionFeedPlugin extends FakePlugin {
   override async disconnect(): Promise<void> {
     this.feeds.clear();
     await super.disconnect();
+  }
+}
+
+/**
+ * {@link MentionFeedPlugin} whose backend has an explicit address syntax, spelled `@**handle**` as
+ * Zulip's is, so a message can be addressed to someone rather than merely mention them.
+ */
+export class ExplicitAddressPlugin extends MentionFeedPlugin {
+  protected override addressedIn(content: string): Handle[] {
+    return [...content.matchAll(/@\*\*([^*]+)\*\*/g)].map((m) => m[1] as Handle);
   }
 }
 

@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fetch.js';
+import { MAX_CATCHUP_PAGES } from '../engine/catchup.js';
 import { liveEraStart } from '../engine/live-boundary.js';
 import { asBackendMsgId, asCursor, type BackendMsgId, type Cursor, type Message, type Topic } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
@@ -98,8 +99,9 @@ export const TOOL_TEXT = {
     'not been handed — by push or by a read — the post is NOT sent, and you get them back instead ' +
     'as { posted: false, unread, nextCursor }; read them, then send it again, revised or unchanged. ' +
     'A first post to a topic you have never read gets its newest page back first. Name someone with ' +
-    '@<handle> and the message is pushed only to those you name, not to every follower of the ' +
-    'topic — on any topic where the backend has a mention feed (parley_whoami says which). ' +
+    '@<handle> and it is pushed to them, from any topic where the backend has a mention feed ' +
+    '(parley_whoami says which). On a backend with its own address syntax (Zulip: @**handle**), ' +
+    'a message addressed that way reaches only those it addresses, not every follower of the topic. ' +
     'Say whether you need a reply ("Reply needed: …" or "No reply needed"). ' +
     'Returns { posted: true, backendMsgId }.',
   post_read_through:
@@ -208,9 +210,11 @@ function deliverPage(deps: ToolDeps, t: Topic, result: FetchRecentResult, read: 
     const stored = readState.get(t);
     if (read.resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
   }
+  const handed = deps.handed;
+  const fresh = handed === undefined ? kept : kept.filter((m) => !handed.has(t, m.backendMsgId));
+  for (const m of kept) handed?.markSeen(t, m.backendMsgId);
   const seen = deps.seen;
-  if (seen === undefined) return { kept, nextCursor, fresh: kept };
-  const fresh: Message[] = [];
+  if (seen === undefined) return { kept, nextCursor, fresh };
   // Only the post-subscribe tail is push's to deliver: a backlog this boot inherited reaches
   // the agent through here unseen whether or not the live path works.
   const liveFrom = liveEraStart(seen, t, read.args.since, kept, nextCursor);
@@ -218,40 +222,45 @@ function deliverPage(deps: ToolDeps, t: Topic, result: FetchRecentResult, read: 
     // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
     // thing that distinguishes a dead live path: a message reaching the agent that push never
     // delivered. Past `markSeen` every message looks delivered.
-    const unseen = !seen.has(t, m.backendMsgId);
-    if (unseen) fresh.push(m);
-    if (i >= liveFrom && unseen) deps.live.recordReconciled(t);
+    if (i >= liveFrom && !seen.has(t, m.backendMsgId)) deps.live.recordReconciled(t);
     seen.markSeen(t, m.backendMsgId);
   });
   return { kept, nextCursor, fresh };
 }
 
 /**
- * What arrived on `t` that the author of a post has not read, so the post can wait until they have.
- * The baseline is the cursor the author names, else this instance's read position — and a topic it
- * has never read has everything in its newest page unread. Everything it hands over is recorded as
- * read, so the same post sent again goes through. A bridge with neither a dedup window nor a named
- * cursor has nothing to compare against, and does not guard.
+ * What arrived on `t` that the author of a post has not been shown, so the post can wait until it
+ * has. The baseline is the cursor the author names, else this instance's read position — and a
+ * topic it has never read has everything in its newest page unread. It pages on while the cursor
+ * advances, since an empty page can still have unread messages behind it. Whatever it hands over
+ * is recorded as shown, so the same post sent again goes through. A bridge that records nothing as
+ * shown (the remote HTTP root) guards only a post that names its own baseline.
  */
 async function unreadBeforePost(
   deps: ToolDeps,
   t: Topic,
   readThrough: string | undefined,
 ): Promise<{ unread: Message[]; nextCursor: Cursor | undefined } | undefined> {
-  if (readThrough === undefined && deps.seen === undefined) return undefined;
-  const resumeFrom = readThrough !== undefined ? asCursor(readThrough) : deps.readState?.get(t);
-  const args: FetchRecentArgs = { topic: t, limit: deps.guardLimit };
-  if (resumeFrom !== undefined) args.since = resumeFrom;
-  let result: FetchRecentResult;
-  try {
-    result = await deps.plugin.fetchRecent(args);
-  } catch (e) {
-    if (isNoSuchTopicError(e)) return undefined;
-    throw e;
+  if (readThrough === undefined && deps.handed === undefined) return undefined;
+  await deps.own.settled();
+  let since = readThrough !== undefined ? asCursor(readThrough) : deps.readState?.get(t);
+  for (let page = 0; page < MAX_CATCHUP_PAGES; page++) {
+    const args: FetchRecentArgs = { topic: t, limit: deps.guardLimit };
+    if (since !== undefined) args.since = since;
+    let result: FetchRecentResult;
+    try {
+      result = await deps.plugin.fetchRecent(args);
+    } catch (e) {
+      if (isNoSuchTopicError(e)) return undefined;
+      throw e;
+    }
+    const read = deliverPage(deps, t, result, { args, resumeFrom: since, readsHead: false, limit: deps.guardLimit });
+    const unread = read.fresh.filter((m) => !deps.own.has(m.backendMsgId));
+    if (unread.length > 0) return { unread, nextCursor: read.nextCursor };
+    if (read.nextCursor === undefined || read.nextCursor === since) return undefined;
+    since = read.nextCursor;
   }
-  const page = deliverPage(deps, t, result, { args, resumeFrom, readsHead: false, limit: deps.guardLimit });
-  const unread = page.fresh.filter((m) => !deps.own.has(m.backendMsgId));
-  return unread.length > 0 ? { unread, nextCursor: page.nextCursor } : undefined;
+  return undefined;
 }
 
 type PostOutcome =

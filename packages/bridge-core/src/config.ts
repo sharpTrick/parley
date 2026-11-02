@@ -9,7 +9,7 @@ import {
   issueLines,
   messageOf,
 } from './config-diagnostics.js';
-import { INBOUND_TRUST_BOUNDARY, inboundTrustBreach } from './inbound-trust.js';
+import { instructionsBreach } from './transport/instructions.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
@@ -195,15 +195,17 @@ const StrictConfigObject = ConfigObject.strict();
  * The load-time config schema: {@link ConfigObject} plus the checks that need the whole object.
  */
 export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
-  if (cfg.directory !== undefined) {
-    const breach = inboundTrustBreach(`${cfg.directory} ${INBOUND_TRUST_BOUNDARY}`);
-    if (breach !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['directory'],
-        message: `directory is shipped into every session's instructions, and this text would break the untrusted-inbound boundary there (DESIGN §14): ${breach}`,
-      });
-    }
+  const breach = instructionsBreach({
+    handle: cfg.identity.handle,
+    ...(cfg.directory !== undefined ? { directory: cfg.directory } : {}),
+    mention_filter: cfg.live_push.mention_filter,
+  });
+  if (breach !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: cfg.directory !== undefined ? ['directory'] : ['identity', 'handle'],
+      message: `identity.handle and directory are shipped into every session's instructions, and as configured they would break the untrusted-inbound boundary there (DESIGN §14): ${breach}`,
+    });
   }
   cfg.post_topics.forEach((src, i) => {
     try {

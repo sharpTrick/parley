@@ -226,7 +226,10 @@ describe('public barrel surface', () => {
     FetchRecentResult: ['messages', 'nextCursor'],
     LiveDeliveryLedger: ['constructor', 'recordPush', 'recordReconciled', 'report'],
     LiveDeliveryPreconditions: ['dedupWindow', 'livePushEnabled', 'startCatchUp'],
-    Message: ['backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp', 'topic'],
+    Message: [
+      'addressed', 'backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp',
+      'topic',
+    ],
     NoSuchTopicError: ['constructor', 'name'],
     OAuthRemoteOptions: [
       'issuerUrl', 'mcpPath', 'now', 'scopesSupported', 'trustProxy', 'verifyOwner',
@@ -248,7 +251,7 @@ describe('public barrel surface', () => {
     ],
     ParleyOAuthProviderOptions: ['consentPath', 'now', 'resource', 'scopesSupported', 'verifyOwner'],
     ParseArgsOptions: ['bin', 'env', 'version'],
-    PushLoopOptions: ['identity', 'live', 'mentionFilter', 'own'],
+    PushLoopOptions: ['handed', 'identity', 'live', 'mentionFilter', 'own'],
     ReadStateStore: ['constructor', 'get', 'markWarmed', 'path', 'set', 'warmPath', 'warmedThrough'],
     RemoteAuthOptions: [
       'fetchFn', 'mcpPath', 'now', 'publicUrl', 'scopesSupported', 'trustProxy', 'verifyOwner',
@@ -258,8 +261,8 @@ describe('public barrel surface', () => {
     SeenSet: ['constructor', 'firstSeen', 'has', 'markSeen'],
     ShutdownHost: ['on', 'stdin'],
     ToolDeps: [
-      'allow', 'blockMaxMs', 'blockPollIntervalMs', 'guardLimit', 'identity', 'live', 'own',
-      'plugin', 'readState', 'seen', 'whoami',
+      'allow', 'blockMaxMs', 'blockPollIntervalMs', 'guardLimit', 'handed', 'identity', 'live',
+      'own', 'plugin', 'readState', 'seen', 'whoami',
     ],
     TopicNotAllowedError: ['constructor', 'name'],
     UnsafePatternError: ['constructor', 'name'],

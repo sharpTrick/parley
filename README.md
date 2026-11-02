@@ -13,7 +13,7 @@ Parley is an MCP server — the standard way Claude connects to outside tools �
 
 Put plainly, it lets you **share context between Claude chat and Claude Code**, **hand off a task to a coding agent** and get the result back, and keep **humans and agents in the same chat room** — running on a **self-hosted message bus for AI agents** that you operate.
 
-**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-three-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
+**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-five-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
 
 ---
 
@@ -160,7 +160,7 @@ Two delivery paths — one is the product, one is a preview. Stated once, here:
 
 ## How it works
 
-Three numbers: **10 backends**, each implementing the same **6 seam methods**; Claude itself calls just **3 MCP tools**.
+Three numbers: **10 backends**, each implementing the same **6 seam methods** (plus one optional mention feed, which Zulip offers); Claude itself calls just **5 MCP tools**.
 
 The *seam* is that one small interface every backend implements. All the hard, backend-independent logic — live push, catch-up, dedup, ordering, reply fan-out, OAuth mode — is written once above it in `@sharptrick/parley-core`. Dependencies point one way: a plugin depends on core, never the reverse.
 
@@ -227,12 +227,12 @@ Every backend clears the identical seam contract — cursor monotonicity, exclus
 
 ---
 
-## The three MCP tools
+## The five MCP tools
 
-Distinct from the six seam methods a backend implements, these are the 3 tools Claude actually calls:
+Distinct from the six seam methods a backend implements, these are the 5 tools Claude actually calls:
 
 - **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?, from?}` → `{messages, nextCursor}`. `from: "recent"` asks for the backend's newest page instead of resuming from where this instance last read, without moving that position. `block_ms` long-polls where the backend's own read primitive takes a wait, and is **refused by name** where it cannot — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
-- **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?, read_through?, force?}` → `{posted: true, backendMsgId}`. Read before you speak: if the topic has messages the author has not been handed, nothing is written and they come back as `{posted: false, unread, nextCursor}`; send it again once read. `@handle` in the content addresses the message: it is pushed only to the handles it names.
+- **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?, read_through?, force?}` → `{posted: true, backendMsgId}`. Read before you speak: if the topic has messages the author has not been handed, nothing is written and they come back as `{posted: false, unread, nextCursor}`; send it again once read. `@handle` in the content pushes it to that handle; a backend's own address syntax (Zulip's `@**handle**`) also keeps it from every follower it does not name.
 - **`parley_whoami`** — who this instance is and what its bridge can do: handle, followed and post-only topics, version, whether live push and mention push are on, and the operator's `directory` of how to reach the others.
 - **`parley_live_status`** — ask whether the live `<channel>` path is actually delivering, per topic, rather than reading a quiet topic as good news. `{}` → per-topic `delivering` / `not-delivering` / `no-traffic`, or a refusal naming why this deployment cannot tell.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.

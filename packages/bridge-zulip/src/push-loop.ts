@@ -18,16 +18,16 @@ const replacedDuringHandshake = (): Error =>
       'subscription exists on the connection this call addressed. Reissue it.',
   );
 
-/**
- * What one push loop listens to: one topic, or every topic in the stream for messages that mention
- * a handle — the seam's optional mention feed, placed by each message's own topic.
- */
 /** The topic a stream-wide queue's message was posted on; one it cannot place is not delivered. */
 const subjectOf = (m: ZulipMessage): string => {
   if (typeof m.subject !== 'string') throw new Error('Zulip message event carries no topic to place it on');
   return m.subject;
 };
 
+/**
+ * What one push loop listens to: one topic, or every topic in the stream for messages that mention
+ * a handle — the seam's optional mention feed, placed by each message's own topic.
+ */
 type PushScope = { topic: Topic } | { mentioning: Handle };
 
 export async function startPushLoop(

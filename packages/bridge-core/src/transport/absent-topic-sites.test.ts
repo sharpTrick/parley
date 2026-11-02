@@ -204,7 +204,7 @@ const SITES: Array<[name: string, run: (fail: () => never) => Promise<Outcome>]>
           failingOn('subscribe', fail),
           new Allowlist(['ctx']),
           new SeenSet(),
-          { mentionFilter: false, identity: asHandle('alice'), live: new LiveDeliveryLedger([]), own: new OwnPosts() },
+          { mentionFilter: false, identity: asHandle('alice'), live: new LiveDeliveryLedger([]), own: new OwnPosts(), handed: new SeenSet() },
         ),
       ),
   ],
@@ -213,6 +213,7 @@ const SITES: Array<[name: string, run: (fail: () => never) => Promise<Outcome>]>
     'parley_fetch_recent (long-poll)',
     (fail) => toolOutcome('parley_fetch_recent', { topic: 'ctx', since: '1', block_ms: 200 }, fail),
   ],
+  ['parley_post (read guard)', (fail) => toolOutcome('parley_post', { topic: 'ctx', content: 'x' }, fail)],
 ];
 
 describe('every absent-topic site recognises the sentinel by contract, not by class identity', () => {
@@ -819,10 +820,10 @@ describe('no production site in bridge-core recognises a sentinel by class ident
    * recognition nothing grades — which is the whole failure this file exists to prevent, arriving
    * by addition rather than by drift.
    */
-  const RECOGNISER_SITES: Record<string, string> = {
-    'engine/catchup.js': 'catchUpTopic',
-    'transport/push-loop.js': 'startPushLoop',
-    'transport/tools.js': 'parley_fetch_recent',
+  const RECOGNISER_SITES: Record<string, string[]> = {
+    'engine/catchup.js': ['catchUpTopic'],
+    'transport/push-loop.js': ['startPushLoop'],
+    'transport/tools.js': ['parley_fetch_recent', 'parley_post (read guard)'],
   };
 
   it('the emit walk reaches every module this package ships', () => {
@@ -834,7 +835,7 @@ describe('no production site in bridge-core recognises a sentinel by class ident
     expect(recogniserSites()).toEqual(Object.keys(RECOGNISER_SITES).sort());
     const siteNames = SITES.map(([name]) => name);
     expect(
-      Object.values(RECOGNISER_SITES).filter(
+      Object.values(RECOGNISER_SITES).flat().filter(
         (site) => !siteNames.some((name) => name.startsWith(site)),
       ),
       'a module calls a recogniser but the behavioural table above reaches it through no site',

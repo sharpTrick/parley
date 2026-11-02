@@ -45,6 +45,12 @@ export interface ToolDeps {
   live: LiveDeliveryLedger;
   /** What this bridge wrote: kept off the read guard, and shared with the push loop's echo check. */
   own: OwnPosts;
+  /**
+   * What the agent has been shown, by push or by a read — which a post's read guard holds unread
+   * messages against. Not the dedup window: on-start catch-up fills that with a backlog it shows
+   * nobody. Only the stdio bridge keeps one.
+   */
+  handed?: SeenSet;
   /** Page size of the read a post makes first, to find what its author has not seen. */
   guardLimit: number;
   /** What `parley_whoami` answers: fixed for the life of the bridge. */
@@ -70,6 +76,8 @@ export interface WhoAmI {
   read_position: boolean;
   /** Operator guidance on how to reach the other participants, when the deployment gives one. */
   directory?: string;
+  /** Whether live push carries only messages that name this handle. */
+  mention_filter: boolean;
 }
 
 /**
@@ -80,7 +88,7 @@ export interface WhoAmI {
 export function toolDepsFor(
   plugin: BackendPlugin,
   cfg: ParleyConfig,
-  extras?: { seen?: SeenSet; readState?: ToolDeps['readState'] },
+  extras?: { seen?: SeenSet; readState?: ToolDeps['readState']; handed?: SeenSet },
 ): ToolDeps {
   const allow = allowlistFor(cfg);
   const identity = asHandle(cfg.identity.handle);
@@ -93,6 +101,7 @@ export function toolDepsFor(
     blockPollIntervalMs: cfg.catchup.block_poll_interval_ms,
     seen: extras?.seen,
     readState: extras?.readState,
+    handed: extras?.handed,
     own: new OwnPosts(),
     guardLimit: cfg.catchup.limit,
     whoami: {
@@ -104,6 +113,7 @@ export function toolDepsFor(
       live_push: livePush,
       mention_push: !livePush ? 'off' : plugin.subscribeMentions !== undefined ? 'any-topic' : 'subscribed-topics',
       read_position: extras?.readState !== undefined,
+      mention_filter: cfg.live_push.mention_filter,
       ...(cfg.directory !== undefined ? { directory: cfg.directory } : {}),
     },
     live: new LiveDeliveryLedger(

@@ -6,7 +6,7 @@ backend dependencies** — plugins depend on this package, never the reverse (`C
 directive #1).
 
 This package is a library, not something you run directly. Install a backend plugin
-(`@sharptrick/parley-sqlite`, `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`, `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`) and build a
+(`@sharptrick/parley-sqlite`, `-postgres`, `-redis`, `-nats`, `-matrix`, `-xmpp`, `-zulip`, `-slack`, `-discord`, `-telegram`) and build a
 bridge with the exports below — see the [root README](../../README.md) for the end-to-end
 quickstart.
 
@@ -17,6 +17,7 @@ interface BackendPlugin {
   connect(config: BackendConfig): Promise<void>;
   disconnect(): Promise<void>;
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;                 // live path (push)
+  subscribeMentions?(handle: Handle, handler: MessageHandler): Promise<void>;      // OPTIONAL: mentions from any topic
   post(topic: Topic, identity: Handle, content: string, opts?: { inReplyTo?: BackendMsgId }): Promise<BackendMsgId>;
   fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult>;                  // catch-up
   resolveIdentity(handle: Handle): Promise<BackendIdentity>;
@@ -103,6 +104,7 @@ post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching 
                                 # listed in `topics`.
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
+directory: "each project's agent is claude-code-<folder>, at home on topic project-<folder>"  # optional
 backend_config:                 # opaque to core; passed verbatim to the plugin's connect()
   db_path: "./parley.db"
 ```
@@ -127,7 +129,7 @@ rather than a silent no-op.
 | `parley_post` | write (reactive) | `{ topic, content, in_reply_to?, read_through?, force? }` → `{ posted: true, backendMsgId }`, or `{ posted: false, reason, unread, nextCursor }` when the topic holds messages the author has not been handed — by push or by a read — in which case nothing is written and those messages are handed over instead, so the same post sent again goes through. The baseline is `read_through` (a cursor the author names) when given, else this instance's read position; a topic it has never read has its newest page unread. The author's own messages never count. A bridge with no dedup window (the remote HTTP root) guards only a post that names `read_through`. `force: true` skips the check. The chat side's only write path. |
 | `parley_live_status` | liveness (reactive) | `{}` → `{ decided, topics }` or `{ decided, blockedBy }`. Whether the live push path is actually DELIVERING, per subscribed topic: `delivering` once a message has reached the agent through push, `not-delivering` when messages that arrived on that topic since the bridge armed reached the agent only through `parley_fetch_recent`, `no-traffic` before either — the backlog from before the bridge armed counts toward neither. A bridge configured so the two cannot be compared — push disabled, no dedup window (the remote HTTP root), or no start catch-up — answers `decided: false` with the reasons rather than reporting a health it did not observe. Two known limits: once the agent reads from a position the bridge cannot place relative to where it armed — after a restart on a backend whose empty page mints a new cursor, after a `from: "recent"` read, or past a boundary message that was deleted — a dead path reads `no-traffic` rather than `not-delivering`; and a message posted between start catch-up and the subscription arming counts as live-era, so a healthy path can read `not-delivering` until its next push. |
 | `parley_reply` | write (channel) | `{ topic, content, in_reply_to?, read_through?, force? }` → the same answers as `parley_post`. Same durable write and the same read guard, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
-| `parley_whoami` | identity (reactive) | `{}` → `{ handle, instance_id, subscribed_topics, post_topics, version, live_push, mention_push, read_position, directory? }`. Who this instance is and what this bridge can do. `mention_push` is `any-topic` when the backend has a mention feed, `subscribed-topics` when mentions push only on followed topics, `off` without live push. `directory` is the operator's `directory` config: how to reach the other participants. |
+| `parley_whoami` | identity (reactive) | `{}` → `{ handle, instance_id, subscribed_topics, post_topics, version, live_push, mention_push, read_position, mention_filter, directory? }`. Who this instance is and what this bridge can do. `mention_push` is `any-topic` when the backend has a mention feed, `subscribed-topics` when mentions push only on followed topics, `off` without live push. `directory` is the operator's `directory` config: how to reach the other participants. |
 
 Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in
 `config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely

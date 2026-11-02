@@ -19,17 +19,20 @@ export interface PushLoopOptions {
   live: LiveDeliveryLedger;
   /** What this bridge wrote, so that none of it is pushed back to the agent that wrote it. */
   own: OwnPosts;
+  /** What the agent has been shown, which a post's read guard holds unread messages against. */
+  handed: SeenSet;
 }
+
 
 /**
  * Whether a message reaching this instance live is one its agent is shown (DESIGN §7). A message
- * that names anyone is addressed: it goes to the instances it names, on whatever topic, and to no
- * other follower of that topic. One that names nobody goes to everyone following the topic.
+ * naming this instance reaches it on whatever topic it arrived from — an address is always a
+ * mention too (seam.ts, `Message.addressed`). Otherwise only a followed topic's messages do, and not
+ * one the backend marks as explicitly addressed to someone else.
  */
 export function routesTo(m: Message, identity: Handle, opts: { followed: boolean; mentionFilter: boolean }): boolean {
-  const named = m.mentions.includes(identity);
-  if (named) return true;
-  return opts.followed && m.mentions.length === 0 && !opts.mentionFilter;
+  if (m.mentions.includes(identity)) return true;
+  return opts.followed && (m.addressed ?? []).length === 0 && !opts.mentionFilter;
 }
 
 /**
@@ -38,7 +41,8 @@ export function routesTo(m: Message, identity: Handle, opts: { followed: boolean
  * filtering lives:
  *   1. drop anything on a topic this instance may not read — subscribed, or (from the mention feed)
  *      allowed for post/fetch,
- *   2. record the delivery, so `parley_live_status` can answer whether this path carries anything,
+ *   2. record a delivery by a topic's own subscription, so `parley_live_status` can answer whether
+ *      that path carries anything — a mention feed reaching the same topic is no evidence it does,
  *   3. dedup on backendMsgId (so a message already pulled via catch-up isn't re-pushed),
  *   4. drop what this bridge wrote itself,
  *   5. route on mentions — a message naming anyone reaches only those it names — in CORE, not in
@@ -75,12 +79,15 @@ export async function startPushLoop(
     await opts.own.settled();
     if (opts.own.has(m.backendMsgId)) return;
     if (!routesTo(m, opts.identity, { followed, mentionFilter: opts.mentionFilter })) return;
+    opts.handed.markSeen(m.topic, m.backendMsgId);
     await emitChannel(server, m);
   };
   const handlerFor = (fromMentionFeed: boolean) => (m: Message): void => {
     const followed = subscribed.has(m.topic);
-    const readable = followed || (fromMentionFeed && allow.has(m.topic) && m.mentions.includes(opts.identity));
-    if (!readable) {
+    // A mention feed carries every topic by contract, so one outside the allowlist is expected
+    // there and dropped quietly; from a topic subscription it is the plugin over-delivering.
+    if (fromMentionFeed && !followed && !allow.has(m.topic)) return;
+    if (!followed && !fromMentionFeed) {
       if (!warned) {
         warned = true;
         console.error(
@@ -93,7 +100,7 @@ export async function startPushLoop(
     // Count the message the live path CARRIED, ahead of every gate that decides whether the agent
     // is shown it: a pull that reached it first, its own echo, and a mention addressed elsewhere are
     // not a dead push path.
-    if (followed) opts.live.recordPush(m.topic);
+    if (followed && !fromMentionFeed) opts.live.recordPush(m.topic);
     if (!seen.firstSeen(m.topic, m.backendMsgId)) return;
     queue = queue.then(() => route(m, followed)).catch(() => {
       // Best-effort: a dropped push is harmless; core reconciles via fetchRecent (§6).

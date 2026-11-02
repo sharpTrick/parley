@@ -51,7 +51,7 @@ describe('no fire-and-forget seam call escapes as an unhandled rejection', () =>
           mentionFilter: false,
           live: new LiveDeliveryLedger([]),
           identity: asHandle('agent'),
-          own: new OwnPosts(),
+          own: new OwnPosts(), handed: new SeenSet(),
         });
         await plugin.post(asTopic('ctx'), asHandle('bob'), 'hi');
         await vi.waitFor(() => expect(notifications).toBeGreaterThan(0));
