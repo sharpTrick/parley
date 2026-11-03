@@ -1,5 +1,6 @@
 import { buildMessage, type Handle, type Message, parseMentions, type Topic } from '@sharptrick/parley-core';
 import { bodyRetryAfter } from '@sharptrick/parley-net-util';
+import type { MemberLookup } from './members.js';
 
 /** The subset of a `GET /api/v1/users` member we read; `full_name` is set by that member. */
 export interface RealmMember {
@@ -90,10 +91,12 @@ export function asArray<T>(value: T[] | undefined): T[] {
  * reaches `Date#toISOString`, either of which throws, and a throw here escapes `fetchRecent` and
  * bricks catch-up on every subsequent start.
  */
-export function zulipToMessage(topic: Topic, m: ZulipMessage | undefined | null): Message | undefined {
+export function zulipToMessage(
+  topic: Topic, m: ZulipMessage | undefined | null, members: MemberLookup,
+): Message | undefined {
   if (m === undefined || m === null) return undefined;
   const id = zulipMessageId(m);
-  return id === undefined ? undefined : buildZulipMessage(topic, m, id);
+  return id === undefined ? undefined : buildZulipMessage(topic, m, id, members);
 }
 
 /**
@@ -110,7 +113,7 @@ export function zulipMessageId(m: ZulipMessage | undefined | null): number | und
   return id;
 }
 
-export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number): Message {
+export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number, members: MemberLookup): Message {
   const content = typeof m.content === 'string' ? m.content : '';
   return buildMessage({
     topic,
@@ -118,17 +121,16 @@ export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number): Me
     content,
     timestamp: isoTimestamp(m.timestamp),
     id: String(id),
-    addressed: zulipMentions(content),
+    addressed: zulipMentions(content, members),
   });
 }
 
 /**
  * Zulip's own mention syntax in a message's markdown source — `@**name**`, or `@**name|id**` as
  * the compose box writes it. A silent mention (`@_**name**`) notifies nobody, and the wildcards
- * address everyone on the topic, so neither names a participant. A name that is not a handle Parley
- * can parse (a human's "First Last") is no participant of Parley's either.
+ * address everyone on the topic, so neither names a participant.
  */
-const ZULIP_MENTION = /(?<![^\s'"(,:<])@\*\*([^*|\n]{1,100}?)(?:\|\d+)?\*\*/g;
+const ZULIP_MENTION = /(?<![^\s'"(,:<])@\*\*([^*|\n]{1,100}?)(?:\|(\d{1,15}))?\*\*/g;
 
 /**
  * The markdown Zulip renders without mentions: code fences, inline code and block quotes. Zulip
@@ -137,14 +139,38 @@ const ZULIP_MENTION = /(?<![^\s'"(,:<])@\*\*([^*|\n]{1,100}?)(?:\|\d+)?\*\*/g;
 const UNADDRESSABLE = [/^(```|~~~)[^\n]*\n[\s\S]*?(?:^\1[^\n]*$|(?![\s\S]))/gm, /`[^`\n]*`/g, /^[ \t]*>.*$/gm];
 const ZULIP_WILDCARDS = new Set(['all', 'everyone', 'stream', 'channel', 'topic']);
 
-function zulipMentions(content: string): Handle[] {
-  const out = new Set<Handle>();
+/**
+ * The mentions a record spells; none for a record whose content is not text. Keep it from throwing,
+ * so that one record it cannot read does not cost every message in the batch it is read with.
+ */
+export function mentionSpellings(m: ZulipMessage | undefined | null): ReturnType<typeof zulipMentionSpellings> {
+  try {
+    return typeof m?.content === 'string' ? zulipMentionSpellings(m.content) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The mentions a message's markdown spells, before anyone checks that they name a member. */
+export function zulipMentionSpellings(content: string): { name: string; id: number | undefined }[] {
   const addressable = UNADDRESSABLE.reduce((text, region) => text.replace(region, ' '), content);
-  for (const match of addressable.matchAll(ZULIP_MENTION)) {
-    const name = match[1]!;
-    if (ZULIP_WILDCARDS.has(name.toLowerCase())) continue;
-    const [handle] = parseMentions(`@${name}`);
-    if (handle === name) out.add(handle);
+  return [...addressable.matchAll(ZULIP_MENTION)]
+    .map((match) => ({ name: match[1]!, id: match[2] === undefined ? undefined : Number(match[2]) }))
+    .filter(({ name }) => !ZULIP_WILDCARDS.has(name.toLowerCase()));
+}
+
+/**
+ * The handles a message addresses: the members its mentions resolve to, as Zulip resolves them. A
+ * member whose name is not a handle Parley can parse (a human's "First Last") is no participant of
+ * Parley's.
+ */
+function zulipMentions(content: string, members: MemberLookup): Handle[] {
+  const out = new Set<Handle>();
+  for (const { name, id } of zulipMentionSpellings(content)) {
+    const member = members(name, id);
+    if (member === undefined) continue;
+    const [handle] = parseMentions(`@${member}`);
+    if (handle === member) out.add(handle);
   }
   return [...out];
 }

@@ -19,10 +19,12 @@
 import { asCursor, asTopic, type Cursor, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
 import { type ZulipMessage, zulipToMessage } from '../src/wire.js';
+import type { MemberLookup } from '../src/members.js';
 import { SERVER_CONSTRAINTS } from './fake-zulip.js';
 import { HAZARD_FIELDS as FIELDS, HAZARDS, rand, SENDER, sleep, useZulip } from './harness.js';
 
 const boot = useZulip();
+const NOBODY: MemberLookup = () => undefined;
 
 /** Everything above the seam relies on; a Message that fails any of these is not usable. */
 function expectWellFormed(m: Message): void {
@@ -67,7 +69,7 @@ describe('a hostile record shape never throws out of fetchRecent', () => {
    * EDGE: the shapes that put one there were the ones it excluded.
    */
   const UNNAMEABLE_IDS = HAZARDS.filter(
-    (h) => zulipToMessage(asTopic('probe'), { id: h.value } as ZulipMessage) === undefined,
+    (h) => zulipToMessage(asTopic('probe'), { id: h.value } as ZulipMessage, NOBODY) === undefined,
   );
 
   /** Usable history the unnameable record is buried in; index 0 is the OLDEST. */

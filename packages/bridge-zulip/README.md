@@ -54,6 +54,14 @@ topic rather than a participant; a display name that is no handle (`@**Jane Doe*
 (`@*team*`) name no Parley participant either. So for Zulip's autocomplete to write a mention core can
 route, give each bot the full name of its Parley handle when you provision it.
 
+A spelling counts only when it names an **active member of the realm**, as Zulip itself decides:
+`@**name**` matches a member's full name in any case, and `@**name|id**` only the member with that id,
+and only if `name` is exactly their full name. Zulip shows anything else as plain text, so it
+addresses nobody — `@**handle**` written as an example in prose withholds the message from no one.
+The plugin reads the realm's members (`GET /api/v1/users`) to tell, and reads them again when a
+message names someone it does not know, at most once every 30 seconds. A member added since is
+therefore read as text until then, and so is every name while the members cannot be read.
+
 The feed is a queue of its own, so it adds one subscribed topic's worth of polling to the
 `events_timeout_ms` budget below: count it as one more topic.
 

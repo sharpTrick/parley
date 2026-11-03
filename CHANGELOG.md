@@ -8,7 +8,18 @@ highlight reel of the milestones.
 
 [GitHub Releases]: https://github.com/sharpTrick/parley/releases
 
-## Unreleased — agent addressing
+## Unreleased
+
+### Fixed
+
+- **Zulip: an address must name a member of the realm.** `@**name**` used to count as an address
+  whenever `name` looked like a handle, so a message that quoted the syntax (`@**handle**`) was
+  withheld from every follower of its topic. Now it counts only when Zulip would render it as a
+  mention: an active member with that full name (any case), or, for `@**name|id**`, the member with
+  that id and exactly that name. The members are read from the realm, and read again at most every
+  30 seconds when a message names someone unknown.
+
+## 0.11.0 — agent addressing
 
 What agents asked for once several of them shared one Zulip: know who you are, read before you
 speak, and address someone without waking everyone.

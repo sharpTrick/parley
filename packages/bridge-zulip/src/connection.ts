@@ -2,7 +2,8 @@ import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import { resolveConfig, type ZulipConfig } from './config.js';
 import { TEARDOWN_TIMEOUT_MS, ZulipHttp } from './http.js';
-import { requireWireTopic } from './wire.js';
+import { RealmMembers } from './members.js';
+import { asArray, type RealmMember, requireWireTopic } from './wire.js';
 
 export interface QueueState {
   queueId: string;
@@ -23,6 +24,8 @@ export class ZulipConnection {
   generation = 0;
   cfg: ZulipConfig = resolveConfig({});
   rest = new ZulipHttp(this.cfg, () => this.stopped);
+  /** Who a mention can name on this connection's realm. */
+  members = this.membersOf(this.rest);
   /** Aborted by `disconnect`, so a loop's in-flight history read cannot outlive its subscription. */
   teardown = new AbortController();
   /** Push loops still running, awaited by `disconnect` so no handler can fire after it resolves. */
@@ -48,9 +51,17 @@ export class ZulipConnection {
    */
   private readonly pendingDeletes = new Set<Promise<void>>();
 
+  private membersOf(rest: ZulipHttp): RealmMembers {
+    return new RealmMembers(async () => {
+      const res = await rest.request('GET', '/api/v1/users', { signal: this.teardown.signal });
+      return asArray(((await res.json()) as { members?: RealmMember[] } | null)?.members);
+    });
+  }
+
   open(cfg: ZulipConfig): void {
     this.cfg = cfg;
     this.rest = new ZulipHttp(cfg, () => this.stopped);
+    this.members = this.membersOf(this.rest);
     this.claimedWireTopics.clear();
     this.generation++;
     this.teardown = new AbortController();

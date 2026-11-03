@@ -3,7 +3,7 @@ import {
 } from '@sharptrick/parley-core';
 import type { ZulipConnection } from './connection.js';
 import {
-  asArray, MAX_MESSAGES_PER_FETCH, pageAnchor, type ZulipMessage, zulipToMessage,
+  asArray, MAX_MESSAGES_PER_FETCH, mentionSpellings, pageAnchor, type ZulipMessage, zulipToMessage,
 } from './wire.js';
 
 /**
@@ -55,12 +55,14 @@ export async function readWindow(
     const res = await conn.rest.request('GET', '/api/v1/messages', { query, signal });
     const raw = asArray(((await res.json()) as { messages?: ZulipMessage[] } | null)?.messages);
     conn.assertGeneration(opts.generation);
+    await conn.members.learn(raw.flatMap(mentionSpellings));
+    conn.assertGeneration(opts.generation);
     const got: Message[] = []; // Zulip returns ascending by id
 
     let firstUsable = -1;
     let lastUsable = -1;
     for (const [i, record] of raw.entries()) {
-      const m = zulipToMessage(topic, record);
+      const m = zulipToMessage(topic, record, conn.members.lookup);
       if (m === undefined) continue;
       if (firstUsable < 0) firstUsable = i;
       lastUsable = i;
