@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Allowlist } from '../allowlist.js';
 import { parseConfig } from '../config.js';
 import { LiveDeliveryLedger } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asHandle } from '../message.js';
 import { registerTools, toolDepsFor, type ToolDeps } from '../transport/tools.js';
@@ -42,6 +43,28 @@ function productionDepKeys(): string[] {
   return Object.keys(toolDepsFor(new FakePlugin(), cfg, { seen: new SeenSet() }));
 }
 
+/**
+ * The dependencies the write path and `parley_whoami` need, for a suite that assembles the rest of
+ * its `ToolDeps` by hand around a plugin or allowlist of its own.
+ */
+export function writePathDeps(allow: Allowlist): Pick<ToolDeps, 'own' | 'guardLimit' | 'whoami'> {
+  return {
+    own: new OwnPosts(),
+    guardLimit: 100,
+    whoami: {
+      handle: asHandle('alice'),
+      instance_id: 'alice',
+      subscribed_topics: allow.topics(),
+      post_topics: allow.patterns(),
+      version: '0.0.0-test',
+      live_push: true,
+      mention_push: 'subscribed-topics',
+      read_position: true,
+      mention_filter: false,
+    },
+  };
+}
+
 export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHarness> {
   const plugin = (opts.plugin as FakePlugin | undefined) ?? new FakePlugin();
   await plugin.connect({});
@@ -56,8 +79,10 @@ export async function toolClient(opts: ToolHarnessOptions = {}): Promise<ToolHar
     seen: new SeenSet(),
     live: new LiveDeliveryLedger(allow.topics()),
     readState: memoryReadState(),
+    handed: new SeenSet(),
     blockMaxMs: 60_000,
     blockPollIntervalMs: 20,
+    ...writePathDeps(allow),
     ...Object.fromEntries(
       Object.entries(opts).filter(([k]) => k !== 'topics' && k !== 'postPatterns'),
     ),

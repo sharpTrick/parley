@@ -1,6 +1,7 @@
 import { availableParallelism } from 'node:os';
 import {
   asBackendMsgId,
+  asHandle,
   asCursor,
   assertBlockMsUnsupported,
   asTopic,
@@ -60,6 +61,8 @@ export interface ReferenceStore {
   seq: number;
   readonly log: Map<string, Message[]>;
   subscriptions: { topic: string; handler: MessageHandler; owner: object }[];
+  /** The mention feed: each handler hears what names its handle, on any topic. */
+  mentionFeeds: { handle: string; handler: MessageHandler; owner: object }[];
   /** Fired by every `post`, so a plugin built `blocking` can honour `blockMs` on a real wake. */
   writes: (() => void)[];
 }
@@ -68,6 +71,7 @@ export const newReferenceStore = (): ReferenceStore => ({
   seq: 0,
   log: new Map(),
   subscriptions: [],
+  mentionFeeds: [],
   writes: [],
 });
 
@@ -97,12 +101,18 @@ export class ReferencePlugin implements BackendPlugin {
   disconnect(): Promise<void> {
     this.connected = false;
     this.store.subscriptions = this.store.subscriptions.filter((s) => s.owner !== this);
+    this.store.mentionFeeds = this.store.mentionFeeds.filter((s) => s.owner !== this);
     return Promise.resolve();
   }
 
   async subscribe(topic: Topic, handler: MessageHandler): Promise<void> {
     this.require();
     this.store.subscriptions.push({ topic: String(topic), handler, owner: this });
+  }
+
+  async subscribeMentions(handle: Handle, handler: MessageHandler): Promise<void> {
+    this.require();
+    this.store.mentionFeeds.push({ handle: String(handle), handler, owner: this });
   }
 
   async post(
@@ -122,6 +132,8 @@ export class ReferencePlugin implements BackendPlugin {
     });
     this.store.log.set(String(topic), [...(this.store.log.get(String(topic)) ?? []), message]);
     for (const s of this.store.subscriptions) if (s.topic === String(topic)) safeDeliver(s.handler, () => message);
+    for (const s of this.store.mentionFeeds)
+      if (message.mentions.includes(asHandle(s.handle))) safeDeliver(s.handler, () => message);
     for (const wake of this.store.writes.splice(0)) wake();
     return asBackendMsgId(id);
   }
@@ -206,6 +218,7 @@ const delegate = (inner: ReferencePlugin): BackendPlugin => ({
   connect: (c) => inner.connect(c),
   disconnect: () => inner.disconnect(),
   subscribe: (t, h) => inner.subscribe(t, h),
+  subscribeMentions: (h, fn) => inner.subscribeMentions(h, fn),
   post: (t, i, c, o) => inner.post(t, i, c, o),
   fetchRecent: (a) => inner.fetchRecent(a),
   resolveIdentity: (h) => inner.resolveIdentity(h),
@@ -276,6 +289,16 @@ const STAMPED = 'reference-bot' as Handle;
  * authenticated account, which is what every hosted SaaS does and what Matrix's homeserver-stamped
  * `sender` amounts to. The weaker contract that arm buys is graded here rather than nowhere.
  */
+/**
+ * The arm every shipped backend but Zulip is on: no mention feed at all. Without it the suite's
+ * no-feed branch is satisfiable by nothing in this repo.
+ */
+export const makeNoMentionFeedReferenceContext = (): Promise<ConformanceContext> => {
+  const store = newReferenceStore();
+  const { subscribeMentions: _omitted, ...plugin } = delegate(new ReferencePlugin(store));
+  return context(plugin, store);
+};
+
 export const makeStampedSenderReferenceContext = (): Promise<ConformanceContext> => {
   const store = newReferenceStore();
   const inner = new ReferencePlugin(store);
@@ -1305,6 +1328,48 @@ export const BROKEN_VARIANTS: BrokenVariant[] = [
     mustFail: 'either round-trips',
     blastRadius: 6,
     make: () => wrap(() => ({}), { refusesContentShapes: CONTENT_SHAPES.map(([label]) => label) }),
+  },
+  {
+    // A feed that is really a firehose: everything on every topic, so an addressed message reaches
+    // every instance with the feed and the routing it exists for never happens.
+    name: 'a mention feed that also hands over what names nobody',
+    mutates: 'subscribeMentions',
+    mustFail: 'delivers what names the handle from any topic',
+    make: () => {
+      const feeds: MessageHandler[] = [];
+      return wrap((inner, store) => ({
+        subscribeMentions: async (handle, handler) => {
+          feeds.push(handler);
+          await inner.subscribeMentions(handle, handler);
+        },
+        post: async (topic, identity, content, opts) => {
+          const id = await inner.post(topic, identity, content, opts);
+          const message = store.log.get(String(topic))!.at(-1)!;
+          if (message.mentions.length === 0) for (const handler of feeds) handler(message);
+          return id;
+        },
+      }));
+    },
+  },
+  {
+    // An address the feed cannot deliver by: the message is addressed to a handle it never mentions,
+    // so it is withheld from every follower it does not name and reaches its addressee by no feed.
+    name: 'a message addressed to a handle it does not mention',
+    mutates: 'addressed-within-mentions',
+    mustFail: 'delivers what names the handle from any topic',
+    make: () =>
+      wrap((inner) => ({
+        subscribeMentions: (handle, handler) =>
+          inner.subscribeMentions(handle, (m) => handler({ ...m, addressed: [...(m.addressed ?? []), asHandle('ghost')] })),
+      })),
+  },
+  {
+    // The feed a backend advertises and never wires: the agent is told mentions reach it anywhere,
+    // and a mention on a topic it does not follow reaches it only when it next reads that topic.
+    name: 'a mention feed that resolves and delivers nothing',
+    mutates: 'subscribeMentions',
+    mustFail: 'delivers what names the handle from any topic',
+    make: () => wrap(() => ({ subscribeMentions: async () => undefined })),
   },
   {
     // The defect the contract exists to forbid, and the only one a DECLARATION could never catch:

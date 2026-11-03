@@ -214,6 +214,7 @@ function prompt(target) {
     return [
       baseCheck(target.key, base),
       `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write the orchestrator's own checkout.`,
+      `Scratch files — the backup a mutate-and-restore cycle copies a file to, helper scripts, logs — go ONLY inside your worktree or under /tmp/careening/${target.key}-scratch/. NEVER a fixed name directly in /tmp such as /tmp/mut.bak: other agents on this machine, including other projects' sessions, pick the same obvious names, and in round 3 of the 2026-11-01 run a restore from a collided /tmp/mut.bak wrote one project's Kotlin into another project's file and left every mutation verdict from that window meaningless.`,
       target.brief,
       `Review the tree AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round."`,
       `Read CLAUDE.md and DESIGN.md first for the invariants.`,
@@ -227,6 +228,7 @@ function prompt(target) {
   return [
     baseCheck(target.key, base),
     `Work ONLY inside your own git worktree: ${WORKTREES}/${target.key} — cd there first. It is pinned to this round's base commit and is yours alone, so you may freely edit, mutate and break things; nobody merges from it and it is deleted after the round. Do NOT read or write the orchestrator's own checkout.`,
+      `Scratch files — the backup a mutate-and-restore cycle copies a file to, helper scripts, logs — go ONLY inside your worktree or under /tmp/careening/${target.key}-scratch/. NEVER a fixed name directly in /tmp such as /tmp/mut.bak: other agents on this machine, including other projects' sessions, pick the same obvious names, and in round 3 of the 2026-11-01 run a restore from a collided /tmp/mut.bak wrote one project's Kotlin into another project's file and left every mutation verdict from that window meaningless.`,
     `Full-surface adversarial review of the Parley package at: ${target.path}.`,
     `Review the WHOLE target AS IT STANDS NOW — NOT a diff, and NOT "only what changed since the last round." A diff-scoped review hides everything the current anchors sit on top of.`,
     `Carry ALL ELEVEN lenses yourself (docs/REVIEW_PROTOCOL.md): correctness, concurrency-and-failure, security, seam-integrity, design-principles, protocol-conformance, test-integrity, truth-in-docs, operability-and-release, maintainability, test-hygiene. Tag every finding with the lens that produced it — that tag is a measurement.`,

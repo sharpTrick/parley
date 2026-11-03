@@ -301,10 +301,14 @@ describe('slack memoized async singletons', () => {
 });
 
 /**
- * The seam MINUS its lifecycle pair, typed off `BackendPlugin`, so a seventh seam method fails this
- * file to compile until it is driven here too.
+ * The seam's REQUIRED methods minus its lifecycle pair, typed off `BackendPlugin`, so a new required
+ * seam method fails this file to compile until it is driven here too. An optional one is driven only
+ * by the backends that implement it.
  */
-type Driven = Exclude<keyof BackendPlugin, 'connect' | 'disconnect'>;
+type RequiredSeam = {
+  [K in keyof BackendPlugin]-?: object extends Pick<BackendPlugin, K> ? never : K;
+}[keyof BackendPlugin];
+type Driven = Exclude<RequiredSeam, 'connect' | 'disconnect'>;
 
 const DRIVE: Record<Driven, (plugin: SlackPlugin, topic: Topic) => Promise<unknown>> = {
   subscribe: (plugin, topic) => plugin.subscribe(topic, () => undefined),

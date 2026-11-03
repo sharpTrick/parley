@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Allowlist } from '../allowlist.js';
 import { catchUpTopic } from '../engine/catchup.js';
 import { LiveDeliveryLedger } from '../engine/live-delivery.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import type { ReadStateStore } from '../engine/read-state.js';
 import { SeenSet } from '../engine/seen-set.js';
 import { asBackendMsgId, asCursor, asHandle, asTopic, type Message, type Topic } from '../message.js';
@@ -12,6 +13,7 @@ import { NoSuchTopicError } from '../no-such-topic.js';
 import type { BackendPlugin, MessageHandler } from '../seam.js';
 import { FakePlugin } from '../test-support/fake-plugin.js';
 import { memoryReadState } from '../test-support/nonconformant.js';
+import { writePathDeps } from '../test-support/tool-harness.js';
 import { CHANNEL_NOTIFICATION_METHOD } from './channel-emit.js';
 import { startPushLoop } from './push-loop.js';
 import { registerTools } from './tools.js';
@@ -45,9 +47,33 @@ async function wired(opts: { mentionFilter: boolean; identity: string }) {
     mentionFilter: opts.mentionFilter,
     identity: asHandle(opts.identity),
     live: new LiveDeliveryLedger(allow.topics()),
+    own: new OwnPosts(), handed: new SeenSet(),
   });
   return { plugin, calls, seen };
 }
+
+describe('what push records as shown to the agent', () => {
+  it.each([
+    ['a push the transport sends', () => Promise.resolve(), true],
+    ['a push the transport fails to send', () => Promise.reject(new Error('transport closed')), false],
+  ] as const)('%s is recorded as shown: %s', async (_label, notify, shown) => {
+    const plugin = new FakePlugin();
+    await plugin.connect({});
+    const server = { server: { notification: vi.fn(notify) } } as unknown as McpServer;
+    const handed = new SeenSet();
+    await startPushLoop(server, plugin, new Allowlist(['ctx']), new SeenSet(), {
+      mentionFilter: false,
+      identity: asHandle('me'),
+      live: new LiveDeliveryLedger([asTopic('ctx')]),
+      own: new OwnPosts(),
+      handed,
+    });
+    const id = await plugin.post(asTopic('ctx'), asHandle('bob'), 'hi');
+    await vi.waitFor(() => expect(server.server.notification).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(handed.has(asTopic('ctx'), id)).toBe(shown);
+  });
+});
 
 describe('startPushLoop (core emit handler)', () => {
   it('emits a channel notification for a new message', async () => {
@@ -118,12 +144,14 @@ describe('startPushLoop (core emit handler)', () => {
         blockMaxMs: 1_000,
         blockPollIntervalMs: 20,
         live: new LiveDeliveryLedger([asTopic('ctx')]),
+        ...writePathDeps(new Allowlist(['ctx'])),
       });
       const emits = vi.spyOn(server.server, 'notification').mockResolvedValue(undefined);
       await startPushLoop(server, plugin, new Allowlist(['ctx']), seen, {
         mentionFilter: false,
         identity: asHandle('agent'),
         live: new LiveDeliveryLedger([asTopic('ctx')]),
+        own: new OwnPosts(), handed: new SeenSet(),
       });
       const [clientT, serverT] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: 'test', version: '0.0.0' }, { capabilities: {} });
@@ -200,6 +228,7 @@ describe('startPushLoop (core emit handler)', () => {
         mentionFilter: false,
         identity: asHandle('me'),
         live: new LiveDeliveryLedger(topics.map(asTopic)),
+        own: new OwnPosts(), handed: new SeenSet(),
       });
       return { plugin, subscribed, calls, start };
     }
@@ -251,7 +280,7 @@ describe('a plugin that over-delivers cannot put an unsubscribed topic into the 
       plugin,
       new Allowlist(['ctx']),
       new SeenSet(),
-      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]) },
+      { mentionFilter: false, identity: asHandle('me'), live: new LiveDeliveryLedger([asTopic('ctx')]), own: new OwnPosts(), handed: new SeenSet() },
     );
     let seq = 0;
     return {

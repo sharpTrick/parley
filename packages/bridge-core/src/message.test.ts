@@ -79,4 +79,19 @@ describe('buildMessage', () => {
     });
     expect(m.mentions).toEqual([asHandle('bob'), asHandle('carol')]);
   });
+
+  it.each([
+    ['an address the content also mentions', 'ping @bob', ['bob'], ['bob'], ['bob']],
+    ['an address the plain parse cannot see', 'ping @**bob**', ['bob'], ['bob'], ['bob']],
+    ['an address beside a plain mention', 'ping @carol', ['bob'], ['carol', 'bob'], ['bob']],
+    ['no addresses', 'ping @carol', [], ['carol'], []],
+  ])('keeps every address among the mentions: %s', (_label, content, addressed, mentions, kept) => {
+    const m = buildMessage({ topic: asTopic('t'), sender: 'alice', content, timestamp: 'ts', id: '1', addressed });
+    expect([m.mentions, m.addressed]).toEqual([mentions.map(asHandle), kept.map(asHandle)]);
+  });
+
+  it('leaves `addressed` off a message whose backend cannot tell an address', () => {
+    const m = buildMessage({ topic: asTopic('t'), sender: 'alice', content: 'ping @bob', timestamp: 'ts', id: '1' });
+    expect('addressed' in m).toBe(false);
+  });
 });

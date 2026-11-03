@@ -9,6 +9,7 @@ import {
   issueLines,
   messageOf,
 } from './config-diagnostics.js';
+import { instructionsBreach } from './transport/instructions.js';
 import { isMentionableHandle } from './mentions.js';
 import { isRedosSafeSource } from './regex-safety.js';
 import { MAX_TIMER_MS } from './timer-bounds.js';
@@ -40,6 +41,9 @@ export const MAX_HANDLE_LEN = 128;
  * turns the long-poll into the client-side timeout the field exists to stay under.
  */
 export const MAX_BLOCK_MS = 300_000;
+
+/** `directory` is sent to the model in every session's instructions, so it is kept to a paragraph. */
+export const MAX_DIRECTORY_LEN = 1_000;
 
 /** One `topics` / `post_topics` entry. */
 const topicString = z.string().min(1).max(MAX_TOPIC_LEN, {
@@ -88,6 +92,16 @@ const ConfigObject = z.object({
    * however well a pattern matches it, and has to be listed in `topics` to be reachable at all.
    */
   post_topics: z.array(topicString).max(MAX_POST_TOPICS).default([]),
+  /**
+   * How an agent reaches the other participants in this deployment — e.g. "each project's agent is
+   * claude-code-<folder>, at home on topic project-<folder>". Shown in the server instructions and
+   * by `parley_whoami`. Operator text: it reaches the model as guidance, unlike inbound messages.
+   */
+  directory: z
+    .string()
+    .min(1)
+    .max(MAX_DIRECTORY_LEN, { message: `directory accepts at most ${MAX_DIRECTORY_LEN} characters` })
+    .optional(),
   catchup: z
     .object({
       on_start: z.boolean().default(true),
@@ -181,6 +195,16 @@ const StrictConfigObject = ConfigObject.strict();
  * The load-time config schema: {@link ConfigObject} plus the checks that need the whole object.
  */
 export const ConfigSchema = StrictConfigObject.superRefine((cfg, ctx) => {
+  if (cfg.directory !== undefined) {
+    const breach = instructionsBreach({ directory: cfg.directory, mention_filter: cfg.live_push.mention_filter });
+    if (breach !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['directory'],
+        message: `directory is shipped into every session's instructions, and this text would break the untrusted-inbound boundary there (DESIGN §14): ${breach}`,
+      });
+    }
+  }
   cfg.post_topics.forEach((src, i) => {
     try {
       new RegExp(src);

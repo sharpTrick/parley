@@ -1,12 +1,12 @@
 import {
   asBackendMsgId,
   asCursor,
+  buildMessage,
   type BackendMsgId,
   type Handle,
   type Message,
   type Topic,
 } from '../message.js';
-import { parseMentions } from '../mentions.js';
 import type {
   BackendConfig,
   BackendIdentity,
@@ -73,16 +73,16 @@ export class FakePlugin implements BackendPlugin {
     this.require();
     const seq = ++this.seq;
     const id = asBackendMsgId(String(seq));
-    const msg: Message = {
+    const addressed = this.addressedIn(content);
+    const msg: Message = buildMessage({
       topic,
-      senderHandle: identity,
+      sender: identity,
       content,
       // Deterministic; timestamp is informational only and never used for order/dedup.
       timestamp: new Date(seq * 1000).toISOString(),
-      backendMsgId: id,
-      cursor: asCursor(String(seq)),
-      mentions: parseMentions(content),
-    };
+      id: String(seq),
+      ...(addressed !== undefined ? { addressed } : {}),
+    });
     this.rows.push({ seq, msg });
     for (const handler of this.subs.get(topic) ?? []) handler(msg);
     return id;
@@ -110,6 +110,11 @@ export class FakePlugin implements BackendPlugin {
     return { handle, backendRef: handle };
   }
 
+  /** The handles a post explicitly addresses in this backend's own syntax; this one has none. */
+  protected addressedIn(_content: string): Handle[] | undefined {
+    return undefined;
+  }
+
   /**
    * Out-of-band inspection of what was durably recorded, answerable while disconnected because it
    * is not a seam call. A test that wants to know what a torn-down bridge managed to post reads
@@ -124,6 +129,52 @@ export class FakePlugin implements BackendPlugin {
 
   protected require(): void {
     if (!this.connected) throw new Error('fake plugin is disconnected');
+  }
+}
+
+/**
+ * {@link FakePlugin} with the seam's optional mention feed: a post that mentions a handle reaches
+ * that handle's feed whatever topic it is on — before the post's own id comes back, as the topic
+ * subscriptions already do, so an echo of the bridge's own write races that write.
+ */
+export class MentionFeedPlugin extends FakePlugin {
+  private readonly feeds = new Map<Handle, Set<MessageHandler>>();
+
+  async subscribeMentions(handle: Handle, handler: MessageHandler): Promise<void> {
+    this.require();
+    let set = this.feeds.get(handle);
+    if (set === undefined) {
+      set = new Set<MessageHandler>();
+      this.feeds.set(handle, set);
+    }
+    set.add(handler);
+  }
+
+  override async post(
+    topic: Topic,
+    identity: Handle,
+    content: string,
+    opts?: { inReplyTo?: BackendMsgId },
+  ): Promise<BackendMsgId> {
+    const id = await super.post(topic, identity, content, opts);
+    const msg = this.recorded(topic).find((m) => m.backendMsgId === id)!;
+    for (const handle of msg.mentions) for (const handler of this.feeds.get(handle) ?? []) handler(msg);
+    return id;
+  }
+
+  override async disconnect(): Promise<void> {
+    this.feeds.clear();
+    await super.disconnect();
+  }
+}
+
+/**
+ * {@link MentionFeedPlugin} whose backend has an explicit address syntax, spelled `@**handle**` as
+ * Zulip's is, so a message can be addressed to someone rather than merely mention them.
+ */
+export class ExplicitAddressPlugin extends MentionFeedPlugin {
+  protected override addressedIn(content: string): Handle[] {
+    return [...content.matchAll(/@\*\*([^*]+)\*\*/g)].map((m) => m[1] as Handle);
   }
 }
 

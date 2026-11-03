@@ -4,23 +4,11 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express, { type Express, type RequestHandler } from 'express';
 import { errorDigest, hardenErrorSurface } from '../auth/error-surface.js';
 import type { ParleyConfig } from '../config.js';
-import { withInboundTrustBoundary } from '../inbound-trust.js';
+import { OwnPosts } from '../engine/own-posts.js';
 import type { BackendPlugin } from '../seam.js';
 import { CORE_VERSION } from '../version.js';
+import { serverInstructions } from './instructions.js';
 import { registerTools, toolDepsFor, type ToolDeps } from './tools.js';
-
-/**
- * What a reactive-only client is told before the untrusted-inbound boundary
- * {@link withInboundTrustBoundary} appends to it. This root serves the chat front door, which reads
- * backend history into a conversation and so needs the boundary as much as the channel does.
- */
-const REACTIVE_INSTRUCTIONS_BODY = [
-  'Parley: a shared, topic-organized message backend. To catch up on a topic, call',
-  'parley_fetch_recent (on session start for each topic you work in, then on demand). To answer a',
-  'message, call parley_reply with the same `topic`. To publish or hand off, call parley_post.',
-  'This root receives no live push at all; parley_live_status says so rather than reporting a',
-  'health it cannot observe.',
-];
 
 /**
  * Build a REACTIVE-ONLY MCP server (DESIGN §8/§10 remote mode): the post / fetchRecent / reply
@@ -32,9 +20,11 @@ const REACTIVE_INSTRUCTIONS_BODY = [
 export function buildReactiveServer(deps: ToolDeps): McpServer {
   const server = new McpServer(
     { name: 'parley', version: CORE_VERSION },
-    { capabilities: { tools: {} }, instructions: withInboundTrustBoundary(REACTIVE_INSTRUCTIONS_BODY) },
+    { capabilities: { tools: {} }, instructions: serverInstructions('reactive', deps.whoami) },
   );
-  registerTools(server, deps);
+  // Keep the write ledger per request: every chat client on the port shares `deps`, and one
+  // client's post must never be taken for another's own.
+  registerTools(server, { ...deps, own: new OwnPosts() });
   return server;
 }
 

@@ -50,7 +50,7 @@ describe('public barrel surface', () => {
     'MAX_NAMED_FRAGMENT', 'MAX_TIMER_MS', 'MAX_TOPIC_LEN', 'MIN_HASH_LEN', 'Message',
     'MessageHandler', 'NoSuchTopicError', 'OAuthRemoteOptions', 'OAuthRemoteServer',
     'OidcAuthConfig', 'OidcAuthSchema', 'OidcRemoteOptions', 'OidcRemoteServer',
-    'OidcTokenVerifier', 'OidcVerifierOptions', 'ParleyBridge', 'ParleyConfig',
+    'OidcTokenVerifier', 'OidcVerifierOptions', 'OwnPosts', 'ParleyBridge', 'ParleyConfig',
     'ParleyOAuthProvider', 'ParleyOAuthProviderOptions', 'ParseArgsOptions', 'ParsedArgs',
     'PushLoopOptions', 'ReadStateStore', 'RemoteAuthOptions', 'RemoteAuthServer',
     'RemoteHttpOptions', 'RemoteHttpServer', 'SeenSet', 'ShutdownHost', 'TOOL_TEXT', 'ToolDeps',
@@ -214,9 +214,10 @@ describe('public barrel surface', () => {
     BackendIdentity: ['backendRef', 'handle'],
     BackendPlugin: [
       'connect', 'disconnect', 'fetchRecent', 'post', 'resolveIdentity', 'subscribe',
+      'subscribeMentions',
     ],
     BlockingFetchOptions: ['blockMs', 'now', 'pollIntervalMs', 'signal', 'sleep'],
-    BuildMessageInput: ['content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
+    BuildMessageInput: ['addressed', 'content', 'cursor', 'id', 'sender', 'timestamp', 'topic'],
     CatchUpArgs: ['limit', 'plugin', 'readState', 'seen', 'topic'],
     ConsentError: ['constructor', 'name'],
     BlockingFetchUnsupportedError: ['constructor', 'name'],
@@ -225,7 +226,10 @@ describe('public barrel surface', () => {
     FetchRecentResult: ['messages', 'nextCursor'],
     LiveDeliveryLedger: ['constructor', 'recordPush', 'recordReconciled', 'report'],
     LiveDeliveryPreconditions: ['dedupWindow', 'livePushEnabled', 'startCatchUp'],
-    Message: ['backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp', 'topic'],
+    Message: [
+      'addressed', 'backendMsgId', 'content', 'cursor', 'mentions', 'senderHandle', 'timestamp',
+      'topic',
+    ],
     NoSuchTopicError: ['constructor', 'name'],
     OAuthRemoteOptions: [
       'issuerUrl', 'mcpPath', 'now', 'scopesSupported', 'trustProxy', 'verifyOwner',
@@ -238,6 +242,7 @@ describe('public barrel surface', () => {
       'allowedSubjects', 'allowedUsernames', 'audience', 'clockSkewS', 'issuer', 'jwksUri', 'now',
       'requiredRole', 'requiredScope',
     ],
+    OwnPosts: ['has', 'settled', 'track'],
     ParleyBridge: ['attach', 'server', 'shutdown'],
     ParleyOAuthProvider: [
       'authorize', 'challengeForAuthorizationCode', 'clientsStore', 'completeConsent',
@@ -246,7 +251,7 @@ describe('public barrel surface', () => {
     ],
     ParleyOAuthProviderOptions: ['consentPath', 'now', 'resource', 'scopesSupported', 'verifyOwner'],
     ParseArgsOptions: ['bin', 'env', 'version'],
-    PushLoopOptions: ['identity', 'live', 'mentionFilter'],
+    PushLoopOptions: ['handed', 'identity', 'live', 'mentionFilter', 'own'],
     ReadStateStore: ['constructor', 'get', 'markWarmed', 'path', 'set', 'warmPath', 'warmedThrough'],
     RemoteAuthOptions: [
       'fetchFn', 'mcpPath', 'now', 'publicUrl', 'scopesSupported', 'trustProxy', 'verifyOwner',
@@ -256,8 +261,8 @@ describe('public barrel surface', () => {
     SeenSet: ['constructor', 'firstSeen', 'has', 'markSeen'],
     ShutdownHost: ['on', 'stdin'],
     ToolDeps: [
-      'allow', 'blockMaxMs', 'blockPollIntervalMs', 'identity', 'live', 'plugin', 'readState',
-      'seen',
+      'allow', 'blockMaxMs', 'blockPollIntervalMs', 'guardLimit', 'handed', 'identity', 'live',
+      'own', 'plugin', 'readState', 'seen', 'whoami',
     ],
     TopicNotAllowedError: ['constructor', 'name'],
     UnsafePatternError: ['constructor', 'name'],

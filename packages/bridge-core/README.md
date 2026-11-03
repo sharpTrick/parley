@@ -6,7 +6,7 @@ backend dependencies** — plugins depend on this package, never the reverse (`C
 directive #1).
 
 This package is a library, not something you run directly. Install a backend plugin
-(`@sharptrick/parley-sqlite`, `@sharptrick/parley-redis`, `@sharptrick/parley-matrix`, `@sharptrick/parley-xmpp`, `@sharptrick/parley-nats`) and build a
+(`@sharptrick/parley-sqlite`, `-postgres`, `-redis`, `-nats`, `-matrix`, `-xmpp`, `-zulip`, `-slack`, `-discord`, `-telegram`) and build a
 bridge with the exports below — see the [root README](../../README.md) for the end-to-end
 quickstart.
 
@@ -17,6 +17,7 @@ interface BackendPlugin {
   connect(config: BackendConfig): Promise<void>;
   disconnect(): Promise<void>;
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;                 // live path (push)
+  subscribeMentions?(handle: Handle, handler: MessageHandler): Promise<void>;      // OPTIONAL: mentions from any topic
   post(topic: Topic, identity: Handle, content: string, opts?: { inReplyTo?: BackendMsgId }): Promise<BackendMsgId>;
   fetchRecent(args: FetchRecentArgs): Promise<FetchRecentResult>;                  // catch-up
   resolveIdentity(handle: Handle): Promise<BackendIdentity>;
@@ -83,7 +84,7 @@ byte-stable across calls. `timestamp` is informational only; ordering and dedup 
 | Config | `ConfigSchema`, `parseConfig`, `loadConfig`, `instanceIdOf` | Validates `parley.config.yaml`. |
 | Allowlist | `Allowlist`, `TopicNotAllowedError` | `config.topics` **is** the allowlist — no wildcard default. |
 | Engine | `SeenSet`, `ReadStateStore`, `catchUpTopic` / `catchUpAll` | Dedup set, per-instance read-cursor persistence, catch-up orchestration. |
-| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_live_status` MCP tools. |
+| Reactive tools | `registerTools`, `toolDepsFor` | `parley_fetch_recent` / `parley_post` / `parley_reply` / `parley_live_status` / `parley_whoami` MCP tools. |
 | Live push | `emitChannel`, `channelMeta`, `startPushLoop` | Emits `claude/channel` `<channel>` notifications to already-running Code sessions. |
 | Local bridge | `buildBridge`, `createStdioBridge` | Composes plugin + tools + push loop into one stdio MCP server. |
 | Remote bridge (v0.2) | `buildReactiveServer`, `createRemoteHttpApp`, `createOAuthRemoteApp` | Streamable-HTTP transport + single-tenant OAuth 2.1 + PKCE front door. |
@@ -103,6 +104,7 @@ post_topics: ["ops-.*"]         # optional: WIDENS post/fetch to fully-matching 
                                 # listed in `topics`.
 catchup: { on_start: true, limit: 100, block_max_ms: 60000, block_poll_interval_ms: 250 }
 live_push: { enabled: true, mention_filter: false }
+directory: "each project's agent is claude-code-<folder>, at home on topic project-<folder>"  # optional
 backend_config:                 # opaque to core; passed verbatim to the plugin's connect()
   db_path: "./parley.db"
 ```
@@ -124,9 +126,10 @@ rather than a silent no-op.
 | Tool | Role | Effect |
 |---|---|---|
 | `parley_fetch_recent` | catch-up (reactive) | `{ topic, since?, limit?, block_ms?, from? }` → `{ messages, nextCursor }`, plus `topicAbsent: true` when the topic does not exist on the backend yet. With NO `since` it resumes from this instance's persisted read position, so a session that was down comes back to the oldest message it has not seen and pages forward from there; `from: "recent"` asks for the backend's newest page instead of resuming — what is happening now rather than a month of paging forward to reach it — and leaves the stored position alone, so the backlog it skipped is still reachable; with no position to resume from — the remote HTTP root keeps none, and a first-ever read of a topic has none yet — it answers with the backend's recent window, and nothing older than that window is reachable from it. The position advances only on a read that actually resumed from it, so a `since` the caller chose is read from but never drags the position over messages the agent was not handed. `block_ms` long-polls an empty window; it and `limit` are clamped server-side. It is advertised on every deployment; a backend with no read primitive to park on rejects a **positive** `block_ms` with `BlockingFetchUnsupportedError` rather than answering with a page. `block_ms: 0` asks for no wait and is the ordinary catch-up read every backend serves, so it is answered with a page rather than refused. Marks returned ids seen so the push loop won't re-deliver them. |
-| `parley_post` | write (reactive) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. The chat side's only write path. |
+| `parley_post` | write (reactive) | `{ topic, content, in_reply_to?, read_through?, force? }` → `{ posted: true, backendMsgId }`, or `{ posted: false, reason, unread, nextCursor }` when the topic holds messages the author has not been handed — by push or by a read — in which case nothing is written and those messages are handed over instead, so the same post sent again goes through. The baseline is `read_through` (a cursor the author names) when given, else this instance's read position; a topic it has never read has its newest page unread. The author's own messages from this session never count. A bridge with no dedup window (the remote HTTP root) guards only a post that names `read_through`, and keeps no record of a client's own posts there, so a client's earlier post past its `read_through` comes back to it once. `force: true` skips the check. The chat side's only write path. |
 | `parley_live_status` | liveness (reactive) | `{}` → `{ decided, topics }` or `{ decided, blockedBy }`. Whether the live push path is actually DELIVERING, per subscribed topic: `delivering` once a message has reached the agent through push, `not-delivering` when messages that arrived on that topic since the bridge armed reached the agent only through `parley_fetch_recent`, `no-traffic` before either — the backlog from before the bridge armed counts toward neither. A bridge configured so the two cannot be compared — push disabled, no dedup window (the remote HTTP root), or no start catch-up — answers `decided: false` with the reasons rather than reporting a health it did not observe. Two known limits: once the agent reads from a position the bridge cannot place relative to where it armed — after a restart on a backend whose empty page mints a new cursor, after a `from: "recent"` read, or past a boundary message that was deleted — a dead path reads `no-traffic` rather than `not-delivering`; and a message posted between start catch-up and the subscription arming counts as live-era, so a healthy path can read `not-delivering` until its next push. |
-| `parley_reply` | write (channel) | `{ topic, content, in_reply_to? }` → `{ backendMsgId }`. Same durable write as `parley_post`, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
+| `parley_reply` | write (channel) | `{ topic, content, in_reply_to?, read_through?, force? }` → the same answers as `parley_post`. Same durable write and the same read guard, distinct name so Claude surfaces it as a reply to an inbound `<channel>` event. |
+| `parley_whoami` | identity (reactive) | `{}` → `{ handle, instance_id, subscribed_topics, post_topics, version, live_push, mention_push, read_position, mention_filter, directory? }`. Who this instance is and what this bridge can do. `mention_push` is `any-topic` when the backend has a mention feed, `subscribed-topics` when mentions push only on followed topics, `off` without live push. `directory` is the operator's `directory` config: how to reach the other participants. |
 
 Every topic argument goes through the topic `Allowlist`, which accepts a topic listed in
 `config.topics` **or** one fully matching a `post_topics` pattern — so `post_topics` genuinely

@@ -1,10 +1,11 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { fetchRecentBlocking, isFetchAbortedError } from '../engine/blocking-fetch.js';
+import { MAX_CATCHUP_PAGES } from '../engine/catchup.js';
 import { liveEraStart } from '../engine/live-boundary.js';
-import { asBackendMsgId, asCursor, type BackendMsgId } from '../message.js';
+import { asBackendMsgId, asCursor, type BackendMsgId, type Cursor, type Message, type Topic } from '../message.js';
 import { isNoSuchTopicError } from '../no-such-topic.js';
-import type { FetchRecentArgs } from '../seam.js';
+import type { FetchRecentArgs, FetchRecentResult } from '../seam.js';
 import type { ToolDeps } from './tool-deps.js';
 import { describeAllowed, textResult, topicList, topicSchema } from './tool-schema.js';
 
@@ -94,7 +95,27 @@ export const TOOL_TEXT = {
     'read primitive to park on refuses this argument rather than ignoring it.',
   post:
     'Publish a message into a topic on the durable backend so humans and other instances see it. ' +
-    'Use this for handoffs and output. Returns { backendMsgId }.',
+    'Use this for handoffs and output. Read before you speak: if the topic has messages you have ' +
+    'not been handed — by push or by a read — the post is NOT sent, and you get them back instead ' +
+    'as { posted: false, unread, nextCursor }; read them, then send it again, revised or unchanged. ' +
+    'A first post to a topic you have never read gets its newest page back first. Name someone with ' +
+    '@<handle> and it is pushed to them, from any topic where the backend has a mention feed ' +
+    '(parley_whoami says which). On a backend with its own address syntax (Zulip: @**handle**), ' +
+    'a message addressed that way reaches only those it addresses, not every follower of the topic. ' +
+    'Say whether you need a reply ("Reply needed: …" or "No reply needed"). ' +
+    'Returns { posted: true, backendMsgId }.',
+  post_read_through:
+    'The cursor of the last message you have read on this topic — a `nextCursor`, or a <channel> ' +
+    "event's cursor. Anything after it you were not handed holds the post back. Omit it and this " +
+    'bridge uses what it has handed you itself; a bridge that keeps no read position does not hold ' +
+    'a post back unless you pass it.',
+  post_force:
+    'Send even if the topic has messages you have not read. For a post that cannot depend on them.',
+  whoami:
+    'Who you are on this bridge and what it can do: your handle, the topics you follow and may post ' +
+    'to, the bridge version, whether live push and mention push are on and from where, whether ' +
+    'reads resume from a kept position, and the deployment\'s directory of how to reach others. ' +
+    'Takes no arguments.',
   live_status:
     'Report whether the live <channel> push path is actually DELIVERING, per subscribed topic. ' +
     '"delivering" = messages have reached you through push since this bridge armed. ' +
@@ -109,24 +130,173 @@ export const TOOL_TEXT = {
   reply:
     'Reply into the topic a <channel> message arrived from. Pass the same `topic`. The reply is ' +
     'written durably to the backend so it survives restart and appears in the next catch-up — the ' +
-    'live channel is only the fast inbound hop, replies always write to the backend. Returns ' +
-    '{ backendMsgId }.',
+    'live channel is only the fast inbound hop, replies always write to the backend. Held back, ' +
+    'like parley_post, while the topic has messages you have not read. Returns ' +
+    '{ posted: true, backendMsgId } or { posted: false, unread, nextCursor }.',
 } as const;
+
+interface PageRead {
+  args: FetchRecentArgs;
+  /** The position the read started from, when it started from one. */
+  resumeFrom: Cursor | undefined;
+  /** The read asked for the newest page on purpose (`from: "recent"`), not from a position. */
+  readsHead: boolean;
+  limit: number | undefined;
+}
+
+interface DeliveredPage {
+  kept: Message[];
+  nextCursor: Cursor | undefined;
+  /** The kept messages this bridge had not handed the agent before, by push or by an earlier read. */
+  fresh: Message[];
+}
+
+/**
+ * Turn what a backend read returned into what the agent is handed, and record that it was handed:
+ * cut to the topic asked for, bounded, the read position advanced, and the dedup window warmed. The
+ * one path every read the agent sees goes through — `parley_fetch_recent`, and the read a post
+ * makes first.
+ */
+function deliverPage(deps: ToolDeps, t: Topic, result: FetchRecentResult, read: PageRead): DeliveredPage {
+  // Bound the PAGE, not only the request. The seam lets a plugin hand back more than `limit`
+  // asked for (test-support/nonconformant.ts ships that shape), and everything past the cap is both
+  // agent-facing context and one more write into a per-topic dedup window small enough that a
+  // single oversized page flushes it — after which the push loop re-delivers what was just
+  // pulled. Re-derive the cursor from the last message KEPT, so that the remainder is paged on
+  // the next call rather than skipped forever.
+  //
+  // Cut the page down to the topic that was ASKED for. `m.topic` is plugin-supplied and a
+  // backend's HISTORY read can be coarser than a topic exactly as its subscribe primitive can (a
+  // NATS wildcard subject, a Matrix room carrying several logical topics), so this is the same
+  // trust boundary `startPushLoop` applies on the live path — without it an unallowed topic
+  // reaches the agent's context through the pull path instead, and
+  // a foreign `backendMsgId` is recorded against THIS topic's dedup window, suppressing a
+  // genuine live push that later collides with it.
+  const own = result.messages.filter((m) => m.topic === t);
+  if (own.length < result.messages.length) {
+    // Count only, once per call: the topics dropped are untrusted strings, and naming them here
+    // would put plugin-chosen text into the operator's log on every page.
+    console.error(
+      `[parley] dropped ${result.messages.length - own.length} fetched message(s) on topics other ` +
+        'than the one requested; the backend plugin is reading history beyond that topic',
+    );
+  }
+  const cap = Math.min(read.limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
+  const kept = own.length > cap ? own.slice(0, cap) : own;
+  const nextCursor = kept.length < own.length ? kept.at(-1)!.cursor : result.nextCursor;
+  // Advance the instance's position to exactly what this page COVERED, so the next since-less
+  // call starts where this one stopped — but ONLY when the read really resumed from that
+  // position, which is a compare-and-set against a fresh read rather than a check of the value
+  // this call opened with. A caller may pass any cursor it likes: one AHEAD of the stored
+  // position drags the position past a region the agent was never handed, and everything in
+  // between is then unreachable by resume. One BEHIND is safe and still does not move it — a
+  // rewind costs duplicates, which the seen-set absorbs. The documented paging loop always
+  // satisfies the condition: its first call is since-less, and every later one carries the
+  // cursor this branch just wrote.
+  //
+  // Skipped when the position has not moved, so an idle agent polling a quiet topic does not
+  // rewrite the state file once per tick for a cursor that never changed.
+  //
+  // Keep this BEFORE the dedup warm-up, so that a cursor the store refuses takes the whole call
+  // down without first recording these ids as delivered — a page the agent never received but
+  // the push loop will now suppress is lost on both paths at once.
+  //
+  // A head read never satisfies it, whatever the store holds. `resumeFrom` is absent there
+  // because the call asked to start from NOWHERE, and on a topic this instance has never read
+  // the position is absent too — two absent values are not the same claim, and treating them as
+  // agreement drags the position to the head of a backlog the agent was never handed.
+  const readState = deps.readState;
+  if (readState !== undefined && nextCursor !== undefined && !read.readsHead) {
+    const stored = readState.get(t);
+    if (read.resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
+  }
+  const handed = deps.handed;
+  const fresh = handed === undefined ? kept : kept.filter((m) => !handed.has(t, m.backendMsgId));
+  for (const m of kept) handed?.markSeen(t, m.backendMsgId);
+  const seen = deps.seen;
+  if (seen === undefined) return { kept, nextCursor, fresh };
+  // Only the post-subscribe tail is push's to deliver: a backlog this boot inherited reaches
+  // the agent through here unseen whether or not the live path works.
+  const liveFrom = liveEraStart(seen, t, read.args.since, kept, nextCursor);
+  kept.forEach((m, i) => {
+    // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
+    // thing that distinguishes a dead live path: a message reaching the agent that push never
+    // delivered. Past `markSeen` every message looks delivered.
+    if (i >= liveFrom && !seen.has(t, m.backendMsgId) && !deps.own.has(m.backendMsgId)) deps.live.recordReconciled(t);
+    seen.markSeen(t, m.backendMsgId);
+  });
+  return { kept, nextCursor, fresh };
+}
+
+/**
+ * What arrived on `t` that the author of a post has not been shown, so the post can wait until it
+ * has. The baseline is the cursor the author names, else this instance's read position — and a
+ * topic it has never read has everything in its newest page unread. It pages on while the cursor
+ * advances, since an empty page can still have unread messages behind it. Whatever it hands over
+ * is recorded as shown, so the same post sent again goes through. A bridge that records nothing as
+ * shown (the remote HTTP root) guards only a post that names its own baseline.
+ */
+async function unreadBeforePost(
+  deps: ToolDeps,
+  t: Topic,
+  readThrough: string | undefined,
+): Promise<{ unread: Message[]; nextCursor: Cursor | undefined } | undefined> {
+  if (readThrough === undefined && deps.handed === undefined) return undefined;
+  await deps.own.settled();
+  let since = readThrough !== undefined ? asCursor(readThrough) : deps.readState?.get(t);
+  for (let page = 0; page < MAX_CATCHUP_PAGES; page++) {
+    const args: FetchRecentArgs = { topic: t, limit: deps.guardLimit };
+    if (since !== undefined) args.since = since;
+    let result: FetchRecentResult;
+    try {
+      result = await deps.plugin.fetchRecent(args);
+    } catch (e) {
+      if (isNoSuchTopicError(e)) return undefined;
+      throw e;
+    }
+    const read = deliverPage(deps, t, result, { args, resumeFrom: since, readsHead: false, limit: deps.guardLimit });
+    const unread = read.fresh.filter((m) => !deps.own.has(m.backendMsgId));
+    if (unread.length > 0) return { unread, nextCursor: read.nextCursor };
+    if (read.nextCursor === undefined || read.nextCursor === since) return undefined;
+    since = read.nextCursor;
+  }
+  return undefined;
+}
+
+type PostOutcome =
+  | { posted: true; backendMsgId: BackendMsgId }
+  | { posted: false; reason: string; unread: Message[]; nextCursor: Cursor | undefined };
 
 /** Shared durable write path for both `parley_post` and `parley_reply`. */
 async function doPost(
   deps: ToolDeps,
   topicStr: string,
   content: string,
-  inReplyTo?: string,
-): Promise<BackendMsgId> {
+  opts: { inReplyTo?: string; readThrough?: string; force?: boolean },
+): Promise<PostOutcome> {
   const topic = deps.allow.assert(topicStr);
-  return deps.plugin.post(
-    topic,
-    deps.identity,
-    content,
-    inReplyTo !== undefined ? { inReplyTo: asBackendMsgId(inReplyTo) } : undefined,
+  if (opts.force !== true) {
+    const pending = await unreadBeforePost(deps, topic, opts.readThrough);
+    if (pending !== undefined) {
+      return {
+        posted: false,
+        reason:
+          `${pending.unread.length} message(s) on this topic you had not read — here they are. ` +
+          'Read them, then send your post again (revised or unchanged); it goes through once ' +
+          'nothing new is waiting.',
+        ...pending,
+      };
+    }
+  }
+  const backendMsgId = await deps.own.track(() =>
+    deps.plugin.post(
+      topic,
+      deps.identity,
+      content,
+      opts.inReplyTo !== undefined ? { inReplyTo: asBackendMsgId(opts.inReplyTo) } : undefined,
+    ),
   );
+  return { posted: true, backendMsgId };
 }
 
 /**
@@ -212,71 +382,7 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         // they were, and omitting it (no `since` given) reads the recent window.
         return textResult({ messages: [], nextCursor: args.since, topicAbsent: true });
       }
-      // Bound the PAGE, not only the request. The seam lets a plugin hand back more than `limit`
-      // asked for (test-support/nonconformant.ts ships that shape), and everything past the cap is both
-      // agent-facing context and one more write into a per-topic dedup window small enough that a
-      // single oversized page flushes it — after which the push loop re-delivers what was just
-      // pulled. Re-derive the cursor from the last message KEPT, so that the remainder is paged on
-      // the next call rather than skipped forever.
-      //
-      // Cut the page down to the topic that was ASKED for. `m.topic` is plugin-supplied and a
-      // backend's HISTORY read can be coarser than a topic exactly as its subscribe primitive can (a
-      // NATS wildcard subject, a Matrix room carrying several logical topics), so this is the same
-      // trust boundary `startPushLoop` applies on the live path — without it an unallowed topic
-      // reaches the agent's context through the pull path instead, and
-      // a foreign `backendMsgId` is recorded against THIS topic's dedup window, suppressing a
-      // genuine live push that later collides with it.
-      const own = result.messages.filter((m) => m.topic === t);
-      if (own.length < result.messages.length) {
-        // Count only, once per call: the topics dropped are untrusted strings, and naming them here
-        // would put plugin-chosen text into the operator's log on every page.
-        console.error(
-          `[parley] dropped ${result.messages.length - own.length} fetched message(s) on topics other ` +
-            'than the one requested; the backend plugin is reading history beyond that topic',
-        );
-      }
-      const cap = Math.min(limit ?? MAX_FETCH_LIMIT, MAX_FETCH_LIMIT);
-      const kept = own.length > cap ? own.slice(0, cap) : own;
-      const nextCursor = kept.length < own.length ? kept.at(-1)!.cursor : result.nextCursor;
-      // Advance the instance's position to exactly what this page COVERED, so the next since-less
-      // call starts where this one stopped — but ONLY when the read really resumed from that
-      // position, which is a compare-and-set against a fresh read rather than a check of the value
-      // this call opened with. A caller may pass any cursor it likes: one AHEAD of the stored
-      // position drags the position past a region the agent was never handed, and everything in
-      // between is then unreachable by resume. One BEHIND is safe and still does not move it — a
-      // rewind costs duplicates, which the seen-set absorbs. The documented paging loop always
-      // satisfies the condition: its first call is since-less, and every later one carries the
-      // cursor this branch just wrote.
-      //
-      // Skipped when the position has not moved, so an idle agent polling a quiet topic does not
-      // rewrite the state file once per tick for a cursor that never changed.
-      //
-      // Keep this BEFORE the dedup warm-up, so that a cursor the store refuses takes the whole call
-      // down without first recording these ids as delivered — a page the agent never received but
-      // the push loop will now suppress is lost on both paths at once.
-      //
-      // A head read never satisfies it, whatever the store holds. `resumeFrom` is absent there
-      // because the call asked to start from NOWHERE, and on a topic this instance has never read
-      // the position is absent too — two absent values are not the same claim, and treating them as
-      // agreement drags the position to the head of a backlog the agent was never handed.
-      const readState = deps.readState;
-      if (readState !== undefined && nextCursor !== undefined && !readsHead) {
-        const stored = readState.get(t);
-        if (resumeFrom === stored && nextCursor !== stored) readState.set(t, nextCursor);
-      }
-      const seen = deps.seen;
-      if (seen !== undefined) {
-        // Only the post-subscribe tail is push's to deliver: a backlog this boot inherited reaches
-        // the agent through here unseen whether or not the live path works.
-        const liveFrom = liveEraStart(seen, t, args.since, kept, nextCursor);
-        kept.forEach((m, i) => {
-          // Count what this read had to reconcile BEFORE recording it, so the ledger sees the one
-          // thing that distinguishes a dead live path: a message reaching the agent that push never
-          // delivered. Past `markSeen` every message looks delivered.
-          if (i >= liveFrom && !seen.has(t, m.backendMsgId)) deps.live.recordReconciled(t);
-          seen.markSeen(t, m.backendMsgId);
-        });
-      }
+      const { kept, nextCursor } = deliverPage(deps, t, result, { args, resumeFrom, readsHead, limit });
       return textResult({ messages: kept, nextCursor });
     },
   );
@@ -290,6 +396,11 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     () => textResult(deps.live.report()),
   );
 
+  const guardInput = {
+    read_through: z.string().optional().describe(TOOL_TEXT.post_read_through),
+    force: z.boolean().optional().describe(TOOL_TEXT.post_force),
+  };
+
   server.registerTool(
     'parley_post',
     {
@@ -302,13 +413,12 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
             .string()
             .optional()
             .describe('Optional backendMsgId this message threads under.'),
+          ...guardInput,
         })
         .strict(),
     },
-    async ({ topic, content, in_reply_to }) => {
-      const id = await doPost(deps, topic, content, in_reply_to);
-      return textResult({ backendMsgId: id });
-    },
+    async ({ topic, content, in_reply_to, read_through, force }) =>
+      textResult(await doPost(deps, topic, content, { inReplyTo: in_reply_to, readThrough: read_through, force })),
   );
 
   server.registerTool(
@@ -325,12 +435,20 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
             .string()
             .optional()
             .describe('Optional msg_id of the message being replied to.'),
+          ...guardInput,
         })
         .strict(),
     },
-    async ({ topic, content, in_reply_to }) => {
-      const id = await doPost(deps, topic, content, in_reply_to);
-      return textResult({ backendMsgId: id });
+    async ({ topic, content, in_reply_to, read_through, force }) =>
+      textResult(await doPost(deps, topic, content, { inReplyTo: in_reply_to, readThrough: read_through, force })),
+  );
+
+  server.registerTool(
+    'parley_whoami',
+    {
+      description: TOOL_TEXT.whoami,
+      inputSchema: z.object({}).strict(),
     },
+    () => textResult(deps.whoami),
   );
 }

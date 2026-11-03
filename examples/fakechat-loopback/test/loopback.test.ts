@@ -89,6 +89,7 @@ describe('fakechat loopback (headless)', () => {
       'parley_live_status',
       'parley_post',
       'parley_reply',
+      'parley_whoami',
     ]);
   });
 

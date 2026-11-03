@@ -2,15 +2,15 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  Allowlist,
   asCursor,
   asHandle,
   catchUpTopic,
-  LiveDeliveryLedger,
+  parseConfig,
   ReadStateStore,
   registerTools,
   SeenSet,
   type ToolDeps,
+  toolDepsFor,
   type Topic,
 } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
@@ -70,14 +70,10 @@ function withRig(storedCursor: string, body: (rig: Rig) => Promise<void>): Promi
       readState,
       drain: () => catchUpTopic({ plugin, topic, limit: 100, readState, seen }),
       agentReads: agentFetch({
-        plugin,
-        identity: asHandle('reader'),
-        allow: new Allowlist([String(topic)]),
-        seen,
-        readState,
-        blockMaxMs: 60_000,
-        blockPollIntervalMs: 20,
-        live: new LiveDeliveryLedger([topic]),
+        ...toolDepsFor(plugin, parseConfig({ identity: { handle: 'reader' }, topics: [String(topic)] }), {
+          seen,
+          readState,
+        }),
       }),
     });
   });

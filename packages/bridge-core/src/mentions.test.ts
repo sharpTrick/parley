@@ -48,7 +48,11 @@ const GRAMMAR: readonly (readonly [label: string, content: string, expected: rea
     ['interior uppercase is part of the handle', 'hi @aBb there', ['aBb']],
     ['repeated interior punctuation is part of the handle', 'hi @a..b there', ['a..b']],
     ['interior colon ends the handle', 'hi @a:b there', ['a']],
-    ['interior slash ends the handle', 'hi @a/b there', ['a']],
+    ['a scope-like token is not a mention', 'hi @a/b there', []],
+    ['a package scope is not a mention', 'bump @sharptrick/parley-core', []],
+    ['a non-ASCII letter before @ makes it an email, not a mention', 'mail josé@bob.example', []],
+    ['a combining mark before @ makes it an email (NFD input)', 'mail jose\u0301@bob.example', []],
+    ['a scope token is refused past a trailing separator', 'see @docs./intro', []],
     ['interior plus ends the handle', 'hi @a+b there', ['a']],
     ['interior at-sign ends the handle', 'hi @a@b there', ['a']],
     ['interior space ends the handle', 'hi @a b there', ['a']],
@@ -106,16 +110,19 @@ describe('the @mention grammar, pinned as literals', () => {
 // either class can be replayed against the table: a mutant no row disagrees with is a hole in the
 // table, and it fails HERE rather than after the hole has been shipped.
 const HANDLE_BODY = '[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?';
-const GUARD_CLASS = '[^A-Za-z0-9_.@-]';
+const GUARD_CLASS = '[^\\p{L}\\p{M}\\p{N}_.@-]';
+const TAIL_GUARD = '(?![._-]*/)';
 
 const parseWith =
-  (body: string, guard: string) =>
+  (body: string, guard: string, tail = TAIL_GUARD) =>
   (content: string): string[] => {
-    const re = new RegExp(`(?:^|${guard})@(${body})`, 'g');
+    const re = new RegExp(`(?:^|${guard})@(?=(${body}))\\1${tail}`, 'gu');
     return [...new Set([...content.matchAll(re)].map((m) => m[1] ?? ''))];
   };
 
-const MUTANTS: readonly (readonly [label: string, body: string, guard: string])[] = [
+const MUTANTS: readonly (readonly [label: string, body: string, guard: string, tail?: string])[] = [
+  ['the trailing scope guard is dropped', HANDLE_BODY, GUARD_CLASS, ''],
+  ['the trailing scope guard ignores separators before the slash', HANDLE_BODY, GUARD_CLASS, '(?!/)'],
   ['the interior class drops _', '[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', GUARD_CLASS],
   ['the interior class drops .', '[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?', GUARD_CLASS],
   ['the interior class drops -', '[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?', GUARD_CLASS],
@@ -127,10 +134,12 @@ const MUTANTS: readonly (readonly [label: string, body: string, guard: string])[
     GUARD_CLASS,
   ],
   ['the handle may end with punctuation', '[A-Za-z0-9][A-Za-z0-9._-]*', GUARD_CLASS],
-  ['the guard class drops _', HANDLE_BODY, '[^A-Za-z0-9.@-]'],
-  ['the guard class drops .', HANDLE_BODY, '[^A-Za-z0-9_@-]'],
-  ['the guard class drops -', HANDLE_BODY, '[^A-Za-z0-9_.@]'],
-  ['the guard class drops @', HANDLE_BODY, '[^A-Za-z0-9_.-]'],
+  ['the guard class drops _', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}.@-]'],
+  ['the guard class drops .', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_@-]'],
+  ['the guard class drops -', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_.@]'],
+  ['the guard class drops @', HANDLE_BODY, '[^\\p{L}\\p{M}\\p{N}_.-]'],
+  ['the guard class drops combining marks', HANDLE_BODY, '[^\\p{L}\\p{N}_.@-]'],
+  ['the guard class is ASCII-only', HANDLE_BODY, '[^A-Za-z0-9_.@-]'],
 ];
 
 describe('the pinned grammar table discriminates', () => {
@@ -140,8 +149,9 @@ describe('the pinned grammar table discriminates', () => {
       expect(restated(content), label).toEqual(parseMentions(content));
   });
 
-  it.each(MUTANTS)('a grammar where %s reddens at least one row', (_label, body, guard) => {
-    const mutant = parseWith(body, guard);
+  const mutants = MUTANTS.map(([label, body, guard, tail]) => [label, body, guard, tail ?? TAIL_GUARD] as const);
+  it.each(mutants)('a grammar where %s reddens at least one row', (_label, body, guard, tail) => {
+    const mutant = parseWith(body, guard, tail);
     const caught = ROWS.filter(
       ([, content, expected]) => JSON.stringify(mutant(content)) !== JSON.stringify(expected),
     );

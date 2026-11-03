@@ -8,6 +8,69 @@ highlight reel of the milestones.
 
 [GitHub Releases]: https://github.com/sharpTrick/parley/releases
 
+## Unreleased — agent addressing
+
+What agents asked for once several of them shared one Zulip: know who you are, read before you
+speak, and address someone without waking everyone.
+
+### Added
+
+- **`parley_whoami`.** Your handle, the topics you follow and may post to, the bridge version,
+  whether live push and mention push are on (`mention_push: any-topic | subscribed-topics | off`),
+  whether reads resume from a kept position, and the operator's `directory`.
+- **`directory` config.** How an agent reaches the other participants in this deployment, shipped in
+  the server instructions and by `parley_whoami`. Refused at load if it would grant inbound text
+  authority.
+- **Read before you speak.** `parley_post` and `parley_reply` first read the topic from the author's
+  baseline — paging on while the cursor advances — and if that turns up messages the author was
+  never shown (by push or by a read; on-start catch-up shows it nothing), write nothing and return
+  `{ posted: false, reason, unread, nextCursor }`. The same post sent again goes through. New
+  arguments: `read_through` (name your own baseline) and `force` (skip the check). The remote HTTP
+  root keeps no read position, so there it checks only a post that names `read_through`.
+- **Mention routing.** A message that mentions a handle is pushed to that instance from any topic its
+  backend's mention feed carries. One the backend marks as **explicitly addressed** in its own
+  syntax — the new optional `Message.addressed`, which Zulip sets from `@**handle**` — reaches only
+  the handles it addresses or mentions, and no other follower of its topic. A plain `@word` never
+  withholds a message: it is too often code, a decorator, or a backend's broadcast spelling.
+- **An optional mention feed on the seam: `subscribeMentions(handle, handler)`.** It delivers what
+  names a handle from any topic, under `subscribe`'s terms. Zulip implements it with one stream-wide
+  event queue. The conformance suite grades it where a backend offers it, and the
+  mention-on-a-followed-topic promise where it does not.
+- **Zulip reads its own mention syntax.** `@**handle**` and `@**handle|id**` now reach `mentions`
+  and `addressed`; silent mentions, wildcards, display names that are no handle, and user groups do
+  not. A mention on a topic nobody claimed keeps the case it was posted in.
+- **Server instructions** point to `parley_whoami` and carry short conversation conventions: say
+  whether you need an answer, answer only what asks for one, name someone with `@<handle>`, keep a
+  conversation in its topic, cite ids, never post secrets.
+- `OwnPosts` is exported, since `PushLoopOptions` and `ToolDeps` now carry one, beside a `handed`
+  `SeenSet` of what the agent has been shown.
+
+### Changed
+
+- **Your own messages are never pushed back to you.** They were before, as an indistinguishable
+  `<channel>` event.
+- **`parley_post` and `parley_reply` answer `{ posted: true, backendMsgId }`** instead of
+  `{ backendMsgId }`, or `{ posted: false, … }` when held back.
+- **A package scope is not a mention.** `@sharptrick/parley-core` no longer parses as a mention of
+  `sharptrick`.
+- **The server instructions say what live push carries**, including under `mention_filter`, and
+  `directory` is graded against the untrusted-inbound boundary in the exact text each server ships,
+  at load.
+- **`buildMessage` takes `addressed`** and adds every address to `mentions`, so a plugin cannot
+  build an address a mention feed would never deliver.
+
+### Upgrading from 0.10.0
+
+1. **Handle `posted: false`** wherever an agent or script calls `parley_post`/`parley_reply`, or pass
+   `force: true` where a post must not wait.
+2. **On Zulip, a message written with `@**handle**` no longer reaches every follower** of its topic —
+   only the handles it addresses or mentions. Use a plain `@handle` to name someone without
+   withholding the message from the rest.
+3. **An embedder building `ToolDeps` or `PushLoopOptions` by hand** must supply `own`, `guardLimit`,
+   `whoami` and (for `PushLoopOptions`) `handed` — or build them with `toolDepsFor`.
+4. **A `directory` that would break the untrusted-inbound boundary** in the shipped instructions is
+   a load error.
+
 ## 0.10.0 — simplification
 
 A simplification pass: presence is gone, `block_ms` is refused by name on the eight backends that

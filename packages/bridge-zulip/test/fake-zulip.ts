@@ -117,7 +117,8 @@ interface QueueEvent {
 
 interface Queue {
   stream: string;
-  topic: string;
+  /** Absent for a queue narrowed to the whole stream. */
+  topic: string | undefined;
   /** What the queue's `register` asked for — decides whether its events carry HTML or source. */
   applyMarkdown: boolean;
   eventSeq: number;
@@ -441,7 +442,7 @@ export async function startFakeZulip(opts?: {
     messages.push(msg);
     for (const q of queues.values()) {
       if (fold(q.stream) !== fold(routing.stream)) continue;
-      if (fold(q.topic) !== fold(routing.topic)) continue;
+      if (q.topic !== undefined && fold(q.topic) !== fold(routing.topic)) continue;
       q.events.push({ id: q.eventSeq++, type: 'message', message: msg });
       const w = q.waiter;
       if (w !== undefined) {
@@ -601,7 +602,7 @@ export async function startFakeZulip(opts?: {
       case 'POST /api/v1/register': {
         const narrow = JSON.parse(form.get('narrow') ?? '[]') as Array<[string, string]>;
         const stream = narrow.find((n) => n[0] === 'stream')?.[1] ?? '';
-        const topic = narrow.find((n) => n[0] === 'topic')?.[1] ?? '';
+        const topic = narrow.find((n) => n[0] === 'topic')?.[1];
         const queueId = `fq-${++queueSeq}`;
         queues.set(queueId, {
           stream,

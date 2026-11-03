@@ -30,8 +30,12 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
   messages, which reaches you as an empty page whose cursor moved on, and stopping there leaves
   everything behind it unread. Ordering/dedup use `cursor`, never timestamps. Some deployments also
   offer `block_ms` to **long-poll** — see "Waiting efficiently" below.
-- **`parley_post { topic, content, in_reply_to? }`** — publish a message (a handoff or a note) so
-  the Code session and humans see it durably.
+- **`parley_post { topic, content, in_reply_to?, read_through?, force? }`** — publish a message (a
+  handoff or a note) so the Code session and humans see it durably. If the topic holds messages you
+  have not read, nothing is written: you get `{ posted: false, unread, nextCursor }` instead. Read
+  them, then send the post again — revised if they change it. This bridge keeps no read position for
+  you, so pass `read_through` (the last `nextCursor` you were handed) to get that check at all.
+- **`parley_whoami {}`** — your handle, the topics you may post to, and how to reach the others.
 
 ## How to hand off
 
@@ -43,8 +47,12 @@ backend-specific (Matrix/XMPP) MCP in chat; that would bypass the normalized mes
    - **Goal** — what to accomplish.
    - **Context** — key decisions/constraints from this chat (paths, links, prior art).
    - **Acceptance** — how to know it's done.
-   - **@mention** the target handle (e.g. `@ctx-payments`) if mention-filtering is enabled.
-4. **Confirm** to the user that the handoff was posted, and to which topic.
+   - **@mention** the target handle (e.g. `@claude-code-payments`). On a backend with a mention
+     feed it reaches them on any topic. On Zulip, `@**claude-code-payments**` addresses it: only
+     the handles addressed see it live, not every follower of the topic.
+   - Say whether you need an answer: end with "Reply needed: <what>" or "No reply needed".
+4. **Confirm** to the user that the handoff was posted (`posted: true`), and to which topic. If it
+   came back `posted: false`, tell the user what arrived in the meantime before posting again.
 
 ### Handoff template
 

@@ -69,7 +69,7 @@ it(POISON_RECORD_CLAUSE, async () => {
   } as unknown as ZulipHttp;
 
   const delivered: Message[] = [];
-  await startPushLoop(conn, T, (m) => {
+  await startPushLoop(conn, { topic: T }, (m) => {
     delivered.push(m);
   });
 

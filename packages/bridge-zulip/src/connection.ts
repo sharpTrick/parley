@@ -1,4 +1,4 @@
-import type { Topic } from '@sharptrick/parley-core';
+import { asTopic, type Topic } from '@sharptrick/parley-core';
 import { delay } from '@sharptrick/parley-net-util';
 import { resolveConfig, type ZulipConfig } from './config.js';
 import { TEARDOWN_TIMEOUT_MS, ZulipHttp } from './http.js';
@@ -146,6 +146,15 @@ export class ZulipConnection {
     const wire = this.wireTopic(topic);
     this.claimedWireTopics.set(wire, topic);
     return wire;
+  }
+
+  /**
+   * The Parley topic a Zulip topic belongs to: the one that claimed it, else the topic as it was
+   * posted. Keep the posted case on the fallback, so that a case-sensitive `post_topics` pattern
+   * still matches a topic this instance never claimed.
+   */
+  topicOf(subject: string): Topic {
+    return this.claimedWireTopics.get(subject.toLowerCase()) ?? asTopic(subject);
   }
 
   require(): void {

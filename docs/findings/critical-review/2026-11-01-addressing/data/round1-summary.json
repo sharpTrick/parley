@@ -1,0 +1,344 @@
+{
+ "round": 1,
+ "converged": false,
+ "blockingClean": false,
+ "wakeAll": true,
+ "counts": {
+  "confirmed": 137,
+  "blocking": 28,
+  "plausible": 7,
+  "total": 144
+ },
+ "ranTargets": [
+  "core-seam",
+  "core-engine",
+  "core-auth",
+  "sqlite",
+  "redis",
+  "postgres",
+  "matrix",
+  "xmpp",
+  "nats",
+  "zulip",
+  "discord",
+  "slack",
+  "telegram",
+  "shared",
+  "repo"
+ ],
+ "quiescedTargets": [],
+ "targets": [
+  {
+   "key": "core-seam",
+   "dirs": [
+    "bridge-core"
+   ]
+  },
+  {
+   "key": "core-engine",
+   "dirs": [
+    "bridge-core"
+   ]
+  },
+  {
+   "key": "core-auth",
+   "dirs": [
+    "bridge-core"
+   ]
+  },
+  {
+   "key": "sqlite",
+   "dirs": [
+    "bridge-sqlite"
+   ]
+  },
+  {
+   "key": "redis",
+   "dirs": [
+    "bridge-redis"
+   ]
+  },
+  {
+   "key": "postgres",
+   "dirs": [
+    "bridge-postgres"
+   ]
+  },
+  {
+   "key": "matrix",
+   "dirs": [
+    "bridge-matrix"
+   ]
+  },
+  {
+   "key": "xmpp",
+   "dirs": [
+    "bridge-xmpp"
+   ]
+  },
+  {
+   "key": "nats",
+   "dirs": [
+    "bridge-nats"
+   ]
+  },
+  {
+   "key": "zulip",
+   "dirs": [
+    "bridge-zulip"
+   ]
+  },
+  {
+   "key": "discord",
+   "dirs": [
+    "bridge-discord"
+   ]
+  },
+  {
+   "key": "slack",
+   "dirs": [
+    "bridge-slack"
+   ]
+  },
+  {
+   "key": "telegram",
+   "dirs": [
+    "bridge-telegram"
+   ]
+  },
+  {
+   "key": "shared",
+   "dirs": [
+    "bridge-net-util",
+    "conformance"
+   ]
+  },
+  {
+   "key": "repo",
+   "dirs": []
+  }
+ ],
+ "packageDeps": {
+  "bridge-core": [],
+  "bridge-discord": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-matrix": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-nats": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-net-util": [],
+  "bridge-postgres": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-redis": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-slack": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-sqlite": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-telegram": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-xmpp": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "bridge-zulip": [
+   "bridge-core",
+   "bridge-net-util",
+   "conformance"
+  ],
+  "conformance": [
+   "bridge-core"
+  ]
+ },
+ "worktrees": "/home/patrick/Projects/.careening/worktrees",
+ "nextQuiesced": [],
+ "byTarget": [
+  {
+   "target": "core-seam",
+   "nothingFound": false,
+   "findings": 11,
+   "errored": false,
+   "checked": "HEAD verified as 0025502. Stage 1 inventory: 30 source files (18 directly in src/, cli/backend-cli.ts, 3 in testing/, 8 in test-support/) and 22 test files, 52 items in all. Seam integrity, checked mechanically: grepping every import in packages/bridge-core/src finds no backend package. The only cross-package import is @sharptrick/parley-net-util/testing, used in tests and declared as a devDependency, and net-util does not depend back on core. `git diff --stat` on packages/bridge-core is clean. Claims I read against the code: seam.ts JSDoc (including the new subscribeMentions), mentions.ts comments, config.ts field docs (directory, post_topics, block_*), allowlist.ts class and option docs, inbound-trust.ts, safeName docs, blocking-unsupported, safe-deliver, backend-cli, testing/ and test-support/ headers, the core README, and the package.json description and keywords. Defects reproduced with tsx probes: parseMentions on code and prose tokens, combined with the push-loop's routesTo; parseConfig plus serverInstructions on chosen handles and directories (including load and ship disagreeing in both directions); inboundTrustBreach bypass strings; MENTION_RE atomic vs plain under hostile tokens (no quadratic blow-up either way; the atomic group is there for correctness); ReDoS-screen candidates (worst accepted about 5 ms per pattern, about 107 ms per has() with 64 patterns, which is within the documented budget, so not filed). Mutations, each confirmed applied by grep before running: config directory check disabled (killed by addressing.test), mention_filter handle check (killed), non-atomic mention capture (killed), safeDeliver .catch dropped (killed), installShutdown destroyed check (killed), parseArgs dash check (killed), isPlainObject null-proto (killed), safeName isDisambiguated (killed), assertCompilesAlone removed (killed), Allowlist empty-topic arm (killed), BACKEND_NAME widened (killed), buildMessage cursor fallback (killed), boundedLine \\p{Cf} (killed), isArmableDelay >=0 (killed), assertBlockMsUnsupported >=0 (survives the core suite, killed by conformance refusal-surface.test, so not filed). Two inbound-trust mutants survive the full 5582-test core suite: em dash removed as a clause break, and yet/still removed from CONTRAST. All mutations were reverted. No containers were started."
+  },
+  {
+   "target": "core-engine",
+   "nothingFound": false,
+   "findings": 6,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. Stage 1 inventory: 13 source files and 25 test files under engine/ and transport/, 38 items in total. Sources: own-posts, live-delivery, live-boundary, seen-set, catchup, blocking-fetch, read-state, push-loop, channel-emit, tools, tool-deps, tool-schema, instructions, stdio-bridge, http. Claims were read from JSDoc, TOOL_TEXT, CHANNEL_INSTRUCTIONS_BODY, DESIGN \u00a77 ('Read before you speak', 'Live-push routing') and the bridge-core README tool table.\n\nReproduced with temporary vitest files, since deleted:\n- The guard bypass after a pre-boot backlog, including the read position moving past it.\n- Push starvation from a hung write, with live_status reporting 'delivering'.\n\nMutations, each confirmed as applied before its run:\n- push-loop: removing the settled() wait was killed (3 failures). Moving recordPush after firstSeen was killed (4). Dropping allow.has from the mention-feed gate was killed. Dropping !mentionFilter was killed. Dropping the mentions.includes clause in `readable` survived; it is close to an equivalent mutant, because routesTo still drops the message and only the warning differs.\n- tools.ts: removing the own-post filter was killed. Removing the readsHead guard was killed (8). Changing guardLimit to 1 was killed. Making the guard rethrow NoSuchTopic survived across all 501 transport tests, which is the registry finding. A mutation dropping inReplyTo was inconclusive, because the run hit a timeout under load average 18 and reported a truncated count.\n\nSeam: the import graph of engine/ and transport/ has no backend package; net-util is test-only, and `git diff --stat HEAD` on bridge-core is empty. Security: I walked the host gate's hostnameOf through Origin 'null', a trailing dot, localhost.evil.com and IPv6 brackets; it held. The channel meta keys are a fixed set of identifiers. Protocol: catch-up stops on an empty page plus a `nextCursor === since` brake. Blocking fetch advances since past coarse foreign pages. seen-set dedups on backendMsgId, never on timestamp. All held. Operability: listen/close latching and the close grace period in http.ts were read; no defect found. Test-hygiene: addressing.test.ts is table-driven with discriminating rows; no duplication found worth filing."
+  },
+  {
+   "target": "core-auth",
+   "nothingFound": false,
+   "findings": 10,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. I read every source file in packages/bridge-core/src/auth in full: oauth-provider, eviction, grant-params, consent-page, html, owner, invariants, loopback-hosts, remote, remote-auth, error-surface, oidc-remote, oidc-discovery and oidc-verifier. I read the relevant parts of the tests: oidc-verifier, oidc-remote (cardinality and skew tables), invariants (OIDC value table), hygiene, crypto-wiring, oidc-verifier-wiring and the teardown headers. I also read the SDK 1.29 token/bearerAuth/shared-auth schemas and jose's remote-JWKS fetch to see what the provider relies on.\n\nProbes I reproduced:\n- Scope-vs-gate ordering: a stranger without the scope gets InsufficientScopeError (403). A stranger with the scope gets the uniform 401.\n- A string-typed `allowed_usernames` passes assertOidcPolicy, and the verifier then admits `pat` against `patrick`.\n- An unreachable JWKS surfaces as InvalidTokenError.\n- The scrypt record `N=1024=junk` is accepted, and so is the duplicate-key block `N=2,r=8,p=1,N=1024`.\n- Bidi spoofing of the consent page through a custom-scheme redirect_uri: this held, because SDK DCR percent-encodes the stored redirect_uris.\n\n19 source mutations, each checked as applied by cmp:\n- Killed: code move to `redeeming`, refresh revokeGrant, audience check, revoke clientId check, consume-before-verify, eviction reverse, shed `>=`, redirectUriWasSupplied (forced true / body only), sweep of `redeeming`, pending ownerApproved, empty-passphrase guard, logSafe escaping, trust-proxy hop depth, jwks origin check, discovery `redirect: manual`, ID-token claim heuristic.\n- Survived: removing both auth-layer hardenErrorSurface calls (only tsc unused-import failed); a barrel quote-style change, which silently drops 3 exports from the hygiene scan; one doc-prose edit, which turned the suite red with no code defect.\n\nSeam: every auth import is to core modules, SDK, express, jose or node, plus a devDependency on parley-net-util/testing (not a backend). `git diff --stat` on bridge-core is empty. Cursor/dedup protocol-conformance does not apply here: auth imports only seam types. I checked the OAuth protocol instead (RFC 6749 \u00a74.1.2/\u00a74.1.3, 6750, 7009, 8707). Operability: exports/files point at dist, and tests and test-support are excluded from the build. I flagged nothing, though the SDK range `^1` is loose given how much this code relies on SDK internals."
+  },
+  {
+   "target": "sqlite",
+   "nothingFound": false,
+   "findings": 10,
+   "errored": false,
+   "checked": "Worktree /home/patrick/Projects/.careening/worktrees/sqlite was verified at 0025502 before starting. I read all 12 sources in packages/bridge-sqlite/src (index, driver, catchup, cursor, poll, retention, store, schema, config, classify, at-rest, cli), plus concurrent-writer.mjs, package.json, tsconfig*.json, README.md and the 20 test files. For the seam I read core's seam.ts, message.ts, safe-deliver.ts, blocking-unsupported.ts and the conformance mention and blocking cases.\n\nSeam integrity was checked mechanically. The only core reference to sqlite is a help string in config-diagnostics.ts:43, not an import. sqlite imports only the public core, conformance and net-util/testing entries, and `git diff --stat 0025502 -- packages/bridge-core` is empty.\n\nProtocol conformance: exclusive since is `id > ?`; dedup and order use the rowid and never ts; the cursor is byte-stable; the empty-topic cursor can be replayed; blockMs>0 is refused. Conformance runs on both drivers.\n\nSecurity: every query binds its parameters. Mode 0600 is claimed before open and sidecars are narrowed afterwards. Diagnostics show what type a value is, never what it holds. The cursor echo in the malformed-cursor error goes back only to the caller who supplied it. Symlinked db_path was considered.\n\nOperability: bin shebang, exports, files=[dist] and npm pack --dry-run were checked. Source maps ship without src, but that comes from the repo-wide base config, so it is not filed here.\n\nReproduced: (a) replacing the db file by rename under a live subscription, using a vitest repro; (b) a cursor skip after a backup restore once the sequence passes the reader's cursor; (c) the precreate open() blocking on a FIFO, plus the O_NONBLOCK fix returning ENXIO and still creating the file at 0600.\n\nMutation runs: 27 single-edit mutations against the whole package suite, each verified to apply (exact-count match) and restored with git checkout; the tree was clean afterwards. Killed: M1 high-water, M2/M3 orphan checks, M4 prune >=, M5 no-such-table, M6 statement clear, M7 precreate, M9 diag reset, M10 while->if, M12 generation++, M15 lastSeen=0, M16 full-batch delay, M20 storeId check, M22 stopped=false, M28 prune lock-quiet, M29 restrict target, M31 storeFiles, M32 WAL retry lock-only, M34 fatal stop, M35 MAX_PAGE. Survived: M8 (poll failures reset on success), M23 (pruneFailures reset), M11 (validate-time retentionCutoff call), M33 (tick-start tornDown guard). Also survived, judged equivalent or redundant and not filed: M19 (LOCKED code arm, which the message regex also covers), M27 (storeId cleared on disconnect, which require() on the cleared statements still covers) and M30 (prune counters reset in connect)."
+  },
+  {
+   "target": "redis",
+   "nothingFound": false,
+   "findings": 11,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. Read every file in src/ (index, read-loop, entry-id, entry, client, config, diagnostics, cli), plus README, package.json, and the conformance clause table. Read support/test-hygiene/conformance/knob-effects/metadata/hostile-config-render/config-fixtures in full and skimmed the rest through their describe tables. Read node-redis 1.6.1 socket.js and client.js (connect loop, disconnect, SETINFO handshake), and core's fetchRecentBlocking, deliverPage and seam.ts. Seam check: core and conformance src never import parley-redis (the only hit is a user-facing string in config-diagnostics.ts). Redis src imports only core, net-util and redis. The only redis change since 7bce79e is one test file. I ran a throwaway container critic-redis-r22 (redis:7-alpine with --appendonly no --save \"\", on 127.0.0.1:16391) and removed it at the end. Reproductions on that server: password rotated while subscribed, maxclients during a reader reconnect (handled correctly as transient), a long poll after password rotation, and connect_timeout_ms timer overflow through a 20ms-latency proxy. I ran 37 single-edit mutations through a harness that refuses to run unless exactly one match is replaced and prints the diff stat. Killed: polled arm answering at once, cap off-by-one, no sub-ms floor, no connecting-exclusion, no lifecycle serialize, teardown order, no MAX_ENTRY_ID guard, uint64 check, second EXISTS probe, seq compare, timestamp clamp and its off-by-one, raw ts forward, retention floor and ~, in_reply_to field, tail captured as '$', disableOfflineQueue, PING, DEGRADED >=, refusal not retired, no RESUMED, isCurrent after read, no gen check after reader connect, heal at equality, refusal-regex word boundary, and six redaction/risk mutations in diagnostics. Survived: delay(1) backoff, no failure reset after success, no post-nap gen check in polledRead, and refusal rethrow when superseded (an equivalent mutation, because teardown never yields a RESP refusal, so not filed). Lint holes shown by mutation: an `export \u2026 from 'zod'` added to src kept metadata.test green, and a top-level `it(` plus `describe.concurrent(` added to a gated file kept test-hygiene green. Rewording one README phrase turned readme.test red with no code change. Lenses with nothing filed, and what I tried: security held under six redaction/risk mutations, and there are no secrets in core. Protocol held: exclusive-since with bare-ms cursors matches XRANGE `(` and XREAD semantics, an empty page's cursor stays byte-stable at '0-0', and the heal races between XRANGE, streamTail and XREVRANGE close. Operability held: bin, exports and files are wired, the shebang is present, and prepublishOnly builds. I also checked a quadratic BigInt parse on huge cursors: 70ms per MB, not filed."
+  },
+  {
+   "target": "postgres",
+   "nothingFound": false,
+   "findings": 9,
+   "errored": false,
+   "checked": "Worktree /home/patrick/Projects/.careening/worktrees/postgres verified at 0025502. HEAD commit touches no file under packages/bridge-postgres (only core + conformance), so this is a full-surface re-review of an unchanged package against a changed core/conformance. Inventory: 11 src files (index.ts PostgresPlugin + connect/open/bootstrapCheckout/prune/disconnect/post/fetchRecent/readPage/subscribe/startSubscription/resolveIdentity/registerSender; listener.ts acquireListen/releaseListen/ensureListener/createListener/adoptListener/heartbeat/redrive/wireListener/reconnectListener/withDeadline; push.ts drain/scheduleRedrain/clearRedrain; state.ts PluginState; read.ts newestMessages/messagesSince/rowToMessage/pageResult; schema.ts assertTableName/schemaNames/quotedNames/channelFor/buildSchema; errors.ts assertCursor/assertStorable/subscribeFailed/dialAbandoned/answerNeverCame/answerAbandoned/bootstrapForbidden/lockWaitAbandoned/serverRefused; config.ts validateBackendConfig/plaintextCredentialOrigin/usesDefaultCredentials/describeRisk/configRisks; connection.ts openPool/endWithin/SOCKET_BOUNDS; cli.ts) + README + package.json, 35 test files + 4 helpers. Seam: import graph of src is core, net-util, pg, pg-connection-string, node:crypto only; nothing in bridge-core/src, conformance/src or net-util/src imports this package (the one core hit is a test-hygiene registry string). Ran the whole package suite once against my own throwaway postgres:16-alpine (critic-postgres-r22, 127.0.0.1:15439, compose flags; torn down) as the mutation baseline. Mutations, each checked as applied before the run: releaseListen made a no-op (SURVIVED, all 1059 green); heartbeat removed (killed by silent-peer black-hole row); reconnect redrive removed (killed, 7); re-LISTEN on reconnect removed (killed, 11); drain pending re-run removed (killed); prune loop cut to one batch (killed by prune-bounded/retention); function prosrc skip forced to always replace (killed by the privilege grid); post checkout serverRefused wrap removed (killed by index-key-budget refusal rows); initial drain after LISTEN removed (killed by subscribe-race). Reproduced: COMMIT answer lost leaves the row stored while post() says 'Nothing was written'; env PGUSER/PGPASSWORD + remote non-TLS DSN gives configRisks() == []; a DML-only role refused (42501 must be owner) on a table missing only the _created_at index; pg DeprecationWarning traced to listener.ts:144 heartbeat stacking a second SELECT 1 behind one still in flight. Traced and held: advisory-lock visibility order (locks release after ProcArray end), subscribe tail\u2192LISTEN\u2192drain ordering, drain pending/draining flags with no await gap, reconnect epoch/reconnecting ownership, disconnect claiming starting before awaits, assertCursor/assertStorable boundaries, table-name quoting, LISTEN channel injection (hex digest only), prune server-clock comparison, concurrent-pruner interaction, subscribe join path, adopt-after-end window (microtask only)."
+  },
+  {
+   "target": "matrix",
+   "nothingFound": false,
+   "findings": 9,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. STAGE 1 inventory: 9 source files (index.ts MatrixPlugin + re-exports sanitizeAlias/readRetryAfter/MAX_SYNC_TIMEOUT_MS/ROOM_PRESETS/RoomPreset/MatrixBackendConfig/syncDeadlineMs; cli.ts bin parley-matrix; session.ts MatrixSession; timeline.ts MatrixTimeline/INCREMENTAL_TIMELINE_LIMIT/SYNC_IDLE_PACE_MS/returnedTooFast; wire.ts; config.ts; cursor.ts; alias.ts; diagnostics.ts) and 24 test files plus README, package.json and tsconfigs, 35 items in all. I read all 9 sources and the README in full, plus the core surfaces the new commit added that this plugin feeds into: own-posts.ts, push-loop routesTo/handlerFor, the tools.ts read-before-you-speak guard, mentions.ts, the seam subscribeMentions, and the conformance mentions clause and assertions.ts:80.\n\nSeam: the import graph shows matrix imports only parley-core, parley-net-util and node:crypto. Core holds only one string mentioning parley-matrix, in config-diagnostics, and no import of it.\n\nReproductions (scratch tests in packages/bridge-matrix/test/zz/):\n- Mention routing, via eventToMessage plus core routesTo: `@room`, a reply fallback, an MXID and a matrix.to link each lose every follower.\n- post across a bare reconnect to a second homeserver writes on B with B's token.\n- A hollow createRoom 200 leaves the room cache holding undefined.\n- Reads across a reconnect are correctly gated today.\n\nMutations (each verified as applied with cmp, then reverted; 18 run against the fake-driven files):\n- Killed (11): shared-room tag gate, reincluded page-fullness, pace floor, unadvanced next_batch, rejoin co-presence, report throttle, exclusive-since slice, timestamp range, emptyWindowCursor stale throw, recentWindow stale guard, acceptedJoinRules, state_key filter.\n- Survived (4): existingRoom gate after lookupAlias (makes a cross-host join), existingRoom gate before the cache set (poisons the cache), subscribe gate after ensureRoom, and the explicit-default-password risk.\n- Survived but not findings: the joinRule===undefined mutant is equivalent; the membershipIn reverse() mutant only changes diagnostic text.\n\nLenses where I found nothing:\n- protocol-conformance: dedup on event_id, exclusive since and cursor forms all hold under mutation.\n- operability: exports/bin/files/prepublishOnly look right, and CI runs typecheck:test.\n- design: the ignored post identity is documented.\n\nI did not stand up my own Synapse, so the live conformance suite (including the new mention clause), live-per-topic and catchup-loop-termination were not run."
+  },
+  {
+   "target": "xmpp",
+   "nothingFound": false,
+   "findings": 13,
+   "errored": false,
+   "checked": "Worktree HEAD verified 0025502. Stage 1 inventory: 10 source files (index.ts XmppPlugin connect/disconnect/post/fetchRecent/subscribe/resolveIdentity plus re-exports; connection.ts; archive.ts; rooms.ts; inbound.ts; stanzas.ts; config.ts; jid.ts; cli.ts; xmpp.d.ts), plus README.md, package.json, 33 test files, fake-xmpp.ts and live-xmpp.ts. That is 47 items. I read every source file in full, the README, the package.json, and the core seam (seam.ts), plus the core code the new commit added (push-loop routesTo, own-posts, tools.ts deliverPage/unreadBeforePost/doPost, mentions, channel-emit).\n\nSeam integrity: grep shows no bridge-core, conformance or net-util import of bridge-xmpp. xmpp src imports only parley-core, net-util, @xmpp/client and node:crypto. bridge-xmpp was last changed in 7bce79e, so adding agent addressing needed no xmpp change.\n\nProtocol conformance: I ran the shared conformance suite live against my own throwaway Prosody (critic-xmpp-prosody-r22 on 127.0.0.1:15222, image and config from examples/dev-compose, removed afterwards). It ran, not skipped.\n\nOperability: built the package with tsc -b and ran npm pack --dry-run. dist plus README and LICENSE ship, the cli.js shebang is kept, and the .d.ts files need no @xmpp/client declaration.\n\nSecurity: plaintext classifier, userinfo stripping, default-password warning, XML-illegal codepoints, attribute normalisation, stanza-id `by` filter, delay `from` filter, MAM result provenance, error-stanza provenance, origin-id correlator randomness. All held under mutation.\n\nMutation testing: 50 mutations, each confirmed applied (exactly one match) and reverted, full package suite run per mutation. 46 were killed. Survivors:\n- B2: disconnect does not reject pending posts. I reproduced the 15 s hang.\n- B5: forward tail keeps the first page's tail.\n- B34: onOccupancyLost not-joined guard.\n- B35: onStanza stopped guard.\n- B3: dropping the live `body === null` guard. This is an equivalent mutant: core's parseMentions throws on null inside safeDeliver's containment, so nothing observable changes. Not reported.\n\nReproduced with a scratch test (since removed): the MAM two-step cycle spin (1421 round trips in 1.5 s, still running), the bodied cycle returning since and duplicates, and the from-less archive sender becoming the login name. The read-before-post fail-open is traced through tools.ts unreadBeforePost and read-path-creation's pinned empty page. Per-file durations were measured for the hygiene findings."
+  },
+  {
+   "target": "nats",
+   "nothingFound": false,
+   "findings": 8,
+   "errored": false,
+   "checked": "Worktree HEAD verified at 0025502. Read every src file (13: index, session, read, pull, live, jetstream, streams, cursor, naming, payload, cli, config, plus package.json/tsconfig/README) and the test helpers, fake, agreement and hygiene files, with test names enumerated for all 31 test files. Read the new core OwnPosts, push-loop routing and the mentions conformance clause to check NATS against the new self-echo and mention seam: post id and live id share one incarnation cache, and NATS takes the no-feed branch of the mention clause. Seam check: core/conformance/net-util have no import of nats or bridge-nats; nats imports only public core/net-util exports; git diff --stat packages/bridge-core is empty. Stood up private containers critic-nats-r22 (anonymous, :14229) and critic-nats-auth-r22 (auth, :14230) from the dev-compose image, both torn down. Reproduced: (a) the duplicate post id via a foreign catch-all stream, then applied the expect.streamName fix and re-ran the full suite (green except the probe); (b) the README conformance recipe silently skipping. Mutation sweep: 29 mutants over live/read/pull/index/session/streams/cursor/payload/config/naming, each checked as applied by exact-count replacement. Killed: m1-m11, m13-m15, m17, m18, m20-m24, m27-m29. Survived: m12 (blockingFetch cleanup wait), m16 (retired break), m19 (Array.isArray), m25 (connecting guard), m26 (streamForRead stopped check; traced as at most a 250ms early-exit optimisation, since the next existingStream throws on cleared handles, so not reported). Security: prefix validation, topic fold, URL-credential refusal, plaintext warning and payload totality traced and held under mutation (m18, m27, m29 killed). Protocol: exclusive since, restarted-incarnation reads, pruned-window clamp and the stitched backwards walk all have killing tests (m2, m9, m22, m23). Lost wakeup: the long-poll pulls from a StartSequence consumer rather than a re-query-then-wait, so there is no gap to reopen. Operability: exports/bin/files/prepublishOnly/engines/references inspected, held."
+  },
+  {
+   "target": "zulip",
+   "nothingFound": false,
+   "findings": 9,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. Read every src file (index, wire, connection, push-loop, history, http, pacing, config, cli), README, package.json, the new mention-feed test, the fake's queue fan-out, and the core consumers of this package's output (bridge-core mentions.ts, seam.ts subscribeMentions, transport/push-loop.ts, allowlist.ts) plus the conformance mention clause and expectWellFormedMessage. Seam check: the zulip src imports only from parley-core and parley-net-util, and core has no runtime import of zulip. I ran a probe test against the fake: subscribeMentions with a message injected on Zulip topic 'Project-X' was delivered as topic 'project-x', and buildZulipMessage('hi @**alice**') gave mentions ['alice'] while parseMentions gave []. Mutations, each checked as applied: dropping the lastDeliveredId watermark (killed); dropping post's assertGeneration (killed); widen=0 in history (killed); dropping the queueProven backoff (killed); dropping the is_active filter (killed); dropping the mention filter (killed); dropping the site_url userinfo check (killed); dropping allowStatuses [400] (killed); removing U+001C-1F from the body strip set (killed). Four survived: topicOf without lowercase, the claim lookup without lowercase, the wildcard set cut to {all, topic}, and re-register narrowing the mention feed to one topic. Probe file removed afterwards and the tree is clean."
+  },
+  {
+   "target": "discord",
+   "nothingFound": false,
+   "findings": 9,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. STAGE 1 inventory: 12 source files (index.ts DiscordPlugin post/fetchRecent/fetchSince/pager/subscribe/unpushableReason/resolveIdentity; session.ts DiscordSession connect/disconnect/forgetTopics/dispatch/channelId/require; catchup.ts newestWindow/windowSince/walk/pageWithin/outOfBudget/MIN_QUERY_BUDGET_MS; gateway.ts DiscordGateway restart/stopSocket/dial/resolveUrl/openSocket/gatewayDialUrl/TERMINAL_CLOSE; ladder.ts IdentifyLedger/GatewayLadder ensureUp/chargeDialAttempt/scheduleReconnect/stop/resetLadder plus 9 exported constants; config.ts assertKnownBackendConfig/SHAPE_REFUSALS/CONFIG_SHAPES/requireDistinctChannels/requireRoutableChannel/MAX_DIALERS; wire.ts toMessage/renderMentions/pageRecords/hasUsableId/botAccount/dispatchedMessage/errorCode/unpushableChannelReason/countCharacters/heartbeatIntervalOf; rest.ts DiscordRest/USER_AGENT/readRetryAfter; creds.ts configRisks/describeRisk; diagnostics.ts warn/reasonOf/shapeOf; intents.ts REQUIRED_INTENTS/INTENTS; cli.ts), plus README.md and package.json, plus 21 test and fixture files: 35 items in all. STAGE 2: listed about 28 README, JSDoc and test-name claims and checked each one against the code. STAGE 3/4, lens by lens. Seam: I grepped the import graph. Discord imports only parley-core, parley-net-util, ws and node:fs, and nothing in core, net-util or conformance imports Discord. The core diff in HEAD came from the agent-addressing feature, not from Discord. The new optional subscribeMentions is correctly left unimplemented. Protocol: exclusive ?after= is resolved by the server; nextCursor echoes since on an empty page; the minted cursor '0' can be replayed; dedup is by snowflake id; only 10003 maps to NoSuchTopicError; the conformance mention-feed fallback passes because it posts plain text. Concurrency: I traced generation and epoch guards, close-after-retire, the ladder's ownership check, the per-socket heartbeat, the ready memo after a post-READY close (benign), subscribe parked across connect() (benign), and the IDENTIFY ledger outliving connect(). Security: the token never reaches a diagnostic; plaintext-scheme warning; dot-segment guard; allowed_mentions default; inbound text stays data. Operability: bin, exports, files; USER_AGENT version read from the shipped package.json; no 5xx retry on POST. STAGE 5: I made 30 single-edit mutations through a script that checks the pattern matched before running the suite. Killed: M1 pager generation, M2 n0 rethrow, M6 stale close, M7 ladder ownership, M8 clock skew, M9 arm-before-send, M10 unknown-user, M12 dot-dot, M13 UTF-16, M14 empty id, M17 op9 wait, M18 second HELLO, M21 stable reset, M22 ceil, M24 readyState, M41 unpushable keeps sub, M47 limit cap, M49 terminal set. Survived: M3, M4, M16, M23, M25, M26, M28, M36, M37, M44, and M48 (a deliberate near-no-op control). Reproduced: Discord mention routing (probe test calling core routesTo on toMessage output); a malformed gateway_url (probe: subscribe resolves, one 'Invalid URL' line, ladder retries forever); a README rewording breaking readme.test (3 failures). I started no containers; this backend has no compose service."
+  },
+  {
+   "target": "slack",
+   "nothingFound": false,
+   "findings": 9,
+   "errored": false,
+   "checked": "Worktree HEAD verified as 0025502. STAGE 1 inventory: 9 source files, about 47 exported or entry symbols (api.ts 10, config.ts 12, history.ts 1, index.ts SlackPlugin plus re-exports, link.ts 1, markup.ts 3, messages.ts 6, socket.ts 6, cli.ts entry), plus package.json, README, 2 tsconfigs, and 18 test files, the fake, the harness and source-tree. STAGE 2: read every JSDoc and README claim. STAGE 3/4 by lens:\n- seam-integrity: grep of the import graph found only @sharptrick/parley-core and parley-net-util imports, and core mentions slack only in a comment. git diff on bridge-core is empty.\n- correctness / protocol: reproduced the HEAD interaction between core's new routesTo and Slack's renderMentions (broadcasts and unmapped ids silence followers), malformed since wedging the window, and glued-mention loss. Exclusive since, ordering, dedup and limit floor are graded by surviving tests (killed mutants M1-M4, M12, M17, M18, M21).\n- concurrency: traced ensureSocket, the cooldown wait, openSocket, close/rotation/reconnect ownership, session guards and stale-callback clobbering.\n- security: escape order (M14 killed), the socket-URL downgrade guard (M11 killed), null-prototype maps, api_url validation, users_not_found narrowing (M23 killed).\n- operability: exports, bin and files; @types/ws must be a runtime dependency because socket.d.ts imports ws types re-exported via index; CI runs typecheck:test, so the Driven compile guard is live.\n- test-hygiene: reviewed harness bypass counts (http-contract and hostile-input bypasses are legitimate custom-server or refused-config cases) and the README-asserting tests.\nSTAGE 5 mutations (23 applied and verified by cmp; M15 re-applied after a quoting miss). Killed: M1-M6, M8, M9, M11-M21, M23. Survived: M7 (reconnect floor; unreachable), M10 (session guard on the cooldown leak; vacuous test), M22 (clearTimeout on grace after close; an equivalent mutant, since closing an already-closed socket is a no-op). All sources restored (git status clean)."
+  },
+  {
+   "target": "telegram",
+   "nothingFound": false,
+   "findings": 12,
+   "errored": false,
+   "checked": "Worktree HEAD verified at 0025502. I read every source file under packages/bridge-telegram/src (index, cli, api, chats, config, cursor, diagnostics, journal, poll, store, store-file, wire), the README, package.json, both tsconfigs, rig.ts, fake-telegram.ts (request handling), and these tests: conformance, guarantees, docs, store-torn-write. I also read core's seam.ts, mentions.ts, the push-loop.ts diff from HEAD, and conformance cases/mentions.ts, because the HEAD commit changed mention routing under this plugin.\n\nLens by lens:\n- seam-integrity: checked the import graph. telegram/src imports only parley-core, parley-net-util and node built-ins. No core, conformance or net-util source imports telegram. The one reference from core is in a test (source-hygiene.test.ts, as a witness file path). The HEAD commit touched no telegram files.\n- protocol-conformance: exclusive `since` is a numeric seq compare, and mutating it to `>=` failed 33 tests. Dedup is on the composite `chat:mid`, never on the timestamp. The cursor's epoch is byte-stable. An empty page holds `since`. Ordering is ascending per chat.\n- concurrency: traced connect/disconnect generation races (connect racing disconnect, two connects, a resolution that settles after teardown) and post teardown between the send and the ingest. All held. Reproduced a torn append.\n- security: redaction boundary, fromCaller sanitising, plaintext api_url warning, 0600 store, O_NOFOLLOW opens. Probed prototype-key topics.\n- operability: package.json files/bin/exports/engines match the build layout.\n\nProbes I ran and then deleted:\n- A torn-append probe: a held cursor is refused after restart. Reproduced.\n- A complete-line append failure: post rejects with 'did not record it', and the message is served after restart. Reproduced.\n- A mention-routing probe through core's routesTo: '@parley_test_bot please review' gives mentions ['parley_test_bot'] and routed=false for handle 'claude'. Reproduced.\n- A prototype-topic / chat_map-shape probe: TypeError 'text.replace is not a function'; an array chat_map value is accepted. Reproduced.\n- An unused-import probe: tsc TS6133 fires, and CI runs typecheck:test.\n\n21 mutations, each checked to have applied:\n- Killed (15): holding back the ack, epoch compare, evicted-id dedup, EVICTED_ID_MEMORY=5, redacting wrapper, echoed-chat check, limit floor, MIN_IDLE_POLL_MS, served admit, store.has post check, hw mark, byTopic eviction on rejection, 429 backoff doubling, served-mark bound, the `marked > issued` re-mint, allowed_updates.\n- Survived (4): SERVED_ID_MEMORY 1000\u2192999 (expected, because the tests derive from the constant), the encodeURIComponent redaction spelling, the generation guard on the serve callback, and tornTail removal.\n- Polluted: one api.ts redaction mutation was killed only through an unrelated empty-token side effect, so I re-ran a clean version (the survivor above)."
+  },
+  {
+   "target": "shared",
+   "nothingFound": false,
+   "findings": 7,
+   "errored": false,
+   "checked": "Worktree verified at 0025502. Inventory: 66 source/test files across packages/conformance (15 src, 17 test) and packages/bridge-net-util (14 src incl. testing/, 20 test).\n\nConformance: read in full mentions.ts, clauses.ts, index.ts, factory.ts, assertions.ts, poison-record.ts, handles.ts, tool-surface.ts, the live.ts disconnect and livePayload sections, the reference.test.ts / broken-variants / broken-shards harness, the reference-plugin head and the new variants, dependency-direction.test.ts, the README clause list, and the seam.ts subscribeMentions JSDoc. Mutations: a reference feed that replays history in reverse plus a feed that survives disconnect, which stayed green (8/8). A no-listener plus no-feed plugin failed 27 cases, against the README's claim of 10. Traced that no fixture reaches the without-feed arm.\n\nNet-util: read in full index.ts, attempt.ts, timing.ts, errors.ts, retry-after.ts, redact.ts, plaintext.ts, config-value.ts, testing/index.ts, imports.ts, refusal-harness.ts, derived-rows.ts, and the README. Reproduced Authorization-header leaks in a 401 echo and in an undici transport error. Probed importsIn: ImportTypeNode and triple-slash references are invisible. A type import of the redis backend planted in core passed dependency-direction and package-boundaries (82/82). Ran 12 single-edit mutations over net-util src: 8 killed; 3 survived (readBounded boundary, redaction length floor, DOOMED_BODY_BYTES near-equivalent); the symbol branch in config-value also survived but is unreachable from YAML/JSON.\n\nImport graph of both packages' src: only parley-core, parley-core/testing (an exported subpath), node:*, typescript and vitest, so no backend edge. No containers started."
+  },
+  {
+   "target": "repo",
+   "nothingFound": false,
+   "findings": 11,
+   "errored": false,
+   "checked": "Worktree /home/patrick/Projects/.careening/worktrees/repo at HEAD 0025502 (verified). Read CLAUDE.md, CONTRIBUTING.md, the root README claims, all four workflows, .releaserc.json, every script in scripts/, vitest.config.ts/setup, the root tsconfigs, and the earlier rounds' findings JSON (to tell recurring findings from new ones). Measurements:\n(a) package.json matrix over all 15 workspaces: name, version, engines, type, bin, exports, files, publishConfig, scripts, and every dependency kind. Only drift: sqlite's engines is >=22.5.0. @types in dependencies was already adjudicated in r19.\n(b) tsconfig.test.json: hashed all 15. There are two families (`tsc -b`, extends ./tsconfig: sqlite and xmpp; `-p` with base: the rest). I mutated a type error into a test in sqlite, xmpp and redis, and all three reddened, so both families do work.\n(c) cli.ts: the task's 'known live example' is stale. All ten are now 5-line `runBackendCli` calls into bridge-core/src/cli, and sqlite's args.ts/shutdown.ts are gone.\n(d) Duplicated code: 8-line windows hashed across packages. The only surviving cross-package copy is the concurrentPost harness (finding 1).\n(e) Repeated test-file names across packages, built into a matrix (creds-warning, hostile-config-render, lifecycle, export-surface, etc.). Also a configRisks/describeRisk matrix: all 9 network backends test it, under 5 different file names.\n(f) Ran slack's argument-explosion AST lint over every package's src: 7 hits, all bounded, so not a finding. Ran discord's private-member-cast AST lint over every test: 57 hits (finding 2).\n(g) Runtime barrel export counts per built package (finding 5).\n(h) Refusal-label regexes and SECURITY-warning delivery tabulated (finding 6).\n(i) Witnesses that name another package's path: a scripted scan found 10 (finding 4).\n(j) Every workspace-set enumerator (finding 10).\n(k) git checks: the backend-adding commits did not touch core; seam.ts changed 5 times since the S-3/S-4 seam commit (aa04e84); latest tag is v0.10.0.\nMutations, all reverted: a stale KEEPS entry (stayed green), renaming telegram src/config.ts (core went red), renaming nats `nc` (4 of 6 lifecycle tests stayed green). I started no containers."
+  }
+ ],
+ "byLens": {
+  "correctness": {
+   "total": 18,
+   "confirmed": 18,
+   "blocking": 9
+  },
+  "design-principles": {
+   "total": 10,
+   "confirmed": 9,
+   "blocking": 1
+  },
+  "security": {
+   "total": 8,
+   "confirmed": 8,
+   "blocking": 3
+  },
+  "test-integrity": {
+   "total": 36,
+   "confirmed": 36,
+   "blocking": 6
+  },
+  "truth-in-docs": {
+   "total": 23,
+   "confirmed": 23,
+   "blocking": 2
+  },
+  "maintainability": {
+   "total": 12,
+   "confirmed": 12,
+   "blocking": 0
+  },
+  "test-hygiene": {
+   "total": 13,
+   "confirmed": 13,
+   "blocking": 0
+  },
+  "concurrency-and-failure": {
+   "total": 14,
+   "confirmed": 10,
+   "blocking": 5
+  },
+  "protocol-conformance": {
+   "total": 4,
+   "confirmed": 3,
+   "blocking": 0
+  },
+  "operability-and-release": {
+   "total": 3,
+   "confirmed": 2,
+   "blocking": 0
+  },
+  "seam-integrity": {
+   "total": 3,
+   "confirmed": 3,
+   "blocking": 2
+  }
+ }
+}

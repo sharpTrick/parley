@@ -121,6 +121,11 @@ interface BackendPlugin {
   //    (emit <channel> event). See §9.
   subscribe(topic: Topic, handler: (msg: Message) => void): Promise<void>;
 
+  // 2b. OPTIONAL mention feed: what names `handle`, from ANY topic, under subscribe's terms.
+  //     A backend without it still delivers mentions on subscribed topics; a mention elsewhere
+  //     then reaches the agent only through fetchRecent. Zulip offers it.
+  subscribeMentions?(handle: Handle, handler: (msg: Message) => void): Promise<void>;
+
   // 3. Write a message to a topic as a given identity. Single centralized write path.
   post(topic: Topic, identity: Handle, content: string,
        opts?: { inReplyTo?: BackendMsgId }): Promise<BackendMsgId>;
@@ -269,9 +274,21 @@ dedup is a second line under it, not a licence for a plugin to deliver a message
   written to the **backend** via `post` so it lives in durable history for the next
   catch-up. Rule: *replies always write to the backend; the live channel is only the fast
   hop.* Otherwise the instance's own messages vanish on restart.
-- **Live-push filtering.** The live path forwards every message it receives in subscribed topics
-  (which is a subset of them — §6); handle-mention is a **filter flag**, not a separate
-  subscription. Filtering lives in one place in `bridge-core`.
+- **Live-push routing.** Filtering lives in one place in `bridge-core`. A message reaches every
+  instance following its topic (a subset of them — §6), and an instance it **mentions** on any topic
+  its backend's mention feed carries (§4, 2b). A message the backend marks as **explicitly
+  addressed** in its own syntax (`Message.addressed`; Zulip's `@**handle**`) reaches only the
+  instances it addresses or mentions, and no other follower. Only an address counts for that: a plain
+  `@word` is too often code, a decorator or a broadcast spelling to withhold a message on.
+  `mention_filter` narrows further: only messages naming this instance. An instance is never pushed
+  its own messages; it recognises them by the ids its writes returned, since a backend may stamp a
+  sender of its own.
+- **Read before you speak.** `parley_post`/`parley_reply` first read the topic from the author's
+  baseline — a cursor it names, else its read position — paging on while the cursor advances, and
+  if that turns up messages it was never shown (by push or by a read; on-start catch-up shows it
+  nothing), write nothing and hand those over instead. The author's own
+  messages from this session never count (the stateless HTTP root keeps no such record). The read and the write are not atomic, and need not be: the point is that
+  reading first is not a separate call an agent must remember. `force` skips it.
 - **Catch-up scope.** `fetchRecent` is **single-topic**; core loops once per configured
   topic. Handle-based catch-up = resolve handle → set of topics → loop.
 
@@ -491,6 +508,7 @@ catchup:
 live_push:
   enabled: false           # Code only; chat leaves this off
   mention_filter: false    # true = only surface messages mentioning `handle`
+directory: "..."           # optional: how to reach the other participants (in instructions + whoami)
 permissions:
   skip_permissions: false  # NOT IMPLEMENTED — nothing in core or any plugin reads it (§14).
                            # `true` is a load error rather than an accepted no-op, so it can never

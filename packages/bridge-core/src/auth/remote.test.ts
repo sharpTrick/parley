@@ -245,6 +245,7 @@ describe('remote OAuth front door (single-tenant)', () => {
         'parley_live_status',
         'parley_post',
         'parley_reply',
+        'parley_whoami',
       ]);
       await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'hi via oauth' } });
       const res = (await client.callTool({

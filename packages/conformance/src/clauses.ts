@@ -15,6 +15,7 @@ export const CLAUSES: readonly string[] = [
   'never-posted topic',
   'hands a resuming session everything it missed',
   'via live push and via catch-up',
+  'delivers what names the handle from any topic',
   'either round-trips',
   'post accepts inReplyTo',
   'only the post-subscribe tail',
@@ -38,6 +39,9 @@ export const CLAUSES: readonly string[] = [
  * field↔variant mappings both stop above these, so each term owns a `BROKEN_VARIANTS` entry — else
  * its assertions can all be deleted with this package, negative control included, staying green.
  *
+ * - `addressed-within-mentions`: every handle a message is explicitly `addressed` to is also in its
+ *   `mentions`. A mention feed delivers by `mentions`, so an address outside them is withheld from
+ *   every follower it does not name and reaches its addressee through no feed either.
  * - `nextCursor-agreement`: a page's `nextCursor` is the cursor of the last row IT returned, never
  *   the topic's tail — reporting the tail on a truncated page drops everything in between.
  * - `nextCursor-stability`: an empty page's cursor does not move, so a drained catch-up loop stays
@@ -137,6 +141,7 @@ export const CLAUSES: readonly string[] = [
  *   live path "contains" a fault by going quiet.
  */
 export const ASSERTED_PROPERTIES: readonly string[] = [
+  'addressed-within-mentions',
   'nextCursor-agreement',
   'nextCursor-stability',
   'limit-honoured',

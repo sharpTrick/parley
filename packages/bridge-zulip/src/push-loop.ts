@@ -1,30 +1,52 @@
-import { type Message, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
+import { type Handle, type Message, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import type { QueueState, ZulipConnection } from './connection.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
-import { asArray, buildZulipMessage, type EventsResponse, zulipMessageId } from './wire.js';
+import { asArray, buildZulipMessage, type EventsResponse, type ZulipMessage, zulipMessageId } from './wire.js';
 
-/**
- * The live path (DESIGN §9 — genuine events, not a poll timer). The queue is awaited before this
- * resolves, so a post immediately after subscribe() is guaranteed to be queued, and Zulip delivers
- * our own sends to our own queue, matching the seam's echo expectation.
- *
- * Delivery is a subset of the tail (DESIGN §6) — but never a repeat. Keep `lastDeliveredId`: an
- * event carrying an id the loop cannot ack leaves the queue position unmoved, and the server then
- * hands back the message behind it on every poll until the fault clears.
- */
 const replacedDuringHandshake = (): Error =>
   new Error(
     'Zulip connection was replaced while subscribe() was registering its event queue, so no ' +
       'subscription exists on the connection this call addressed. Reissue it.',
   );
 
+/** The topic a stream-wide queue's message was posted on; one it cannot place is not delivered. */
+const subjectOf = (m: ZulipMessage): string => {
+  if (typeof m.subject !== 'string') throw new Error('Zulip message event carries no topic to place it on');
+  return m.subject;
+};
+
+/**
+ * What one push loop listens to: one topic, or every topic in the stream for messages that mention
+ * a handle — the seam's optional mention feed, placed by each message's own topic.
+ */
+type PushScope = { topic: Topic } | { mentioning: Handle };
+
+/**
+ * The live path (DESIGN §9 — genuine events, not a poll timer). The queue is awaited before this
+ * resolves, so a post immediately after subscribe() is guaranteed to be queued, and Zulip delivers
+ * our own sends to our own queue, matching the seam's echo expectation.
+ *
+ * Delivery is a subset of the tail (DESIGN §6) — but never a repeat. Keep the delivered-id watermark: an
+ * event carrying an id the loop cannot ack leaves the queue position unmoved, and the server then
+ * hands back the message behind it on every poll until the fault clears.
+ */
 export async function startPushLoop(
-  conn: ZulipConnection, topic: Topic, handler: MessageHandler,
+  conn: ZulipConnection, scope: PushScope, handler: MessageHandler,
 ): Promise<void> {
   const generation = conn.generation;
   const signal = conn.teardown.signal;
   const alive = (): boolean => !conn.stopped && conn.generation === generation;
-  const wire = conn.claimWireTopic(topic);
+  const wire = 'topic' in scope ? conn.claimWireTopic(scope.topic) : undefined;
+  const label =
+    'topic' in scope
+      ? `push loop for topic ${JSON.stringify(scope.topic)}`
+      : `mention feed for ${JSON.stringify(scope.mentioning)}`;
+  const deliverTo: MessageHandler =
+    'topic' in scope
+      ? handler
+      : (m) => {
+          if (m.mentions.includes(scope.mentioning)) handler(m);
+        };
   // Keep the queue's own transport pinned here, so that abandoning it drops it on the server that
   // minted it rather than offering its id to whatever connection replaced this one.
   const rest = conn.rest;
@@ -33,7 +55,12 @@ export async function startPushLoop(
   // calls `process.exit(0)` the moment shutdown resolves, so whatever is still in flight then is
   // killed mid-request rather than finished.
   /** The newest message id handed to the handler; anything at or below it has already gone out. */
-  let lastDeliveredId: number | undefined;
+  /**
+   * The newest message id handed over, per topic. Keep it per topic, so that on the stream-wide
+   * mention feed a lower id committed late on one topic — Zulip commits ids out of order — is not
+   * suppressed by a higher one already delivered on another.
+   */
+  const lastDelivered = new Map<string, number>();
   let reg: Awaited<ReturnType<typeof rest.register>>;
   try {
     reg = await rest.register(wire, signal);
@@ -64,13 +91,13 @@ export async function startPushLoop(
   let parking = true;
   const deliver = (build: () => Message): void => {
     if (!alive()) return;
-    safeDeliver(handler, build);
+    safeDeliver(deliverTo, build);
   };
   const backoff = async (reason: string): Promise<void> => {
     consecutiveFailures++;
     if (reportsLoopFailure(consecutiveFailures)) {
       console.error(
-        `[parley-zulip] push loop for topic ${JSON.stringify(topic)} has failed ` +
+        `[parley-zulip] ${label} has failed ` +
           `${consecutiveFailures}× in a row (${reason}); still retrying, backing off`,
       );
     }
@@ -147,9 +174,17 @@ export async function startPushLoop(
       const record = ev.message;
       const id = zulipMessageId(record);
       if (record === undefined || id === undefined) continue;
-      if (lastDeliveredId !== undefined && id <= lastDeliveredId) continue;
-      lastDeliveredId = id;
-      deliver(() => buildZulipMessage(topic, record, id));
+      const watermarkKey = 'topic' in scope ? '' : String(record.subject ?? '').toLowerCase();
+      const last = lastDelivered.get(watermarkKey);
+      if (last !== undefined && id <= last) continue;
+      lastDelivered.set(watermarkKey, id);
+      deliver(() =>
+        buildZulipMessage(
+          'topic' in scope ? scope.topic : conn.topicOf(subjectOf(record)),
+          record,
+          id,
+        ),
+      );
     }
     // Grade the answer on whether it MOVED the queue, not on whether it carried bytes: a parked
     // poll the ack cannot advance past is re-issued unchanged forever. Keep it paced, so that a

@@ -1,13 +1,13 @@
 import {
-  Allowlist,
   asHandle,
   asTopic,
-  LiveDeliveryLedger,
+  parseConfig,
   registerTools,
   SeenSet,
   type Cursor,
   type Topic,
   type ToolDeps,
+  toolDepsFor,
 } from '@sharptrick/parley-core';
 import { describe, expect, it } from 'vitest';
 import { MatrixPlugin } from '../src/index.js';
@@ -95,16 +95,14 @@ describe.skipIf(!up)('the catch-up loop ends on a cursor that stopped, not on an
     const writer = asHandle('writer');
     try {
       const positions = new Map<Topic, Cursor>();
-      const deps: ToolDeps = {
+      const deps = toolDepsFor(
         plugin,
-        identity: writer,
-        allow: new Allowlist([String(mine)]),
-        seen: new SeenSet(),
-        readState: { get: (t) => positions.get(t), set: (t, c) => void positions.set(t, c) },
-        blockMaxMs: 60_000,
-        blockPollIntervalMs: 20,
-        live: new LiveDeliveryLedger([mine]),
-      };
+        parseConfig({ identity: { handle: String(writer) }, topics: [String(mine)] }),
+        {
+          seen: new SeenSet(),
+          readState: { get: (t) => positions.get(t), set: (t, c) => void positions.set(t, c) },
+        },
+      );
       const fetchRecent = toolOf(deps);
 
       await plugin.post(mine, writer, 'mine-0');

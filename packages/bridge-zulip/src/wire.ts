@@ -1,4 +1,4 @@
-import { buildMessage, type Message, type Topic } from '@sharptrick/parley-core';
+import { buildMessage, type Handle, type Message, parseMentions, type Topic } from '@sharptrick/parley-core';
 import { bodyRetryAfter } from '@sharptrick/parley-net-util';
 
 /** The subset of a `GET /api/v1/users` member we read; `full_name` is set by that member. */
@@ -13,6 +13,8 @@ export interface RealmMember {
 export interface ZulipMessage {
   id: number;
   content?: string;
+  /** The topic, which a queue narrowed to a whole stream needs to place the message. */
+  subject?: string;
   sender_email?: string;
   /** Unix seconds. */
   timestamp?: number;
@@ -109,13 +111,42 @@ export function zulipMessageId(m: ZulipMessage | undefined | null): number | und
 }
 
 export function buildZulipMessage(topic: Topic, m: ZulipMessage, id: number): Message {
+  const content = typeof m.content === 'string' ? m.content : '';
   return buildMessage({
     topic,
     sender: typeof m.sender_email === 'string' ? m.sender_email : '',
-    content: typeof m.content === 'string' ? m.content : '',
+    content,
     timestamp: isoTimestamp(m.timestamp),
     id: String(id),
+    addressed: zulipMentions(content),
   });
+}
+
+/**
+ * Zulip's own mention syntax in a message's markdown source — `@**name**`, or `@**name|id**` as
+ * the compose box writes it. A silent mention (`@_**name**`) notifies nobody, and the wildcards
+ * address everyone on the topic, so neither names a participant. A name that is not a handle Parley
+ * can parse (a human's "First Last") is no participant of Parley's either.
+ */
+const ZULIP_MENTION = /(?<![^\s'"(,:<])@\*\*([^*|\n]{1,100}?)(?:\|\d+)?\*\*/g;
+
+/**
+ * The markdown Zulip renders without mentions: code fences, inline code and block quotes. Zulip
+ * neither links nor notifies a name written there, so it addresses nobody.
+ */
+const UNADDRESSABLE = [/^(```|~~~)[^\n]*\n[\s\S]*?(?:^\1[^\n]*$|(?![\s\S]))/gm, /`[^`\n]*`/g, /^[ \t]*>.*$/gm];
+const ZULIP_WILDCARDS = new Set(['all', 'everyone', 'stream', 'channel', 'topic']);
+
+function zulipMentions(content: string): Handle[] {
+  const out = new Set<Handle>();
+  const addressable = UNADDRESSABLE.reduce((text, region) => text.replace(region, ' '), content);
+  for (const match of addressable.matchAll(ZULIP_MENTION)) {
+    const name = match[1]!;
+    if (ZULIP_WILDCARDS.has(name.toLowerCase())) continue;
+    const [handle] = parseMentions(`@${name}`);
+    if (handle === name) out.add(handle);
+  }
+  return [...out];
 }
 
 /** Zulip timestamps are Unix SECONDS; an out-of-range or non-numeric one falls back to the epoch. */

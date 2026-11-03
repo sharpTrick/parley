@@ -13,7 +13,7 @@ Parley is an MCP server — the standard way Claude connects to outside tools �
 
 Put plainly, it lets you **share context between Claude chat and Claude Code**, **hand off a task to a coding agent** and get the result back, and keep **humans and agents in the same chat room** — running on a **self-hosted message bus for AI agents** that you operate.
 
-**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-three-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
+**Contents:** [The loop](#the-loop) · [Two ways in](#two-ways-in) · [Quickstart A — local, 5 min](#quickstart-a-the-local-taste-5-min-zero-infra) · [Quickstart B — chat→Code, 15 min](#quickstart-b-the-chat-to-code-hand-off-remote-mode-15-min) · [Today vs. preview](#what-runs-today-and-whats-still-preview) · [How it works](#how-it-works) · [Backends](#backends) · [Tools](#the-five-mcp-tools) · [Configuration](#configuration) · [Remote / chat mode](#remote--chat-mode) · [Compare](#how-it-compares) · [Status](#project-status--maintenance) · [Docs](#docs--license)
 
 ---
 
@@ -160,7 +160,7 @@ Two delivery paths — one is the product, one is a preview. Stated once, here:
 
 ## How it works
 
-Three numbers: **10 backends**, each implementing the same **6 seam methods**; Claude itself calls just **3 MCP tools**.
+Three numbers: **10 backends**, each implementing the same **6 seam methods** (plus one optional mention feed, which Zulip offers); Claude itself calls just **5 MCP tools**.
 
 The *seam* is that one small interface every backend implements. All the hard, backend-independent logic — live push, catch-up, dedup, ordering, reply fan-out, OAuth mode — is written once above it in `@sharptrick/parley-core`. Dependencies point one way: a plugin depends on core, never the reverse.
 
@@ -176,7 +176,7 @@ The *seam* is that one small interface every backend implements. All the hard, b
  catch-up + live push (preview)  post + fetchRecent
 ```
 
-The whole product is these six seam methods:
+The whole product is these six seam methods, plus one optional one:
 
 ```ts
 interface BackendPlugin {
@@ -186,6 +186,7 @@ interface BackendPlugin {
   post(topic, identity, content, opts?): Promise<BackendMsgId>;   // the single durable write
   fetchRecent({ topic, since?, limit? }): Promise<{ messages, nextCursor }>; // catch-up
   resolveIdentity(handle): Promise<BackendIdentity>;
+  subscribeMentions?(handle, handler): Promise<void>;     // OPTIONAL: mentions from any topic (Zulip)
 }
 ```
 
@@ -227,12 +228,13 @@ Every backend clears the identical seam contract — cursor monotonicity, exclus
 
 ---
 
-## The three MCP tools
+## The five MCP tools
 
-Distinct from the six seam methods a backend implements, these are the 3 tools Claude actually calls:
+Distinct from the six seam methods a backend implements, these are the 5 tools Claude actually calls:
 
 - **`parley_fetch_recent`** — catch a topic up from the durable backend. `{topic, since?, limit?, block_ms?, from?}` → `{messages, nextCursor}`. `from: "recent"` asks for the backend's newest page instead of resuming from where this instance last read, without moving that position. `block_ms` long-polls where the backend's own read primitive takes a wait, and is **refused by name** where it cannot — see [Waiting for a reply](#waiting-for-a-reply-block_ms) below.
-- **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?}` → `{backendMsgId}`.
+- **`parley_post`** — publish or hand off into a topic (thread with optional `in_reply_to`). `{topic, content, in_reply_to?, read_through?, force?}` → `{posted: true, backendMsgId}`. Read before you speak: if the topic has messages the author has not been handed, nothing is written and they come back as `{posted: false, unread, nextCursor}`; send it again once read. `@handle` in the content pushes it to that handle; a backend's own address syntax (Zulip's `@**handle**`) also keeps it from every follower it does not name.
+- **`parley_whoami`** — who this instance is and what its bridge can do: handle, followed and post-only topics, version, whether live push and mention push are on, and the operator's `directory` of how to reach the others.
 - **`parley_live_status`** — ask whether the live `<channel>` path is actually delivering, per topic, rather than reading a quiet topic as good news. `{}` → per-topic `delivering` / `not-delivering` / `no-traffic`, or a refusal naming why this deployment cannot tell.
 - **`parley_reply`** — reply into the topic an inbound `<channel>` event arrived from. Like `parley_post`, it's written durably to the backend — the live channel is only the fast inbound hop, so a reply survives restart and shows up in the next catch-up.
 
@@ -288,6 +290,7 @@ a real account:
 | `catchup.block_poll_interval_ms` | `250` | How often core re-drives `fetchRecent` **after** a plugin has come back from a budget early and with nothing for the topic asked for — a page of somebody else's traffic on a backend whose delivery is coarser than a topic, or a native blocker cut short. It does **not** set the delivery latency while a plugin is parked: Redis and NATS spend the budget inside a single `fetchRecent`. Measured on both, a message posted 400 ms into an 8 s budget arrived at 402 ms and an idle 1 200 ms budget returned at ~1 205 ms — identical at a cadence of 250 ms and of 5 000 ms. They do not always stay parked, though: Redis returns early on a disconnect inside the budget, on a caught reader failure, and for a caller past its concurrent-reader cap, and this cadence is what honours the rest of that budget. The other eight backends refuse `block_ms` outright, so their long poll never starts. |
 | `live_push.enabled` | `false` | Claude Code only — push `<channel>` events into a running session. |
 | `live_push.mention_filter` | `false` | `true` = only surface messages that mention your handle. Only the live push path reads it, so `true` with `live_push.enabled: false` is a load error rather than a filter that never runs. Requires a handle an `@mention` can name (ASCII letters/digits, optional interior `.` `-` `_`); anything else is a load error rather than a bridge that silently receives nothing. |
+| `directory` | — | How an agent reaches the other participants in this deployment, e.g. `each project's agent is claude-code-<folder>, at home on topic project-<folder>`. Shipped in the server instructions and returned by `parley_whoami`. At most 1000 characters, and refused at load if it would grant inbound text authority. |
 | `backend_config` | `{}` | Opaque to core, passed verbatim to the plugin. Secrets live here — never committed. |
 
 There is no `backend` key: the backend is whichever `parley-<name>` binary you run. A config

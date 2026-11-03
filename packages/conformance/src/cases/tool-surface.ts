@@ -1,11 +1,11 @@
 import {
-  Allowlist,
   type Cursor,
-  LiveDeliveryLedger,
+  parseConfig,
   registerTools,
   SeenSet,
   type Topic,
   type ToolDeps,
+  toolDepsFor,
 } from '@sharptrick/parley-core';
 import { expect, it } from 'vitest';
 import type { ConformanceContext } from '../factory.js';
@@ -118,16 +118,11 @@ export function toolSurfaceCases(ctx: ConformanceContext): void {
     const topic = ctx.freshTopic();
     const backlog = between(TOOL_BACKLOG_MIN, TOOL_BACKLOG_MAX);
     const readState = position();
-    const deps: ToolDeps = {
-      plugin: ctx.plugin,
-      identity: SENDER,
-      allow: new Allowlist([String(topic)]),
-      seen: new SeenSet(),
-      readState,
-      blockMaxMs: 60_000,
-      blockPollIntervalMs: 20,
-      live: new LiveDeliveryLedger([topic]),
-    };
+    const deps = toolDepsFor(
+      ctx.plugin,
+      parseConfig({ identity: { handle: String(SENDER) }, topics: [String(topic)] }),
+      { seen: new SeenSet(), readState },
+    );
     const fetchRecent = toolsOf(deps).get('parley_fetch_recent')!;
 
     // Session one: the agent reads the topic, and the position that read establishes is the whole

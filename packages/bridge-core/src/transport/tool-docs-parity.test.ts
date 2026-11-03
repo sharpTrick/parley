@@ -49,7 +49,7 @@ interface ListedTool {
 describe('the README tool table matches the registered surface', () => {
   it('parses the table (guards against a broken scan)', () => {
     expect(DOCUMENTED.size).toBeGreaterThan(2);
-    expect(DOCUMENTED.get('parley_post')).toEqual(['topic', 'content', 'in_reply_to']);
+    expect(DOCUMENTED.get('parley_post')).toEqual(['topic', 'content', 'in_reply_to', 'read_through', 'force']);
   });
 
   it('documents exactly the tools registerTools registers', async () => {

@@ -179,6 +179,7 @@ describe('remote OIDC front door (delegated resource server)', () => {
         'parley_live_status',
         'parley_post',
         'parley_reply',
+        'parley_whoami',
       ]);
       await client.callTool({ name: 'parley_post', arguments: { topic: 'ctx', content: 'hi via keycloak' } });
       const res = (await client.callTool({

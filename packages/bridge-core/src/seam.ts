@@ -1,8 +1,8 @@
 /**
  * The Seam — the backend plugin interface (DESIGN §4). THE PRODUCT.
  *
- * A backend plugin implements these six methods; everything hard (push delivery,
- * catch-up, routing, dedup) lives ABOVE this seam in @sharptrick/parley-core. Dependencies point
+ * A backend plugin implements these six methods, and may add the optional mention feed; everything
+ * hard (push delivery, catch-up, routing, dedup) lives ABOVE this seam in @sharptrick/parley-core. Dependencies point
  * one way: plugins depend on core, never the reverse (CLAUDE.md prime directive #1).
  *
  * Conformance contract (what makes a backend correct):
@@ -100,6 +100,18 @@ export interface BackendPlugin {
    * proceeds. Every other rejection is a real failure and fails the attach.
    */
   subscribe(topic: Topic, handler: MessageHandler): Promise<void>;
+
+  /**
+   * OPTIONAL. Register interest in messages that mention `handle`, from ANY topic — including ones
+   * nobody subscribed to. `handler` fires under the same terms as `subscribe`'s: at most once per
+   * message, in ascending cursor order per topic, only for messages arriving after this call, and a
+   * subset rather than all of them. Every message it delivers carries `handle` in `mentions`.
+   *
+   * A backend that leaves it out still delivers mentions on the topics an instance subscribes to;
+   * what it loses is a mention on a topic that instance does not follow, which then reaches the
+   * agent only through `fetchRecent`.
+   */
+  subscribeMentions?(handle: Handle, handler: MessageHandler): Promise<void>;
 
   /**
    * Single centralized durable write path. Writes `content` to `topic`, optionally threaded to
