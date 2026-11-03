@@ -1,7 +1,9 @@
 import { type Handle, type Message, type MessageHandler, safeDeliver, type Topic } from '@sharptrick/parley-core';
 import type { QueueState, ZulipConnection } from './connection.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from './pacing.js';
-import { asArray, buildZulipMessage, type EventsResponse, type ZulipMessage, zulipMessageId } from './wire.js';
+import {
+  asArray, buildZulipMessage, type EventsResponse, mentionSpellings, type ZulipMessage, zulipMessageId,
+} from './wire.js';
 
 const replacedDuringHandshake = (): Error =>
   new Error(
@@ -165,7 +167,9 @@ export async function startPushLoop(
     }
     queueProven = true;
     let acked = false;
-    for (const ev of asArray(json.events)) {
+    const events = asArray(json.events);
+    await conn.members.learn(events.flatMap((ev) => (ev?.type === 'message' ? mentionSpellings(ev.message) : [])));
+    for (const ev of events) {
       if (typeof ev?.id === 'number' && ev.id > lastEventId) {
         lastEventId = ev.id; // ack heartbeats too
         acked = true;
@@ -183,6 +187,7 @@ export async function startPushLoop(
           'topic' in scope ? scope.topic : conn.topicOf(subjectOf(record)),
           record,
           id,
+          conn.members.lookup,
         ),
       );
     }

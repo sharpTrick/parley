@@ -8,11 +8,19 @@
  */
 import { asHandle, asTopic, type Handle, type Message } from '@sharptrick/parley-core';
 import { describe, expect, it, vi } from 'vitest';
-import { buildZulipMessage } from '../src/wire.js';
+import { MEMBERS_REFRESH_MS, RealmMembers } from '../src/members.js';
+import { buildZulipMessage, zulipMentionSpellings } from '../src/wire.js';
 import { rand, sleep, useZulip } from './harness.js';
 
-const boot = useZulip();
+const useBoot = useZulip();
 const ME = asHandle('claude-code-taskqueue');
+const REALM = [
+  { user_id: 42, email: 'taskqueue-bot@localhost', full_name: 'claude-code-taskqueue', is_bot: true },
+  { user_id: 43, email: 'other-bot@localhost', full_name: 'claude-code-other', is_bot: true },
+  { user_id: 44, email: 'gone-bot@localhost', full_name: 'claude-code-gone', is_bot: true, is_active: false },
+  { user_id: 8, email: 'pat@example.com', full_name: 'Patrick Sharp', is_bot: false },
+];
+const boot = () => useBoot({ members: REALM });
 
 type Row = [label: string, content: string, mentions: Handle[], addressed: Handle[]];
 
@@ -35,8 +43,14 @@ describe('who a Zulip message mentions, and who it is explicitly addressed to', 
     ['an address run into the word before it', 'mail@**claude-code-taskqueue**', [], []],
     ['an address in parentheses', '(@**claude-code-taskqueue**)', [ME], [ME]],
     ['a user group', 'ping @*maintainers*', [], []],
-  ])('%s', (_label, content, mentions, addressed) => {
-    const m = buildZulipMessage(asTopic('t'), { id: 1, content }, 1);
+    ['a name no member has, which Zulip shows as text', 'Zulip spells it @**handle**', [], []],
+    ['a member’s name with another member’s id', 'see @**claude-code-taskqueue|43**', [], []],
+    ['a member’s name in another case, as the member is named', 'see @**Claude-Code-TaskQueue**', [ME], [ME]],
+    ['a deactivated member', 'see @**claude-code-gone**', [], []],
+  ])('%s', async (_label, content, mentions, addressed) => {
+    const members = new RealmMembers(async () => REALM);
+    await members.learn(zulipMentionSpellings(content));
+    const m = buildZulipMessage(asTopic('t'), { id: 1, content }, 1, members.lookup);
     expect([m.mentions, m.addressed]).toEqual([mentions, addressed]);
   });
 });
@@ -49,13 +63,13 @@ describe('subscribeMentions delivers what names the handle, from every topic', (
     const elsewhere = `project-${rand()}`;
 
     fake.injectMessage({ topic: elsewhere, content: 'no one named here' });
-    fake.injectMessage({ topic: elsewhere, content: 'over to you @**claude-code-taskqueue|7**' });
+    fake.injectMessage({ topic: elsewhere, content: 'over to you @**claude-code-taskqueue|42**' });
     fake.injectMessage({ topic: 'general', content: 'and @**claude-code-other**, not you' });
 
     await vi.waitFor(() => expect(got).toHaveLength(1));
     await sleep(300);
     expect(got.map((m) => [m.topic, m.content])).toEqual([
-      [elsewhere, 'over to you @**claude-code-taskqueue|7**'],
+      [elsewhere, 'over to you @**claude-code-taskqueue|42**'],
     ]);
   });
 
@@ -148,5 +162,35 @@ describe('subscribeMentions delivers what names the handle, from every topic', (
     fake.injectMessage({ topic: two, content: '@**claude-code-taskqueue** second' });
 
     await vi.waitFor(() => expect(got.map((m) => m.topic).sort()).toEqual([one, two].sort()), { timeout: 3_000 });
+  });
+});
+
+describe('an address names a member of the realm, on the live path and in history alike', () => {
+  it('arrives addressed to the member it names, and to nobody when no member has the name', async () => {
+    const { plugin, fake } = await boot();
+    const topic = asTopic(`t-${rand()}`);
+    const pushed: Message[] = [];
+    await plugin.subscribe(topic, (m) => pushed.push(m));
+
+    fake.injectMessage({ topic, content: 'over to @**claude-code-taskqueue**' });
+    fake.injectMessage({ topic, content: 'the syntax is @**handle**' });
+
+    await vi.waitFor(() => expect(pushed).toHaveLength(2));
+    const { messages } = await plugin.fetchRecent({ topic });
+    for (const path of [pushed, messages]) {
+      expect(path.map((m) => m.addressed)).toEqual([[ME], []]);
+    }
+  });
+
+  it('addresses a member who joined after the realm was last read, once the refresh interval has passed', async () => {
+    const realm = REALM.filter((u) => u.full_name !== 'claude-code-taskqueue');
+    const { plugin, fake } = await useBoot({ members: realm });
+    const topic = asTopic(`t-${rand()}`);
+    fake.injectMessage({ topic, content: 'over to @**claude-code-taskqueue**' });
+    expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.addressed)).toEqual([[]]);
+
+    realm.push(REALM[0]!);
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + MEMBERS_REFRESH_MS);
+    expect((await plugin.fetchRecent({ topic })).messages.map((m) => m.addressed)).toEqual([[ME]]);
   });
 });

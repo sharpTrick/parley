@@ -11,6 +11,7 @@ import { normalizeBody, normalizeTopic, SERVER_CONSTRAINTS } from './fake-zulip.
 import { ALL_PLACEMENTS, CANDIDATE_PADDINGS, padName } from './harness.js';
 import { resolveConfig, type ZulipConfig } from '../src/config.js';
 import { longPollDeadlineMs, loopBackoffMs, reportsLoopFailure } from '../src/pacing.js';
+import type { MemberLookup } from '../src/members.js';
 import {
   asArray,
   type EventsResponse,
@@ -26,6 +27,7 @@ import {
 } from '../src/wire.js';
 
 const TOPIC = asTopic('units');
+const NOBODY: MemberLookup = () => undefined;
 
 describe('a Parley topic is refused unless Zulip would store it verbatim', () => {
   const ROWS: Array<{ name: string; topic: string; wire?: string; rejects?: RegExp }> = [
@@ -195,12 +197,12 @@ describe('a server record becomes a Message only when its id can carry the curso
 
   for (const row of UNUSABLE) {
     it(`drops ${row.name}`, () => {
-      expect(zulipToMessage(TOPIC, row.record as ZulipMessage)).toBeUndefined();
+      expect(zulipToMessage(TOPIC, row.record as ZulipMessage, NOBODY)).toBeUndefined();
     });
   }
 
   it('coerces every other server-controlled field rather than trusting it', () => {
-    const m = zulipToMessage(TOPIC, { id: 7, content: 1 as never, sender_email: [] as never });
+    const m = zulipToMessage(TOPIC, { id: 7, content: 1 as never, sender_email: [] as never }, NOBODY);
     expect(m).toMatchObject({ backendMsgId: '7', cursor: '7', content: '', senderHandle: '' });
     expect(m?.timestamp).toBe(new Date(0).toISOString());
   });
@@ -214,7 +216,7 @@ describe('a server record becomes a Message only when its id can carry the curso
 
   for (const row of TIMESTAMPS) {
     it(`renders ${row.name}`, () => {
-      expect(zulipToMessage(TOPIC, { id: 7, timestamp: row.seconds as number })?.timestamp).toBe(
+      expect(zulipToMessage(TOPIC, { id: 7, timestamp: row.seconds as number }, NOBODY)?.timestamp).toBe(
         row.iso,
       );
     });
